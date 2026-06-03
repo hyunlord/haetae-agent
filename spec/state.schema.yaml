@@ -1,0 +1,36 @@
+# state.yaml — haetae의 mutable 절반 (spec.yaml = pinned 절반)
+# replan이 읽고, 매 iteration마다 append/갱신한다.
+
+spec_ref: ws-needs-expand-001     # 어느 spec의 state인지
+spec_version: 1                   # 현재 따르는 spec 버전 (governance 추적)
+status: running                   # running | escalated | done | stopped_budget | stopped_stuck
+
+# 살아있는 계획. spec.decomposition은 초기 힌트일 뿐, 이게 진짜 현재 계획.
+plan:
+  - { unit: u1, state: done }     # pending | in_progress | done | failed
+  - { unit: u2, state: in_progress }
+  - { unit: u3, state: pending, deps: [u2] }
+
+# append-only 이벤트 로그 (replay / audit / anti-drift의 근거)
+events:
+  - seq: 1
+    unit: u1
+    work_order_ref: "의뢰서 본문 또는 경로"
+    result: "추가/변경 요약"
+    verdict: pass                 # pass|fail_recoverable|fail_replan|ambiguous|stuck|budget|done
+    checks: [{ id: ac1, type: bench, result: "11 tps", pass: true }]
+    learnings: "이번에 새로 안 것"
+    cost: { tokens: 12000, usd: 0.04 }
+    ts: "2026-06-04T01:40:00Z"
+
+# spec 변경 감사 로그 (governance: 무엇을·왜·어떤 증거로 바꿨나)
+spec_changes:
+  - { seq: 1, target: assumptions.as3, reason: "...", evidence: "events[1]", version: "1->2" }
+
+# 예산 누적
+budget:
+  spent: { tokens: 12000, usd: 0.04 }
+  cap:   { usd: 5.00 }
+
+# 사람 응답 대기 중인 escalation
+pending_escalations: []
