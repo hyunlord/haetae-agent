@@ -1,0 +1,131 @@
+"""CodexClient 테스트 — 실제 codex를 부르지 않는다.
+
+complete 레벨은 _run을 가짜로 바꿔 검증하고,
+_run 내부 에러 처리는 모듈의 subprocess.run을 가짜로 바꿔 검증한다.
+"""
+
+import os
+import shutil
+from types import SimpleNamespace
+
+import pytest
+
+import haetae.providers.codex as codex_mod
+from haetae.llm import CodexClient, CodexError, LLMClient
+
+
+# ──────────────────────────── complete (seam = _run) ────────────────────────────
+
+
+def test_complete_returns_run_output(monkeypatch):
+    c = CodexClient()
+    monkeypatch.setattr(c, "_run", lambda prompt: "spec_id: x")
+    assert c.complete("SYS", "USER") == "spec_id: x"
+
+
+def test_complete_merges_system_and_user_into_prompt(monkeypatch):
+    c = CodexClient()
+    seen = {}
+    monkeypatch.setattr(c, "_run", lambda prompt: seen.setdefault("p", prompt) or "ok")
+    c.complete("SYSTEM-PREAMBLE", "USER-ORDER")
+    p = seen["p"]
+    assert "SYSTEM-PREAMBLE" in p
+    assert "USER-ORDER" in p
+    # system이 user보다 앞(preamble)
+    assert p.index("SYSTEM-PREAMBLE") < p.index("USER-ORDER")
+
+
+def test_merge_prompt_without_system():
+    assert CodexClient._merge_prompt("", "only user") == "only user"
+
+
+def test_codexclient_satisfies_llmclient_protocol():
+    c = CodexClient()
+    assert isinstance(c, LLMClient)  # runtime_checkable Protocol
+
+
+# ──────────────────────────── _run 에러 처리 (seam = subprocess.run) ──────────
+
+
+def test_run_raises_on_nonzero_exit(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    c = CodexClient()
+    with pytest.raises(CodexError) as ei:
+        c._run("prompt")
+    assert "boom" in str(ei.value)
+
+
+def test_run_raises_on_empty_output(monkeypatch):
+    # returncode 0이지만 -o 파일을 아무도 안 써서 빈 출력 → 예외
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="done", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    c = CodexClient()
+    with pytest.raises(CodexError):
+        c._run("prompt")
+
+
+def test_run_returns_final_message_file(monkeypatch):
+    # fake_run이 cmd의 -o 경로에 최종 메시지를 써주면 _run이 그걸 읽어 반환.
+    def fake_run(cmd, **kwargs):
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("  spec_id: gen-1  \n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    c = CodexClient()
+    assert c._run("prompt") == "spec_id: gen-1"
+
+
+def test_run_uses_model_flag_when_set(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    CodexClient(model="some-model")._run("prompt")
+    cmd = seen["cmd"]
+    assert "-m" in cmd and cmd[cmd.index("-m") + 1] == "some-model"
+    # 격리 플래그 존재
+    assert "--skip-git-repo-check" in cmd
+    assert "--ephemeral" in cmd
+    assert cmd[cmd.index("-s") + 1] == "read-only"
+
+
+def test_run_omits_model_flag_when_unset(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    CodexClient()._run("prompt")
+    assert "-m" not in seen["cmd"]
+
+
+# ──────────────────────────── (선택) 실제 codex 통합 ────────────────────────────
+
+
+@pytest.mark.skipif(
+    shutil.which("codex") is None or os.environ.get("HAETAE_CODEX_IT") != "1",
+    reason="실제 codex 통합 테스트는 opt-in (HAETAE_CODEX_IT=1 + codex 설치 시에만)",
+)
+def test_codex_integration_smoke():
+    # 실제 codex 한 턴: 간단한 산술만 시켜 결정성/저비용 유지.
+    c = CodexClient()
+    out = c.complete("You output only the final answer, nothing else.", "What is 2+2?")
+    assert "4" in out

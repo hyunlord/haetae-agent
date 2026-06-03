@@ -52,3 +52,9 @@ class MockClient:
         resp = self._responses[self._index]
         self._index += 1
         return resp
+
+
+# 실제 provider 재노출 (codex.py는 llm.py를 import하지 않아 순환 없음)
+from haetae.providers.codex import CodexClient, CodexError  # noqa: E402
+
+__all__ = ["LLMClient", "MockClient", "CodexClient", "CodexError"]
