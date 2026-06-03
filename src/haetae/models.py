@@ -64,6 +64,26 @@ class PlanState(str, Enum):
     failed = "failed"
 
 
+class Verdict(str, Enum):
+    # 'pass'는 파이썬 예약어라 멤버명은 pass_, 값만 "pass" (Check.pass_ 패턴과 동일)
+    pass_ = "pass"
+    fail_recoverable = "fail_recoverable"
+    fail_replan = "fail_replan"
+    ambiguous = "ambiguous"
+    stuck = "stuck"
+    budget = "budget"
+    done = "done"
+
+
+class Action(str, Enum):
+    next_order = "next_order"
+    retry = "retry"
+    replan_approach = "replan_approach"
+    propose_spec_change = "propose_spec_change"
+    escalate = "escalate"
+    stop = "stop"
+
+
 # ──────────────────────── ProjectSpec 하위 모델 ────────────────────────
 
 
@@ -154,7 +174,7 @@ class Event(BaseModel):
     unit: str | None = None
     work_order_ref: str | None = None
     result: str | None = None
-    verdict: str | None = None
+    verdict: Verdict | None = None
     checks: list[EventCheck] = Field(default_factory=list)
     learnings: str | None = None
     cost: Cost | None = None
@@ -193,3 +213,53 @@ class State(BaseModel):
     def from_yaml(cls, path: str | Path) -> "State":
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.model_validate(data)
+
+
+# ──────────────────────── Decision (replan 출력 계약) ────────────────────────
+# prompts/replan.md 맨 아래 Decision 스키마를 그대로 모델로 옮긴 것.
+
+
+class NextOrder(BaseModel):
+    """action == next_order | retry 일 때 다음 work order."""
+
+    unit: str
+    goal: str
+    scope: str | None = None
+    context_refs: list[str] = Field(default_factory=list)
+    local_checks: list[Check] = Field(default_factory=list)
+    executor: str | None = None
+    deliverable: str | None = None
+
+
+class SpecChangeProposal(BaseModel):
+    """action == propose_spec_change 일 때 spec 변경 제안.
+
+    State.SpecChange(감사 로그 항목)와 다른 형태라 이름을 분리한다.
+    """
+
+    target: str
+    from_: str | None = Field(default=None, alias="from")
+    to: str | None = None
+    reason: str
+    evidence: str | None = None
+    version_bump: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class Escalation(BaseModel):
+    """action == escalate 일 때 사람에게 올리는 질문."""
+
+    question: str
+    why_now: str | None = None
+
+
+class Decision(BaseModel):
+    """replan이 매 iteration 내리는 단 하나의 결정."""
+
+    verdict: Verdict
+    action: Action
+    rationale: str
+    next_order: NextOrder | None = None
+    spec_change: SpecChangeProposal | None = None
+    escalation: Escalation | None = None

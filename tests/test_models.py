@@ -10,11 +10,14 @@ import pytest
 from pydantic import ValidationError
 
 from haetae.models import (
+    Action,
+    Decision,
     Mode,
     ProjectSpec,
     State,
     Status,
     TaskType,
+    Verdict,
     Verifiability,
 )
 
@@ -113,3 +116,50 @@ def test_state_invalid_plan_state_rejected():
     }
     with pytest.raises(ValidationError):
         State.model_validate(bad)
+
+
+def test_state_event_verdict_enum_promoted():
+    """state 예시의 verdict: pass가 Verdict enum으로 파싱됨 (WO#3 gap 해소)."""
+    state = State.from_yaml(SPEC_DIR / "state.schema.yaml")
+    assert state.events[0].verdict is Verdict.pass_
+
+
+def test_state_invalid_event_verdict_rejected():
+    """Event.verdict에 잘못된 값 → ValidationError (str→enum 승격 확인)."""
+    bad = {
+        "spec_ref": "x",
+        "spec_version": 1,
+        "status": "running",
+        "events": [{"seq": 1, "verdict": "not_a_verdict"}],
+    }
+    with pytest.raises(ValidationError):
+        State.model_validate(bad)
+
+
+# ──────────────────────────── Decision ────────────────────────────
+
+
+def test_decision_validates_and_parses_enums():
+    d = Decision.model_validate(
+        {
+            "verdict": "pass",
+            "action": "next_order",
+            "rationale": "다음 unit이 done_when에 기여",
+            "next_order": {
+                "unit": "u2",
+                "goal": "로직 구현",
+                "local_checks": [{"type": "test", "cmd": "pytest x"}],
+            },
+        }
+    )
+    assert d.verdict is Verdict.pass_
+    assert d.action is Action.next_order
+    assert d.next_order.unit == "u2"
+    assert d.next_order.local_checks[0].type.value == "test"
+
+
+def test_decision_invalid_action_rejected():
+    with pytest.raises(ValidationError):
+        Decision.model_validate(
+            {"verdict": "pass", "action": "warp", "rationale": "x"}
+        )
