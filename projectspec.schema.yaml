@@ -1,0 +1,65 @@
+# ProjectSpec — haetae의 north-star 아티팩트
+#
+# 주문(order) 하나로부터 합성기가 만들어내며, 이후 고정(pinned)되어
+# 매 iteration마다 재주입된다. gate가 "완료"를 판정하는 기준이 바로 이 문서다.
+#
+# 사람이 읽는 필드(goal, *.desc, assumptions.text)는 한국어,
+# 키와 enum 값은 영어로 쓴다.
+#
+# 아래는 스키마 정의 + 동작하는 예시(WorldSim 전투)를 겸한다.
+
+spec_id: ws-combat-001          # 고유 id
+version: 1                      # revise 시 ++ , 이유를 커밋/로그에 남긴다 (자기약화 추적)
+order_raw: "WorldSim에 전투 시스템 추가해"   # 주문 원문 보존 (의도 변질 방지)
+
+goal: >                         # 합성기의 의도 해석, 1문단
+  에이전트 간 근접/원거리 전투를 ECS에 추가하되 기존 스트레스/감정/Trait 시스템과 연동한다.
+
+# feature_impl | research | harness_build | infra | refactor | investigation
+task_type: feature_impl
+
+# objective       = 기계로 완료 판정 가능 → 완전 자율 종료 가능
+# judge           = 독립 판정자(LLM) 필요
+# human_checkpoint = 객관 기준 없음 → 주기적 사람 확인 필요
+verifiability: objective
+
+mode: normal                    # fast | normal | slow (예산/깊이)
+
+constraints:                    # project_context에서만 주입. 지어내지 말 것.
+  - "UI 텍스트 전부 Locale.tr()/tr_id()/trf()/tr_data() 경유, 하드코딩 금지"
+  - "Rust hecs ECS + rayon, 10 TPS 유지"
+
+# ★핵심★ 각 항목은 반드시 check를 가진다. check 없는 기준은 기준이 아니다.
+# check.type: test | bench | lint | build | schema | judge | human
+acceptance_criteria:
+  - id: ac1
+    desc: "전투 컴포넌트가 ECS에 등록되고 10 TPS가 깨지지 않음"
+    check: { type: bench, cmd: "cargo bench tps", pass: ">=10" }
+  - id: ac2
+    desc: "전투 결과가 스트레스/Trait 시스템에 반영됨"
+    check: { type: test, cmd: "cargo test combat_stress_integration" }
+  - id: ac3
+    desc: "신규 UI 텍스트 하드코딩 0개"
+    check: { type: lint, cmd: "scripts/i18n_check.sh", pass: "0" }
+
+# 주문이 모호해 합성기가 채운 것. 사람에게 묻지 않고 진행하되 반드시 기록.
+# checkpoint: (stakes 高 AND confidence < 0.5) 일 때만 true
+assumptions:
+  - { id: as1, text: "근접+원거리 둘 다. 공성/대규모는 v1 범위 외", confidence: 0.7, checkpoint: false }
+  - { id: as2, text: "데미지는 STR/무기 기반 단순식부터", confidence: 0.6, checkpoint: false }
+
+non_goals:                      # 최소 2개. 스코프 경계 = 드리프트 방지.
+  - "공성전·대규모 부대 전투"
+  - "전투 애니메이션/이펙트"
+
+# 개별 ac의 합과 별개인 통합 게이트. "합쳐져서 원래 주문을 충족하는가."
+done_when: "ac1~ac3 전부 통과 AND 기존 테스트 스위트 무회귀(no regression)"
+
+# planner로 넘길 작업 단위 힌트. (모호한 주문이면 첫 unit을 '탐색/조사로 spec 정제'로 둘 것)
+decomposition:
+  - { unit: u1, desc: "전투 컴포넌트/시스템 스켈레톤", deps: [] }
+  - { unit: u2, desc: "데미지/판정 로직", deps: [u1] }
+  - { unit: u3, desc: "스트레스/Trait 연동", deps: [u2] }
+
+# 비어 있으면 = 사람에게 묻지 않고 즉시 진행한다는 뜻
+open_questions: []
