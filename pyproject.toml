@@ -1,0 +1,25 @@
+[project]
+name = "haetae"
+version = "0.1.0"
+description = "haetae — director가 한 줄 주문을 검증 가능한 명세로 합성하고 자율 루프로 실행하는 에이전트"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "pyyaml>=6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/haetae"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
