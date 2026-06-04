@@ -153,15 +153,31 @@ class PlanItem(BaseModel):
     deps: list[str] | None = None
 
 
-class EventCheck(BaseModel):
-    """이벤트 로그에 기록된 검증 결과. type은 enum 강제, pass는 bool."""
+class CheckReport(BaseModel):
+    """gate가 ac 하나를 평가한 per-check 증거.
 
-    id: str | None = None
-    type: CheckType
-    result: str | None = None
-    pass_: bool | None = Field(default=None, alias="pass")
+    gate(CheckRunner)가 무엇을(cmd) 돌려 어떤 결과(status/exit_code)를 얻었는지
+    감사 추적으로 남긴다. verdict의 *근거*. Event.checks에 그대로 실린다.
+    status는 pass | fail | skipped.
+    """
 
-    model_config = {"populate_by_name": True}
+    ac_id: str
+    check_type: CheckType
+    cmd: str | None = None
+    status: str  # pass | fail | skipped
+    exit_code: int | None = None
+    detail: str | None = None
+
+
+class GateResult(BaseModel):
+    """gate.judge의 반환 계약 — verdict + 그 근거(per-check 증거).
+
+    근거는 mutable 속성에서 루프가 몰래 꺼내는 게 아니라 반환에 동봉한다.
+    미래의 judge-gate(LLM-as-judge)도 같은 계약(verdict + checks)으로 끼워진다.
+    """
+
+    verdict: Verdict
+    checks: list[CheckReport] = Field(default_factory=list)
 
 
 class Cost(BaseModel):
@@ -175,7 +191,7 @@ class Event(BaseModel):
     work_order_ref: str | None = None
     result: str | None = None
     verdict: Verdict | None = None
-    checks: list[EventCheck] = Field(default_factory=list)
+    checks: list[CheckReport] = Field(default_factory=list)
     learnings: str | None = None
     cost: Cost | None = None
     ts: str | None = None

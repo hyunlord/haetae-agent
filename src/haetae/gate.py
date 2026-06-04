@@ -21,7 +21,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from haetae.models import CheckType, ProjectSpec, Verdict
+from haetae.models import CheckReport, CheckType, GateResult, ProjectSpec, Verdict
 
 # 기계로 자동 실행 불가한 check 타입
 _UNEVALUATABLE_TYPES = {CheckType.human, CheckType.judge}
@@ -32,39 +32,40 @@ class CheckRunner:
 
     workdir: check 명령을 실행할 cwd.
     timeout: 각 명령의 최대 실행 시간(초). 행 방지 필수.
-    실행 후 self.last_report에 per-check 결과(ac id/type/cmd/status/exit_code/...)가 남는다.
+    judge는 verdict뿐 아니라 per-check 증거(CheckReport 리스트)를 GateResult에 동봉해
+    반환한다 — 근거가 반환 계약이라 루프가 그대로 Event.checks에 실을 수 있다.
     """
 
     def __init__(self, workdir: str | Path = ".", timeout: float = 120):
         self.workdir = str(workdir)
         self.timeout = timeout
-        self.last_report: list[dict] = []
 
     # ── Gate 인터페이스 ───────────────────────────────────────────────
-    def judge(self, result: str, spec: ProjectSpec) -> Verdict:
-        report: list[dict] = []
+    def judge(self, result: str, spec: ProjectSpec) -> GateResult:
+        report: list[CheckReport] = []
         any_fail = False
         any_skipped = False
 
         for ac in spec.acceptance_criteria:
             entry = self._run_check(ac.id, ac.check)
             report.append(entry)
-            if entry["status"] == "fail":
+            if entry.status == "fail":
                 any_fail = True
-            elif entry["status"] == "skipped":
+            elif entry.status == "skipped":
                 any_skipped = True
 
-        self.last_report = report
-
+        # 집계 규칙은 불변 — 근거(report)만 반환에 동봉한다.
         if any_fail:
-            return Verdict.fail_recoverable
-        if any_skipped:
-            return Verdict.ambiguous
-        return Verdict.pass_
+            verdict = Verdict.fail_recoverable
+        elif any_skipped:
+            verdict = Verdict.ambiguous
+        else:
+            verdict = Verdict.pass_
+        return GateResult(verdict=verdict, checks=report)
 
     # ── 단일 check 실행 ───────────────────────────────────────────────
-    def _run_check(self, ac_id: str, check) -> dict:
-        base = {"ac_id": ac_id, "type": check.type.value, "cmd": check.cmd}
+    def _run_check(self, ac_id: str, check) -> CheckReport:
+        base: dict = {"ac_id": ac_id, "check_type": check.type, "cmd": check.cmd}
 
         # 미평가: human/judge 타입이거나 cmd가 없음
         if check.type in _UNEVALUATABLE_TYPES or not check.cmd:
@@ -73,7 +74,7 @@ class CheckRunner:
                 if check.type in _UNEVALUATABLE_TYPES
                 else "cmd 없음"
             )
-            return {**base, "status": "skipped", "exit_code": None, "detail": reason}
+            return CheckReport(**base, status="skipped", exit_code=None, detail=reason)
 
         try:
             proc = subprocess.run(
@@ -85,22 +86,19 @@ class CheckRunner:
                 timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
-            return {
-                **base,
-                "status": "fail",
-                "exit_code": None,
-                "detail": f"timeout (>{self.timeout}s)",
-            }
+            return CheckReport(
+                **base, status="fail", exit_code=None, detail=f"timeout (>{self.timeout}s)"
+            )
         except OSError as e:  # cwd 없음 등 실행 자체 실패
-            return {**base, "status": "fail", "exit_code": None, "detail": f"실행 실패: {e}"}
+            return CheckReport(**base, status="fail", exit_code=None, detail=f"실행 실패: {e}")
 
         status = "pass" if proc.returncode == 0 else "fail"
-        return {
+        return CheckReport(
             **base,
-            "status": status,
-            "exit_code": proc.returncode,
-            "detail": _tail(proc.stderr or proc.stdout),
-        }
+            status=status,
+            exit_code=proc.returncode,
+            detail=_tail(proc.stderr or proc.stdout),
+        )
 
 
 def _tail(s: str, n: int = 300) -> str:

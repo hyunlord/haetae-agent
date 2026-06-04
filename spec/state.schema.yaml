@@ -18,7 +18,8 @@ events:
     work_order_ref: "의뢰서 본문 또는 경로"
     result: "추가/변경 요약"
     verdict: pass                 # pass|fail_recoverable|fail_replan|ambiguous|stuck|budget|done
-    checks: [{ id: ac1, type: bench, result: "11 tps", pass: true }]
+    # gate가 남긴 per-check 증거(CheckReport). verdict의 근거 = 감사 추적.
+    checks: [{ ac_id: ac1, check_type: bench, cmd: "cargo bench", status: pass, exit_code: 0, detail: "11 tps" }]
     learnings: "이번에 새로 안 것"
     cost: { tokens: 12000, usd: 0.04 }
     ts: "2026-06-04T01:40:00Z"

@@ -6,7 +6,7 @@ import pytest
 
 from haetae.llm import MockClient
 from haetae.loop import Executor, Gate, MockExecutor, MockGate, run_loop
-from haetae.models import State, Status, Verdict
+from haetae.models import CheckReport, State, Status, Verdict
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = REPO_ROOT / "prompts"
@@ -166,6 +166,51 @@ def test_run_loop_saves_and_reloads_state(tmp_path):
     assert reloaded.status is Status.done
     assert reloaded.spec_ref == "loop-001"
     assert len(reloaded.events) == 2
+
+
+# ──────────────────── gate 근거 → Event.checks 저장 (WO#14) ────────────────────
+
+
+def _report(ac_id: str, status: str = "pass") -> CheckReport:
+    return CheckReport(
+        ac_id=ac_id, check_type="test", cmd=f"pytest {ac_id}",
+        status=status, exit_code=0 if status == "pass" else 1,
+    )
+
+
+def test_run_loop_persists_gate_evidence_into_events():
+    """gate가 GateResult(checks 포함)를 반환하면 그 근거가 Event.checks에 실린다."""
+    evidence = [_report("ac1")]
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u2")])
+    gate = MockGate([Verdict.pass_, Verdict.done], checks=evidence)
+    state = run_loop(order="x", client=client,
+                     executor=MockExecutor(["a", "b"]), gate=gate,
+                     prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    # 두 이벤트 모두 근거가 비어있지 않고 CheckReport로 채워졌는지
+    assert all(len(ev.checks) == 1 for ev in state.events)
+    c = state.events[0].checks[0]
+    assert c.ac_id == "ac1"
+    assert c.check_type.value == "test"
+    assert c.status == "pass"
+    assert c.exit_code == 0
+
+
+def test_run_loop_event_checks_roundtrip_through_yaml(tmp_path):
+    """Event.checks(CheckReport)가 YAML로 저장되고 다시 State로 로드되는지(감사 로그)."""
+    out = tmp_path / "state.yaml"
+    evidence = [_report("ac1", "pass"), _report("ac2", "fail")]
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    run_loop(order="x", client=client,
+             executor=MockExecutor("a"),
+             gate=MockGate(Verdict.done, checks=evidence),
+             prompt_dir=PROMPT_DIR, state_path=out)
+    reloaded = State.from_yaml(out)
+    checks = reloaded.events[0].checks
+    assert [c.ac_id for c in checks] == ["ac1", "ac2"]
+    assert checks[1].status == "fail"
+    assert checks[1].exit_code == 1
+    assert checks[0].check_type.value == "test"
 
 
 # ──────────────────────────── Protocol 적합성 ────────────────────────────

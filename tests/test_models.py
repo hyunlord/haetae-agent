@@ -47,8 +47,11 @@ def test_state_example_yaml_loads():
     assert state.status is Status.running
     assert state.plan[0].state.value == "done"
     assert state.events[0].seq == 1
-    assert state.events[0].checks[0].type.value == "bench"
-    assert state.events[0].checks[0].pass_ is True
+    # checks는 CheckReport(per-check 증거)로 파싱된다.
+    assert state.events[0].checks[0].ac_id == "ac1"
+    assert state.events[0].checks[0].check_type.value == "bench"
+    assert state.events[0].checks[0].status == "pass"
+    assert state.events[0].checks[0].exit_code == 0
     assert state.budget.cap.usd == 5.00
 
 

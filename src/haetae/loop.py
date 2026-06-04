@@ -17,7 +17,9 @@ from haetae.intake import SynthesisError, synthesize
 from haetae.llm import LLMClient
 from haetae.models import (
     Action,
+    CheckReport,
     Event,
+    GateResult,
     NextOrder,
     PlanItem,
     PlanState,
@@ -41,9 +43,13 @@ class Executor(Protocol):
 
 @runtime_checkable
 class Gate(Protocol):
-    """실행 결과를 spec 기준으로 판정해 Verdict를 반환한다."""
+    """실행 결과를 spec 기준으로 판정해 verdict + 근거(GateResult)를 반환한다.
 
-    def judge(self, result: str, spec: ProjectSpec) -> Verdict: ...
+    근거(per-check 증거)는 mutable 속성이 아니라 반환 계약이다 — 루프가 그대로
+    Event.checks에 실어 state 파일을 진짜 감사 로그로 만든다.
+    """
+
+    def judge(self, result: str, spec: ProjectSpec) -> GateResult: ...
 
 
 class MockExecutor:
@@ -62,18 +68,27 @@ class MockExecutor:
 
 
 class MockGate:
-    """테스트용. 스크립트된 Verdict를 순서대로(소진 시 마지막을 반복) 반환."""
+    """테스트용. 스크립트된 Verdict를 순서대로(소진 시 마지막을 반복) GateResult로 반환.
 
-    def __init__(self, verdicts: list[Verdict] | Verdict):
+    checks: 매 judge 호출이 동봉할 per-check 증거(선택). 모든 호출에 같은 리스트를
+    재사용한다. 기본 None=빈 근거. 근거가 Event.checks까지 흐르는지 검증용.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[Verdict] | Verdict,
+        checks: list[CheckReport] | None = None,
+    ):
         self._v = [verdicts] if isinstance(verdicts, Verdict) else list(verdicts)
+        self._checks = checks
         self._i = 0
         self.calls: list[str] = []
 
-    def judge(self, result: str, spec: ProjectSpec) -> Verdict:
+    def judge(self, result: str, spec: ProjectSpec) -> GateResult:
         self.calls.append(result)
         v = self._v[min(self._i, len(self._v) - 1)]
         self._i += 1
-        return v
+        return GateResult(verdict=v, checks=list(self._checks or []))
 
 
 # ──────────────────────────── 내부 헬퍼 ────────────────────────────
@@ -235,7 +250,8 @@ def run_loop(
             emit("작업 실행 중…")
             result = executor.run(no)
             emit("gate 검사 중…")
-            verdict = gate.judge(result, spec)
+            gr = gate.judge(result, spec)
+            verdict = gr.verdict
             state.events.append(
                 Event(
                     seq=len(state.events) + 1,
@@ -243,6 +259,7 @@ def run_loop(
                     work_order_ref=no.goal,
                     result=result,
                     verdict=verdict,
+                    checks=gr.checks,
                 )
             )
             _update_plan(state, no.unit, verdict)
