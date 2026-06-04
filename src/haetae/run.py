@@ -30,6 +30,10 @@ def run(
     state_path: str | Path | None = None,
     prompt_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
+    max_parallel: int = 1,
+    workdir: str | Path | None = None,
+    executor_factory: Callable | None = None,
+    gate_factory: Callable | None = None,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -42,6 +46,10 @@ def run(
         state_path=state_path,
         prompt_dir=prompt_dir,
         progress=progress,
+        max_parallel=max_parallel,
+        workdir=workdir,
+        executor_factory=executor_factory,
+        gate_factory=gate_factory,
     )
 
 
@@ -92,6 +100,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
     parser.add_argument("--max-iters", type=int, default=20, help="최대 루프 횟수 (기본 20)")
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=4,
+        help=(
+            "동시에 굴릴 ready unit 수 (기본 4). 1이면 현행 순차 경로(worktree 미사용). "
+            ">1이면 git worktree per unit 격리 + 결정적 DAG 스케줄링."
+        ),
+    )
     args = parser.parse_args(argv)
 
     client = CodexClient(model=args.model)
@@ -106,6 +123,18 @@ def main(argv: list[str] | None = None) -> int:
         executor: Executor = CodexExecutor(model=args.model, workdir=args.workdir)
     else:
         executor = HumanRelayExecutor()
+
+    # 병렬 모드(>1): unit마다 worktree 경로에 묶인 executor/gate를 만든다.
+    # 통합 gate(머지된 main 1회)는 위 gate(=main workdir)를 그대로 쓴다.
+    executor_factory = None
+    gate_factory = None
+    if args.max_parallel > 1:
+        if args.executor == "codex":
+            executor_factory = lambda wt: CodexExecutor(model=args.model, workdir=wt)
+        else:
+            executor_factory = lambda wt: HumanRelayExecutor()
+        gate_factory = lambda wt: CompositeGate(
+            workdir=wt, judge_client=CodexClient(model=args.judge_model))
 
     # spec critic: --critic-model 줄 때만 ON(read-only, 합성기와 다른 모델 권장 = 독립성).
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
@@ -124,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         max_iters=args.max_iters,
         state_path=args.state_path,
         progress=progress,
+        max_parallel=args.max_parallel,
+        workdir=args.workdir,
+        executor_factory=executor_factory,
+        gate_factory=gate_factory,
     )
     print(format_summary(state))
     return 0

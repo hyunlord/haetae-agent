@@ -8,3 +8,6 @@ __pycache__/
 
 # OMC tooling
 .omc/
+
+# haetae 병렬 executor worktree 관리 루트(run 종료 시 cleanup되지만 방어적으로 무시)
+.haetae-worktrees/
