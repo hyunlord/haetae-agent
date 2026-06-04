@@ -155,6 +155,45 @@ def _save_state(state: State, state_path: str | Path) -> None:
     )
 
 
+# ──────────────────────────── 진행 표시 헬퍼 ────────────────────────────
+
+
+def _truncate(text: str, limit: int = 60) -> str:
+    """여러 줄/공백을 한 줄로 접고 limit자로 자른다(진행 메시지용)."""
+    one_line = " ".join((text or "").split())
+    return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
+
+
+def _summarize_gate(gr: GateResult) -> str:
+    """gate 판정을 한 줄로: verdict + 체크 요약(첫 실패 체크의 cmd/exit 포함)."""
+    v = gr.verdict.value
+    checks = gr.checks
+    failed = [c for c in checks if c.status == "fail"]
+    if failed:
+        c = failed[0]
+        what = c.cmd or c.ac_id or c.check_type.value
+        ec = "" if c.exit_code is None else f" (exit {c.exit_code})"
+        return f"gate: {v} — {_truncate(what, 40)}{ec}"
+    if checks:
+        passed = sum(1 for c in checks if c.status == "pass")
+        return f"gate: {v} ({passed}/{len(checks)} 통과)"
+    return f"gate: {v}"
+
+
+def _final_label(state: State) -> str:
+    """종료 라벨: escalated면 직전 escalation 사유를 한 줄로 덧붙인다."""
+    if state.status == Status.escalated and state.pending_escalations:
+        last = state.pending_escalations[-1]
+        reason = None
+        if isinstance(last, dict):
+            reason = last.get("reason") or last.get("question")
+        else:
+            reason = str(last)
+        if reason:
+            return f"종료: {state.status.value} — {_truncate(str(reason))}"
+    return f"종료: {state.status.value}"
+
+
 # ──────────────────────────── 루프 ────────────────────────────
 
 
@@ -186,6 +225,19 @@ def run_loop(
         if progress is not None:
             progress(msg)
 
+    def try_save() -> None:
+        """비치명적 + 증분 저장. write 실패해도 run을 죽이지 않고 경고만 흘린다.
+
+        이벤트 append/spec 변경/종료마다 호출 → Ctrl-C나 후반 실패에도 그때까지의
+        감사 로그가 파일에 남는다. state_path가 없으면 no-op.
+        """
+        if state_path is None:
+            return
+        try:
+            _save_state(state, state_path)
+        except Exception as e:  # noqa: BLE001 — 저장 실패는 run을 죽이면 안 된다
+            emit(f"⚠ state 저장 실패: {state_path} ({e}) — run은 정상 완료됨")
+
     syn_prompt = (
         Path(prompt_dir) / "synthesizer.md" if prompt_dir else intake.DEFAULT_PROMPT_PATH
     )
@@ -200,9 +252,8 @@ def run_loop(
         state = _escalated_no_spec(
             "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
         )
-        emit(f"종료: {state.status.value}")
-        if state_path is not None:
-            _save_state(state, state_path)
+        emit(_final_label(state))
+        try_save()
         return state
 
     state = _init_state(spec)
@@ -217,7 +268,13 @@ def run_loop(
         feedback: str | None = None
         last_err: ReplanError | None = None
         for _attempt in range(replan_retries + 1):
-            emit(f"replan 중… (재시도 {_attempt})")
+            if _attempt == 0:
+                emit("replan 중…")
+            else:
+                emit(
+                    f"replan 재시도 {_attempt}: "
+                    f"{_truncate(feedback or 'Decision 검증 실패')}"
+                )
             try:
                 decision = replan(
                     spec, state, last_result, client,
@@ -248,11 +305,12 @@ def run_loop(
                     {"reason": "next_order 본문 없음", "action": action.value}
                 )
                 break
-            emit("작업 실행 중…")
+            emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
             result = executor.run(no)
             emit("gate 검사 중…")
             gr = gate.judge(result, spec)
             verdict = gr.verdict
+            emit(_summarize_gate(gr))
             state.events.append(
                 Event(
                     seq=len(state.events) + 1,
@@ -264,6 +322,7 @@ def run_loop(
                 )
             )
             _update_plan(state, no.unit, verdict)
+            try_save()  # 증분: 매 이벤트마다 감사 로그 보존(비치명적)
             last_result = f"unit={no.unit} verdict={verdict.value} :: {result}"
             if verdict == Verdict.done:
                 state.status = Status.done
@@ -303,10 +362,13 @@ def run_loop(
                         learnings=outcome.reason,
                     )
                 )
+                emit(f"spec 변경 적용: {proposal.target} (v{spec.version})")
+                try_save()  # 증분: spec 변경도 즉시 보존(비치명적)
                 last_result = f"(spec-change applied — {outcome.reason})"
             else:
                 state.status = Status.escalated
                 state.pending_escalations.append(outcome.note)
+                emit(f"spec 변경 escalate: {_truncate(outcome.reason)}")
 
         else:  # 방어: 미지원 action
             state.status = Status.escalated
@@ -316,9 +378,7 @@ def run_loop(
     if state.status == Status.running:
         state.status = Status.stopped_stuck
 
-    emit(f"종료: {state.status.value}")
-
-    if state_path is not None:
-        _save_state(state, state_path)
+    emit(_final_label(state))
+    try_save()
 
     return state

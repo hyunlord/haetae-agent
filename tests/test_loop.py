@@ -213,6 +213,146 @@ def test_run_loop_event_checks_roundtrip_through_yaml(tmp_path):
     assert checks[0].check_type.value == "test"
 
 
+# ──────────── 진행 메시지 풍부화 (WO#18) ────────────
+
+
+def test_progress_execute_message_includes_unit_and_goal():
+    """작업 실행 진행 메시지에 unit과 goal이 보여야 추적 가능하다."""
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    seen: list[str] = []
+    run_loop(order="x", client=client, executor=MockExecutor("a"),
+             gate=MockGate(Verdict.done), prompt_dir=PROMPT_DIR, progress=seen.append)
+    exec_msgs = [s for s in seen if s.startswith("작업 실행")]
+    assert exec_msgs, seen
+    assert "u1" in exec_msgs[0]
+    assert "u1 구현" in exec_msgs[0]  # _next_order의 goal
+
+
+def test_progress_gate_message_includes_verdict_and_check_summary():
+    """gate 진행 메시지에 verdict와 체크 통과 요약(N/M)이 보여야 한다."""
+    evidence = [_report("ac1", "pass")]
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    gate = MockGate(Verdict.done, checks=evidence)
+    seen: list[str] = []
+    run_loop(order="x", client=client, executor=MockExecutor("a"), gate=gate,
+             prompt_dir=PROMPT_DIR, progress=seen.append)
+    summary = [s for s in seen if s.startswith("gate:")]
+    assert summary, seen
+    assert "done" in summary[0]
+    assert "1/1 통과" in summary[0]
+
+
+def test_progress_gate_message_reports_first_failing_check():
+    """실패 시 첫 실패 체크의 cmd/exit_code가 한 줄로 드러난다."""
+    evidence = [_report("ac1", "pass"), _report("ac2", "fail")]
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    gate = MockGate(Verdict.done, checks=evidence)
+    seen: list[str] = []
+    run_loop(order="x", client=client, executor=MockExecutor("a"), gate=gate,
+             prompt_dir=PROMPT_DIR, progress=seen.append)
+    summary = [s for s in seen if s.startswith("gate:")]
+    assert summary, seen
+    assert "pytest ac2" in summary[0]
+    assert "exit 1" in summary[0]
+
+
+def test_progress_replan_retry_message_shows_reason():
+    """replan 재시도 메시지에 직전 검증 에러 요약이 붙는다."""
+    client = MockClient([SPEC_YAML, DEC_INVALID, _next_order("u1")])
+    seen: list[str] = []
+    run_loop(order="x", client=client, executor=MockExecutor("a"),
+             gate=MockGate(Verdict.done), prompt_dir=PROMPT_DIR, progress=seen.append)
+    retry = [s for s in seen if s.startswith("replan 재시도")]
+    assert retry, seen
+    assert "replan 재시도 1" in retry[0]
+
+
+def test_progress_final_label_includes_escalation_reason():
+    """escalated 종료 라벨에 사유가 한 줄 붙는다."""
+    client = MockClient([SPEC_YAML, DEC_ESCALATE])
+    seen: list[str] = []
+    run_loop(order="x", client=client, executor=MockExecutor("noop"),
+             gate=MockGate(Verdict.pass_), prompt_dir=PROMPT_DIR, progress=seen.append)
+    final = [s for s in seen if s.startswith("종료")]
+    assert final, seen
+    assert "escalated" in final[-1]
+    assert "공성전" in final[-1]  # escalation question이 사유로
+
+
+# ──────────── state 저장 견고화: 비치명적 + 증분 (WO#18) ────────────
+
+
+def test_save_failure_is_non_fatal_and_warns(tmp_path):
+    """state_path가 디렉토리(write 불가)여도 run은 예외 없이 State를 반환하고 경고한다."""
+    bad_path = tmp_path / "as_dir"
+    bad_path.mkdir()  # 디렉토리 → write_text가 IsADirectoryError
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    seen: list[str] = []
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), prompt_dir=PROMPT_DIR,
+                     state_path=bad_path, progress=seen.append)
+    # 성공한 run을 저장 실패가 죽이지 않는다
+    assert state.status is Status.done
+    warns = [s for s in seen if s.startswith("⚠ state 저장 실패")]
+    assert warns, seen
+    assert str(bad_path) in warns[0]
+
+
+def test_save_failure_non_fatal_without_progress(tmp_path):
+    """progress 없이도 저장 실패가 run을 죽이지 않는다(경고는 그냥 흡수)."""
+    bad_path = tmp_path / "as_dir"
+    bad_path.mkdir()
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), prompt_dir=PROMPT_DIR,
+                     state_path=bad_path)
+    assert state.status is Status.done
+
+
+def test_incremental_save_persists_events_during_run(tmp_path):
+    """이벤트마다 증분 저장 → max_iters로 중단돼도 그때까지의 이벤트가 파일에 남는다."""
+    out = tmp_path / "state.yaml"
+    # 끝나지 않는 스크립트: 매번 next_order, gate는 pass만 → max_iters에서 stopped_stuck
+    client = MockClient([SPEC_YAML] + [_next_order("u1")] * 3)
+    run_loop(order="x", client=client, executor=MockExecutor("again"),
+             gate=MockGate(Verdict.pass_), max_iters=3, prompt_dir=PROMPT_DIR,
+             state_path=out)
+    assert out.exists()
+    reloaded = State.from_yaml(out)
+    # 증분으로 3 이벤트가 모두 보존됨(라운드트립)
+    assert len(reloaded.events) == 3
+    assert reloaded.status is Status.stopped_stuck
+
+
+def test_incremental_save_preserves_audit_log_on_midrun_crash(tmp_path):
+    """후반 실패(executor가 2번째에 raise)에도 1번째 이벤트는 이미 파일에 남는다.
+
+    최종 저장이 아니라 *증분* 저장이 동작함을 증명한다 — 루프가 예외로 죽어
+    최종 저장에 도달하지 못해도 그때까지의 감사 로그가 보존되어야 한다.
+    """
+    out = tmp_path / "state.yaml"
+
+    class _CrashOnSecond:
+        def __init__(self):
+            self.n = 0
+
+        def run(self, order):
+            self.n += 1
+            if self.n >= 2:
+                raise RuntimeError("executor 폭발")
+            return "first ok"
+
+    client = MockClient([SPEC_YAML] + [_next_order("u1")] * 3)
+    with pytest.raises(RuntimeError):
+        run_loop(order="x", client=client, executor=_CrashOnSecond(),
+                 gate=MockGate(Verdict.pass_), prompt_dir=PROMPT_DIR, state_path=out)
+    # 루프는 예외로 죽었지만 1번째 이벤트는 증분 저장으로 디스크에 남아야 한다
+    assert out.exists()
+    reloaded = State.from_yaml(out)
+    assert len(reloaded.events) == 1
+    assert reloaded.events[0].unit == "u1"
+
+
 # ──────────────────────────── Protocol 적합성 ────────────────────────────
 
 
