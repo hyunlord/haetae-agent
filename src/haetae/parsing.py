@@ -6,7 +6,7 @@ intake(synthesize)와 replan이 똑같이: raw 응답 → 코드펜스 제거 �
 
 from __future__ import annotations
 
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 import yaml
 from pydantic import BaseModel, ValidationError
@@ -41,8 +41,13 @@ def parse_yaml_model(
     raw: str,
     model_cls: type[M],
     error_cls: type[ParseError] = ParseError,
+    normalize: Callable[[dict], dict] | None = None,
 ) -> M:
-    """raw LLM 응답을 model_cls로 파싱·검증해 반환. 실패 시 error_cls(raw 동봉)."""
+    """raw LLM 응답을 model_cls로 파싱·검증해 반환. 실패 시 error_cls(raw 동봉).
+
+    normalize: model_validate 직전, safe_load된 dict를 보정하는 안전망(선택).
+               흔한 키/타입 변종을 흡수하되, 못 잡는 변종은 그대로 검증 실패로 둔다.
+    """
     body = strip_code_fence(raw)
 
     try:
@@ -54,6 +59,9 @@ def parse_yaml_model(
         raise error_cls(
             f"응답이 매핑(dict)이 아님: {type(data).__name__}", raw
         )
+
+    if normalize is not None:
+        data = normalize(data)
 
     try:
         return model_cls.model_validate(data)

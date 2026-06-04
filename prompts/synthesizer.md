@@ -23,9 +23,55 @@
 
 ## 출력
 
-- **오직 유효한 ProjectSpec(YAML)만** 출력한다. 인사·설명·마크다운 헤더·코드펜스 금지.
-- 스키마는 `spec/projectspec.schema.yaml`을 따른다.
+- **오직 유효한 ProjectSpec(YAML 또는 JSON)만** 출력한다. 인사·설명·마크다운 헤더·코드펜스 금지.
+- 스키마는 `spec/projectspec.schema.yaml`을 따르되, 아래 **"정확한 키와 타입"** 계약을 엄수한다.
 - 사람이 읽는 필드(`goal`, `*.desc`, `assumptions[].text`)는 **한국어**, 키와 enum 값은 **영어**.
+
+---
+
+## 정확한 키와 타입 (구조 계약 — 어기면 검증에서 거부됨)
+
+스키마는 키 이름과 타입을 **정확히** 따져 검증한다. 다음을 절대 변형하지 마라:
+
+- 최상위 **필수 필드** (하나라도 빠지면 spec 거부): `spec_id`(str), `version`(int),
+  `order_raw`(str), `goal`(str), `task_type`(enum), `verifiability`(enum), `mode`(enum),
+  `acceptance_criteria`(list), `non_goals`(list), `done_when`(str).
+- `constraints`, `non_goals`는 **문자열의 리스트**(`list[str]`). `{id, desc}` 같은 객체 리스트 **금지**.
+- `decomposition[]` 항목의 키는 **`unit`**(절대 `id` 아님), `desc`, 선택 `deps`(`list[str]`).
+- `acceptance_criteria[]`는 `id`, `desc`, `check`. `check`의 명령 키는 **`cmd`**(절대 `command` 아님),
+  그리고 `type`(enum), 선택 `pass`. `check`에 다른 키(`command`, `desc` 등)를 **추가하지 마라**.
+- `assumptions[]`는 `id`, `text`, `confidence`(0~1 float), `checkpoint`(bool).
+
+## 완성 예시 (이 모양을 그대로 베껴라)
+
+```yaml
+spec_id: todo-cli-001
+version: 1
+order_raw: "할 일 추가/조회/완료하는 todo CLI를 Python으로"
+goal: "Python 표준 라이브러리만으로 할 일을 추가·조회·완료하는 최소 todo CLI를 구현한다."
+task_type: feature_impl
+verifiability: objective
+mode: normal
+constraints:
+  - "구현 언어는 Python (표준 라이브러리만)"
+acceptance_criteria:
+  - id: ac1
+    desc: "add 명령으로 새 할 일이 미완료로 저장되고 id가 출력된다"
+    check: { type: test, cmd: "python -m pytest -k add" }
+  - id: ac2
+    desc: "complete 명령으로 해당 id가 완료 처리되고 list에 반영된다"
+    check: { type: test, cmd: "python -m pytest -k complete" }
+assumptions:
+  - { id: as1, text: "데이터는 로컬 JSON 파일에 저장", confidence: 0.7, checkpoint: false }
+non_goals:
+  - "웹/GUI/TUI"
+  - "마감일·우선순위·태그 등 확장 메타데이터"
+done_when: "모든 acceptance_criteria 통과 AND 기존 테스트 무회귀"
+decomposition:
+  - { unit: u1, desc: "저장 모델과 JSON 입출력 구현", deps: [] }
+  - { unit: u2, desc: "add/list/complete CLI 구현", deps: [u1] }
+open_questions: []
+```
 
 ---
 
