@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Callable
 
 from haetae.models import NextOrder
+from haetae.providers.codex import CodexError, exec_codex
 
 # 사람이 결과 입력을 끝낼 때 쓰는 센티넬 라인
 SENTINEL = "---END---"
@@ -74,3 +76,69 @@ class HumanRelayExecutor:
     def run(self, order: NextOrder) -> str:
         self.present(format_work_order(order))
         return self.collect()
+
+
+class CodexExecutorError(RuntimeError):
+    """CodexExecutor 실행 실패(비정상 종료/빈 출력/타임아웃 등)."""
+
+
+# codex에게 work order 뒤에 붙이는 실행 지시. HumanRelay용 센티넬 안내는 무시되고
+# 대신 "이 디렉토리에서 직접 구현하고 요약 보고하라"를 명시한다.
+_EXEC_INSTRUCTION = (
+    "\n\n"
+    + "=" * 60
+    + "\n"
+    "위 work order를 **지금 이 작업 디렉토리에서 직접** 구현하라.\n"
+    "- 필요한 파일을 만들고/수정하라 (이 디렉토리 밖은 건드리지 마라).\n"
+    "- local_checks가 있으면 직접 돌려 검증하라.\n"
+    "- 끝나면 무엇을 했는지(변경/생성한 파일, 검증 결과)를 한국어로 요약 보고하라.\n"
+)
+
+
+class CodexExecutor:
+    """work order를 codex(쓰기 sandbox)에 직접 던져 `--workdir`에서 자율 구현시키는 Executor.
+
+    HumanRelayExecutor를 대체해 run_loop에 끼울 수 있다(둘 다 Executor Protocol 충족).
+
+    ⚠️ SAFETY: 이건 LLM이 만든 work order를 *쓰기 권한*으로 실행하는 위험 단계다.
+      - sandbox는 가장 좁은 쓰기 모드(workspace-write)만. danger-full-access는
+        exec_codex의 화이트리스트가 코드 레벨에서 막는다.
+      - 실행 범위는 cwd=workdir로 한정된다(`-C`). workdir 밖은 codex가 못 건드린다.
+      - 단, 지금은 버리는 scratch 폴더(예: ~/haetae-test/...) 용도다. 진짜 repo에
+        쓰려면 컨테이너/VM 격리가 필요하며 그건 후속 hardening(이번 스코프 아님).
+
+    model:   codex 모델 override. None이면 codex 설정 기본.
+    workdir: codex 작업 루트(cwd). 실행이 이 폴더로 한정된다.
+    timeout: subprocess 타임아웃(초). 자율 구현은 느릴 수 있어 넉넉히.
+    sandbox: 쓰기 sandbox. 기본 workspace-write(가장 좁은 쓰기 모드).
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        workdir: str | Path = ".",
+        timeout: float = 1800.0,
+        sandbox: str = "workspace-write",
+    ):
+        self.model = model
+        self.workdir = Path(workdir)
+        self.timeout = timeout
+        self.sandbox = sandbox
+
+    # ── Executor 인터페이스 ────────────────────────────────────────────
+    def run(self, order: NextOrder) -> str:
+        prompt = format_work_order(order) + _EXEC_INSTRUCTION
+        return self._run(prompt)
+
+    # ── 테스트 seam: 실제 subprocess 실행은 공유 헬퍼로 격리 ────────────
+    def _run(self, prompt: str) -> str:
+        try:
+            return exec_codex(
+                prompt,
+                sandbox=self.sandbox,
+                cwd=str(self.workdir),
+                model=self.model,
+                timeout=self.timeout,
+            )
+        except CodexError as e:
+            raise CodexExecutorError(str(e)) from e

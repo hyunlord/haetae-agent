@@ -8,7 +8,7 @@ Protocol + mock으로 두고 *오케스트레이션 흐름*만 증명한다.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 import yaml
 
@@ -152,6 +152,7 @@ def run_loop(
     replan_retries: int = 2,
     prompt_dir: str | Path | None = None,
     state_path: str | Path | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -159,7 +160,16 @@ def run_loop(
       - 합성(synthesize) 실패: traceback 대신 escalated State 반환.
       - replan 출력 검증 실패: 최대 replan_retries회 재시도(직전 에러를 피드백으로
         얹어 self-correction 유도), 소진 시 escalate하고 루프 종료(예외 전파 안 함).
+
+    progress: 단계 진입 시 한 줄 상태를 받는 콜백(WO#13). 기본 None=no-op이라
+      테스트엔 아무것도 새지 않는다. CLI는 stderr로 찍는 함수를 주입해 느린 codex
+      호출이 "행"으로 안 보이게 한다.
     """
+
+    def emit(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
     syn_prompt = (
         Path(prompt_dir) / "synthesizer.md" if prompt_dir else intake.DEFAULT_PROMPT_PATH
     )
@@ -167,12 +177,14 @@ def run_loop(
         Path(prompt_dir) / "replan.md" if prompt_dir else replan_mod.DEFAULT_PROMPT_PATH
     )
 
+    emit("합성 중…")
     try:
         spec = synthesize(order, client, prompt_path=syn_prompt)
     except SynthesisError as e:
         state = _escalated_no_spec(
             "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
         )
+        emit(f"종료: {state.status.value}")
         if state_path is not None:
             _save_state(state, state_path)
         return state
@@ -189,6 +201,7 @@ def run_loop(
         feedback: str | None = None
         last_err: ReplanError | None = None
         for _attempt in range(replan_retries + 1):
+            emit(f"replan 중… (재시도 {_attempt})")
             try:
                 decision = replan(
                     spec, state, last_result, client,
@@ -219,7 +232,9 @@ def run_loop(
                     {"reason": "next_order 본문 없음", "action": action.value}
                 )
                 break
+            emit("작업 실행 중…")
             result = executor.run(no)
+            emit("gate 검사 중…")
             verdict = gate.judge(result, spec)
             state.events.append(
                 Event(
@@ -266,6 +281,8 @@ def run_loop(
     # max_iters 도달 등으로 여전히 running이면 임시로 stopped_stuck.
     if state.status == Status.running:
         state.status = Status.stopped_stuck
+
+    emit(f"종료: {state.status.value}")
 
     if state_path is not None:
         _save_state(state, state_path)

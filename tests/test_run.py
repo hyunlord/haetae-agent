@@ -2,11 +2,12 @@
 
 from pathlib import Path
 
-from haetae.executors import HumanRelayExecutor
+import haetae.run as run_mod
+from haetae.executors import CodexExecutor, HumanRelayExecutor
 from haetae.llm import MockClient
 from haetae.loop import MockGate
 from haetae.models import State, Status, Verdict
-from haetae.run import format_summary, run
+from haetae.run import format_summary, main, run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = REPO_ROOT / "prompts"
@@ -78,3 +79,40 @@ def test_format_summary_contains_status_and_plan():
     assert "status" in summary
     assert "done" in summary
     assert "u1=" in summary
+
+
+# ──────────────────────────── --executor 배선 (WO#13) ────────────────────────────
+
+
+def _capture_main_run(monkeypatch):
+    """main()이 run()에 넘기는 kwargs를 캡처하고, 실제 루프는 돌리지 않는다."""
+    captured = {}
+
+    def fake_run(order, **kwargs):
+        captured["order"] = order
+        captured.update(kwargs)
+        return State(spec_ref="x", spec_version=1, status=Status.done)
+
+    monkeypatch.setattr(run_mod, "run", fake_run)
+    return captured
+
+
+def test_main_executor_codex_wires_codexexecutor(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    rc = main(["--order", "x", "--executor", "codex", "--workdir", "/tmp/scratch"])
+    assert rc == 0
+    ex = captured["executor"]
+    assert isinstance(ex, CodexExecutor)
+    # gate와 같은 --workdir로 범위가 한정됐는지
+    assert str(ex.workdir) == "/tmp/scratch"
+    # 가장 좁은 쓰기 sandbox 기본
+    assert ex.sandbox == "workspace-write"
+    # progress 함수가 주입됐는지
+    assert callable(captured.get("progress"))
+
+
+def test_main_executor_defaults_to_human(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    rc = main(["--order", "x"])
+    assert rc == 0
+    assert isinstance(captured["executor"], HumanRelayExecutor)

@@ -119,6 +119,38 @@ def test_run_loop_max_iters_caps():
     assert len(state.events) == 3
 
 
+# ──────────────────────────── 진행 표시 (WO#13) ────────────────────────────
+
+
+def test_run_loop_emits_progress_labels():
+    """progress 콜백에 synthesize/replan/execute/gate/종료 라벨이 흘러오는지."""
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u2")])
+    executor = MockExecutor(["u1 done", "u2 done"])
+    gate = MockGate([Verdict.pass_, Verdict.done])
+
+    seen: list[str] = []
+    state = run_loop(order="x", client=client, executor=executor, gate=gate,
+                     prompt_dir=PROMPT_DIR, progress=seen.append)
+
+    assert state.status is Status.done
+    assert any(s.startswith("합성 중") for s in seen)
+    assert any(s.startswith("replan 중") for s in seen)
+    assert any(s.startswith("작업 실행 중") for s in seen)
+    assert any(s.startswith("gate 검사 중") for s in seen)
+    assert any(s.startswith("종료") for s in seen)
+
+
+def test_run_loop_progress_defaults_to_noop(capsys):
+    """progress 기본 None → 표준출력/에러로 아무것도 새지 않는다."""
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u2")])
+    run_loop(order="x", client=client,
+             executor=MockExecutor(["u1 done", "u2 done"]),
+             gate=MockGate([Verdict.pass_, Verdict.done]), prompt_dir=PROMPT_DIR)
+    out = capsys.readouterr()
+    assert out.out == ""
+    assert out.err == ""
+
+
 # ──────────────────────────── state_path 저장/재로드 ────────────────────────────
 
 

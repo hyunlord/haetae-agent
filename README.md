@@ -26,3 +26,12 @@ OpenClaw류 범용 에이전트가 "손"이라면, haetae는 **멈출 줄 아는
 
 부트스트랩 단계. 데몬·CI·패키징은 아직 없음.
 현재는 director 로직(특히 명세 합성기)을 사람이 손으로 루프를 돌리며(dogfooding) 만들고 있다.
+
+## ⚠️ 자율 executor 안전 한계 (CodexExecutor)
+
+`--executor codex`(opt-in)는 LLM이 만든 work order를 **쓰기 권한으로** 실행한다.
+방어선은 두 겹뿐이다: (1) 가장 좁은 쓰기 sandbox `workspace-write`(danger-full-access는
+코드 화이트리스트가 차단), (2) 실행 범위를 `--workdir`로 한정(`-C`).
+이건 프로세스 수준 격리라 **충분하지 않다.** 지금은 버리는 scratch 폴더
+(예: `~/haetae-test/...`)에만 써라. 진짜 repo에 물리려면 컨테이너/VM 격리가
+필요하며 그건 후속 hardening이다.
