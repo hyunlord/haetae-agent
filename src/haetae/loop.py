@@ -12,7 +12,7 @@ from typing import Callable, Protocol, runtime_checkable
 
 import yaml
 
-from haetae import intake, replan as replan_mod
+from haetae import intake, replan as replan_mod, spec_critic as critic_mod
 from haetae.intake import SynthesisError, synthesize
 from haetae.llm import LLMClient
 from haetae.models import (
@@ -24,12 +24,14 @@ from haetae.models import (
     PlanItem,
     PlanState,
     ProjectSpec,
+    SpecCritique,
     State,
     Status,
     Verdict,
 )
 from haetae.replan import ReplanError, replan
 from haetae.spec_change import apply_spec_change
+from haetae.spec_critic import synthesize_with_critique
 
 
 # ──────────────────────────── 주입 인터페이스 ────────────────────────────
@@ -180,6 +182,18 @@ def _summarize_gate(gr: GateResult) -> str:
     return f"gate: {v}"
 
 
+def _critique_label(crit: SpecCritique) -> str:
+    """spec critic 비평을 한 줄 progress로: 재합성/평가불가/soft/adequate."""
+    if crit.resynthesized:
+        return "spec critic: soft — 1회 재합성"
+    if crit.note and "평가 불가" in crit.note:
+        return "spec critic: (평가 불가)"
+    if crit.verdict == "soft":
+        # soft지만 재합성이 안 일어남(구체 gap 없음 or 재합성 폴백) → 원본 유지.
+        return "spec critic: soft — 원본 유지"
+    return "spec critic: adequate"
+
+
 def _final_label(state: State) -> str:
     """종료 라벨: escalated면 직전 escalation 사유를 한 줄로 덧붙인다."""
     if state.status == Status.escalated and state.pending_escalations:
@@ -203,6 +217,7 @@ def run_loop(
     executor: Executor,
     gate: Gate,
     *,
+    critic_client: LLMClient | None = None,
     max_iters: int = 20,
     replan_retries: int = 2,
     prompt_dir: str | Path | None = None,
@@ -244,10 +259,23 @@ def run_loop(
     rep_prompt = (
         Path(prompt_dir) / "replan.md" if prompt_dir else replan_mod.DEFAULT_PROMPT_PATH
     )
+    critic_prompt = (
+        Path(prompt_dir) / "spec_critic.md"
+        if prompt_dir
+        else critic_mod.DEFAULT_CRITIC_PROMPT_PATH
+    )
 
     emit("합성 중…")
+    critique: SpecCritique | None = None
     try:
-        spec = synthesize(order, client, prompt_path=syn_prompt)
+        if critic_client is not None:
+            # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
+            spec, critique = synthesize_with_critique(
+                order, client, critic_client,
+                syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
+            )
+        else:
+            spec = synthesize(order, client, prompt_path=syn_prompt)
     except SynthesisError as e:
         state = _escalated_no_spec(
             "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
@@ -257,6 +285,10 @@ def run_loop(
         return state
 
     state = _init_state(spec)
+    if critique is not None:
+        state.spec_critique = critique  # 감사 기록(재합성 발생 여부 포함)
+        emit(_critique_label(critique))
+        try_save()
     last_result = "(시작 — 아직 실행 없음)"
 
     iters = 0

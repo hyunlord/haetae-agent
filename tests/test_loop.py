@@ -353,6 +353,76 @@ def test_incremental_save_preserves_audit_log_on_midrun_crash(tmp_path):
     assert reloaded.events[0].unit == "u1"
 
 
+# ──────────── spec critic 통합 (WO#19) ────────────
+
+_CRIT_SOFT = """\
+verdict: soft
+gaps:
+  - area: "ac1"
+    cheap_path: "격자 칸 점유만 막으면 통과 — 진짜 어려움 회피"
+    strengthening: "연속공간 고밀도 충돌까지 검사하도록 ac 강화"
+"""
+_CRIT_ADEQUATE = "verdict: adequate\ngaps: []\n"
+
+
+def test_run_loop_critic_off_by_default():
+    """critic_client 미주입 → critic 호출 0, critique 미기록(기존 동작 불변)."""
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert state.spec_critique is None
+    assert len(client.calls) == 2  # synthesize + replan만, critic 재합성 없음
+
+
+def test_run_loop_critic_adequate_surfaces_and_persists():
+    """critic_client 주입 + adequate → progress surface + State.spec_critique 기록."""
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    critic = MockClient([_CRIT_ADEQUATE])
+    seen: list[str] = []
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), critic_client=critic,
+                     prompt_dir=PROMPT_DIR, progress=seen.append)
+    assert state.status is Status.done
+    assert state.spec_critique is not None
+    assert state.spec_critique.verdict == "adequate"
+    assert state.spec_critique.resynthesized is False
+    assert any(s == "spec critic: adequate" for s in seen), seen
+    assert len(critic.calls) == 1
+
+
+def test_run_loop_critic_soft_triggers_resynthesis_and_records():
+    """soft(구체 gap) → 1회 재합성, progress·State에 재합성 사실이 남는다."""
+    # client: synthesize → 재합성 → replan
+    client = MockClient([SPEC_YAML, SPEC_YAML, _next_order("u1")])
+    critic = MockClient([_CRIT_SOFT])
+    seen: list[str] = []
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), critic_client=critic,
+                     prompt_dir=PROMPT_DIR, progress=seen.append)
+    assert state.status is Status.done
+    assert state.spec_critique is not None
+    assert state.spec_critique.resynthesized is True
+    assert any(s.startswith("spec critic: soft") and "재합성" in s for s in seen), seen
+    assert len(client.calls) == 3  # synthesize + 재합성 + replan
+
+
+def test_run_loop_critic_persists_through_yaml(tmp_path):
+    """State.spec_critique가 YAML로 저장/재로드되는지(감사 로그)."""
+    out = tmp_path / "state.yaml"
+    # soft면 synthesize가 2회 소비됨(합성 + 재합성) → client 시퀀스도 그만큼.
+    client = MockClient([SPEC_YAML, SPEC_YAML, _next_order("u1")])
+    critic = MockClient([_CRIT_SOFT])
+    run_loop(order="x", client=client, executor=MockExecutor("a"),
+             gate=MockGate(Verdict.done), critic_client=critic,
+             prompt_dir=PROMPT_DIR, state_path=out)
+    reloaded = State.from_yaml(out)
+    assert reloaded.spec_critique is not None
+    assert reloaded.spec_critique.verdict == "soft"
+    assert reloaded.spec_critique.resynthesized is True
+    assert len(reloaded.spec_critique.gaps) == 1
+
+
 # ──────────────────────────── Protocol 적합성 ────────────────────────────
 
 

@@ -25,6 +25,7 @@ def run(
     client: LLMClient,
     executor: Executor,
     gate: Gate,
+    critic_client: LLMClient | None = None,
     max_iters: int = 20,
     state_path: str | Path | None = None,
     prompt_dir: str | Path | None = None,
@@ -36,6 +37,7 @@ def run(
         client,
         executor,
         gate,
+        critic_client=critic_client,
         max_iters=max_iters,
         state_path=state_path,
         prompt_dir=prompt_dir,
@@ -75,6 +77,14 @@ def main(argv: list[str] | None = None) -> int:
         help="judge 전용 codex 모델 (executor --model과 다르게 줘 독립성 확보; 기본: codex 설정)",
     )
     parser.add_argument(
+        "--critic-model",
+        default=None,
+        help=(
+            "spec critic 전용 codex 모델 (주면 적대적 spec 비평 ON — 다른 모델 권장 = 독립성). "
+            "없으면 critic OFF(추가 비용 0, 기존 동작 불변)"
+        ),
+    )
+    parser.add_argument(
         "--executor",
         choices=["human", "codex"],
         default="human",
@@ -97,6 +107,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         executor = HumanRelayExecutor()
 
+    # spec critic: --critic-model 줄 때만 ON(read-only, 합성기와 다른 모델 권장 = 독립성).
+    # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
+    critic_client = CodexClient(model=args.critic_model) if args.critic_model else None
+
     # 진행 표시: 느린 codex 호출이 "행"으로 안 보이게 stderr로 한 줄씩.
     def progress(msg: str) -> None:
         print(f"… {msg}", file=sys.stderr, flush=True)
@@ -106,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         client=client,
         executor=executor,
         gate=gate,
+        critic_client=critic_client,
         max_iters=args.max_iters,
         state_path=args.state_path,
         progress=progress,

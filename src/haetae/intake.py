@@ -83,8 +83,13 @@ def synthesize(
     client: LLMClient,
     context: str | None = None,
     prompt_path: str | Path = DEFAULT_PROMPT_PATH,
+    *,
+    feedback: str | None = None,
 ) -> ProjectSpec:
     """주문을 합성기에 태워 검증된 ProjectSpec을 반환한다.
+
+    feedback: 직전 합성된 spec에 대한 적대적 비평. 주어지면 user 메시지에 얹어
+              모델이 *기준을 강화한* spec을 다시 내도록 유도한다(critic 재합성 경로).
 
     실패 시(YAML 파싱 불가 / 스키마 검증 불통과) raw 응답을 담은 SynthesisError.
     """
@@ -93,6 +98,13 @@ def synthesize(
     user = f"# 주문(order)\n{order}"
     if context:
         user += f"\n\n# 프로젝트 컨텍스트(project_context)\n{context}"
+    if feedback:
+        user += (
+            "\n\n# ⚠️ 직전 합성된 spec이 적대적 비평에서 '물렁하다'고 지적됨 — "
+            "아래 지적을 반영해 acceptance_criteria/done_when을 *더 엄격하게* 강화한 "
+            "ProjectSpec을 다시(그리고 그것만) 출력하라\n"
+            f"{feedback}"
+        )
 
     raw = client.complete(system, user)
     return parse_yaml_model(

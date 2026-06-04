@@ -210,6 +210,38 @@ class Budget(BaseModel):
     cap: Cost = Field(default_factory=Cost)
 
 
+# ──────────────────────── SpecCritique (적대적 spec 비평) ────────────────────────
+
+
+class SpecGap(BaseModel):
+    """비평가가 짚은 구체적 약점 하나.
+
+    cheap_path: acceptance_criteria를 *싸구려로/trivial하게* 충족하는 구체 경로.
+    strengthening: 그 cheap-path를 막으려면 기준을 어떻게 강화해야 하는지.
+    막연한 지적은 금지 — area만 있고 cheap_path가 없으면 약한 신호다.
+    """
+
+    area: str
+    cheap_path: str | None = None
+    strengthening: str | None = None
+
+
+class SpecCritique(BaseModel):
+    """spec critic의 구조화 출력 + 오케스트레이션 결과(감사용).
+
+    verdict: "adequate"(진짜 어려움을 잡음) | "soft"(싸구려 충족 경로 있음).
+             파싱/평가 불가 시 견고성 차원에서 "adequate"로 흡수(진행 막지 않음).
+    gaps:    구체적 약점 목록. soft인데 gaps가 비면 재합성을 트리거하지 않는다.
+    note:    메타 기록(예: "평가 불가: ...", 재합성 폴백 사유). surface/감사용.
+    resynthesized: 비평을 피드백으로 1회 재합성이 *실제로* 일어났는지(루프가 설정).
+    """
+
+    verdict: str
+    gaps: list[SpecGap] = Field(default_factory=list)
+    note: str | None = None
+    resynthesized: bool = False
+
+
 # ──────────────────────────── State ────────────────────────────
 
 
@@ -224,6 +256,8 @@ class State(BaseModel):
     spec_changes: list[SpecChange] = Field(default_factory=list)
     budget: Budget = Field(default_factory=Budget)
     pending_escalations: list[Any] = Field(default_factory=list)
+    # synthesize 직후 적대적 critic이 남긴 비평(opt-in; critic OFF면 None).
+    spec_critique: SpecCritique | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "State":
