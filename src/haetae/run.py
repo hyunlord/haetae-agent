@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from haetae.executors import CodexExecutor, HumanRelayExecutor
-from haetae.gate import CheckRunner
+from haetae.gate import CompositeGate
 from haetae.llm import CodexClient
 from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
@@ -70,6 +70,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model", default=None, help="codex 모델 override (기본: codex 설정)")
     parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="judge 전용 codex 모델 (executor --model과 다르게 줘 독립성 확보; 기본: codex 설정)",
+    )
+    parser.add_argument(
         "--executor",
         choices=["human", "codex"],
         default="human",
@@ -80,7 +85,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     client = CodexClient(model=args.model)
-    gate = CheckRunner(workdir=args.workdir)
+    # judge는 read-only CodexClient(executor와 다른 --judge-model 가능). judge 타입
+    # 기준이 없는 spec(예: palindrome)이면 CompositeGate가 judge를 아예 안 부른다.
+    gate = CompositeGate(
+        workdir=args.workdir,
+        judge_client=CodexClient(model=args.judge_model),
+    )
     if args.executor == "codex":
         # 자율 쓰기 실행 — gate와 같은 --workdir로 범위 한정.
         executor: Executor = CodexExecutor(model=args.model, workdir=args.workdir)

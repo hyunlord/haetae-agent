@@ -21,10 +21,30 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from haetae.judge import DEFAULT_JUDGE_PROMPT_PATH, LLMJudge
+from haetae.llm import LLMClient
 from haetae.models import CheckReport, CheckType, GateResult, ProjectSpec, Verdict
 
 # 기계로 자동 실행 불가한 check 타입
 _UNEVALUATABLE_TYPES = {CheckType.human, CheckType.judge}
+
+
+def aggregate_verdict(reports: list[CheckReport]) -> Verdict:
+    """per-check 보고들을 하나의 verdict로 집계하는 공유 규칙(중복 금지).
+
+    CheckRunner와 CompositeGate가 *동일* 규칙을 쓰도록 일원화한다:
+      - fail 하나라도 → fail_recoverable
+      - fail 없고 skipped 하나라도 → ambiguous (사람/judge tier 필요)
+      - 전부 pass → pass_
+    gate는 done을 내지 않는다(done_when 충족 판단은 replan 몫).
+    """
+    any_fail = any(r.status == "fail" for r in reports)
+    any_skipped = any(r.status == "skipped" for r in reports)
+    if any_fail:
+        return Verdict.fail_recoverable
+    if any_skipped:
+        return Verdict.ambiguous
+    return Verdict.pass_
 
 
 class CheckRunner:
@@ -42,26 +62,9 @@ class CheckRunner:
 
     # ── Gate 인터페이스 ───────────────────────────────────────────────
     def judge(self, result: str, spec: ProjectSpec) -> GateResult:
-        report: list[CheckReport] = []
-        any_fail = False
-        any_skipped = False
-
-        for ac in spec.acceptance_criteria:
-            entry = self._run_check(ac.id, ac.check)
-            report.append(entry)
-            if entry.status == "fail":
-                any_fail = True
-            elif entry.status == "skipped":
-                any_skipped = True
-
-        # 집계 규칙은 불변 — 근거(report)만 반환에 동봉한다.
-        if any_fail:
-            verdict = Verdict.fail_recoverable
-        elif any_skipped:
-            verdict = Verdict.ambiguous
-        else:
-            verdict = Verdict.pass_
-        return GateResult(verdict=verdict, checks=report)
+        report = [self._run_check(ac.id, ac.check) for ac in spec.acceptance_criteria]
+        # 집계 규칙은 공유 헬퍼로 일원화 — 근거(report)만 반환에 동봉한다.
+        return GateResult(verdict=aggregate_verdict(report), checks=report)
 
     # ── 단일 check 실행 ───────────────────────────────────────────────
     def _run_check(self, ac_id: str, check) -> CheckReport:
@@ -104,3 +107,69 @@ class CheckRunner:
 def _tail(s: str, n: int = 300) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else "…" + s[-n:]
+
+
+class CompositeGate:
+    """기계 체크(CheckRunner)와 LLM judge를 기준별로 라우팅해 하나의 GateResult로 합친다.
+
+    라우팅(check.type 기준):
+      - 기계(test/bench/lint/build/schema, cmd 있음) → CheckRunner._run_check 재사용.
+      - judge 타입 → 모아서 LLMJudge.judge_criteria로 *한 번에* 평가(느린 호출 절감).
+      - human / cmd 없음 → skipped(CheckRunner._run_check이 그대로 처리).
+
+    비용/행동 불변 보장: judge_client=None 이거나 judge 타입 기준이 0개면 LLMJudge를
+    아예 만들지 않아 judge 호출 0회. judge 타입은 그때 _run_check으로 흘러 skipped가
+    되므로(=기존 CheckRunner와 동일), 기계 전용 spec의 verdict는 무회귀다.
+
+    집계는 aggregate_verdict 공유 헬퍼로 일원화한다(CheckRunner와 동일 규칙).
+    """
+
+    def __init__(
+        self,
+        workdir: str | Path = ".",
+        judge_client: LLMClient | None = None,
+        *,
+        timeout: float = 120,
+        judge_prompt_path: str | Path = DEFAULT_JUDGE_PROMPT_PATH,
+        max_file_bytes: int = 64_000,
+        max_total_bytes: int = 200_000,
+    ):
+        self.workdir = str(workdir)
+        self.judge_client = judge_client
+        self.judge_prompt_path = judge_prompt_path
+        self.max_file_bytes = max_file_bytes
+        self.max_total_bytes = max_total_bytes
+        # 기계 per-check 평가는 CheckRunner에 위임(중복 로직 금지).
+        self._runner = CheckRunner(workdir=workdir, timeout=timeout)
+
+    # ── Gate 인터페이스 ───────────────────────────────────────────────
+    def judge(self, result: str, spec: ProjectSpec) -> GateResult:
+        # judge 타입은 judge_client이 있을 때만 LLM 경로로. 없으면 _run_check→skipped.
+        route_to_judge = self.judge_client is not None
+        judge_acs = [
+            ac
+            for ac in spec.acceptance_criteria
+            if route_to_judge and ac.check.type == CheckType.judge
+        ]
+
+        judged: dict[str, CheckReport] = {}
+        if judge_acs:  # 비면 LLMJudge 생성·호출 0회.
+            llm_judge = LLMJudge(
+                self.judge_client,
+                workdir=self.workdir,
+                prompt_path=self.judge_prompt_path,
+                max_file_bytes=self.max_file_bytes,
+                max_total_bytes=self.max_total_bytes,
+            )
+            for rep in llm_judge.judge_criteria(judge_acs, result, spec):
+                judged[rep.ac_id] = rep
+
+        # spec 순서를 보존하며 기계/ judge 보고를 합친다.
+        report: list[CheckReport] = []
+        for ac in spec.acceptance_criteria:
+            if ac.id in judged:
+                report.append(judged[ac.id])
+            else:
+                report.append(self._runner._run_check(ac.id, ac.check))
+
+        return GateResult(verdict=aggregate_verdict(report), checks=report)
