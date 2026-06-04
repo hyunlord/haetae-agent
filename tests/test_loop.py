@@ -142,3 +142,80 @@ def test_run_loop_saves_and_reloads_state(tmp_path):
 def test_mocks_satisfy_protocols():
     assert isinstance(MockExecutor("x"), Executor)
     assert isinstance(MockGate(Verdict.pass_), Gate)
+
+
+# ──────────────────── 루프 내성 (WO#12 — LLM 출력으로 crash 금지) ────────────────────
+
+# 정규화로도 못 고치는 검증 실패(action enum 위반) → replan이 ReplanError를 낸다.
+DEC_INVALID = """\
+verdict: pass
+action: teleport
+rationale: "미지원 action — 검증 실패용"
+"""
+
+
+def test_run_loop_replan_retries_then_succeeds():
+    """첫 replan이 검증 실패해도 재시도로 정상 출력을 얻으면 crash 없이 진행한다."""
+    # iter1: replan attempt1=DEC_INVALID(실패) → attempt2=정상 next_order → done
+    client = MockClient([SPEC_YAML, DEC_INVALID, _next_order("u1")])
+    state = run_loop(order="x", client=client,
+                     executor=MockExecutor("u1 done"), gate=MockGate(Verdict.done),
+                     prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert len(state.events) == 1
+    assert state.events[0].unit == "u1"
+    assert state.pending_escalations == []  # 재시도로 흡수 → escalate 없음
+
+
+def test_run_loop_escalates_when_replan_retries_exhausted():
+    """replan이 계속 검증 실패하면 crash 대신 escalated로 종료하고 raw를 보존한다."""
+    # replan_retries=2 → iter1에서 3회 시도 모두 실패 → escalate
+    client = MockClient([SPEC_YAML, DEC_INVALID, DEC_INVALID, DEC_INVALID])
+    state = run_loop(order="x", client=client,
+                     executor=MockExecutor("noop"), gate=MockGate(Verdict.pass_),
+                     replan_retries=2, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.escalated
+    assert len(state.pending_escalations) == 1
+    esc = state.pending_escalations[0]
+    assert "검증 실패" in esc["reason"]
+    assert "teleport" in esc["raw_response"]  # raw 응답 보존
+    assert state.events == []  # 실행까지 못 감
+
+
+def test_run_loop_feeds_validation_error_back_on_retry():
+    """재시도 시 직전 검증 에러를 피드백으로 프롬프트에 얹어 self-correction을 유도한다."""
+    client = MockClient([SPEC_YAML, DEC_INVALID, _next_order("u1")])
+    run_loop(order="x", client=client,
+             executor=MockExecutor("u1 done"), gate=MockGate(Verdict.done),
+             prompt_dir=PROMPT_DIR)
+    # calls: [0]=synthesize, [1]=replan attempt1(피드백 없음), [2]=replan retry(피드백 있음)
+    assert "검증 실패" not in client.calls[1]["user"]
+    assert "직전 응답이 검증에 실패" in client.calls[2]["user"]
+
+
+def test_run_loop_synthesis_failure_returns_escalated_without_traceback():
+    """합성 실패 시 traceback 대신 escalated State를 반환한다(spec 없음)."""
+    # 매핑(dict)이 아닌 출력 → SynthesisError
+    client = MockClient(["이건 spec이 아니라 그냥 문장이다"])
+    state = run_loop(order="x", client=client,
+                     executor=MockExecutor("noop"), gate=MockGate(Verdict.pass_),
+                     prompt_dir=PROMPT_DIR)
+    assert state.status is Status.escalated
+    assert state.spec_ref == "(synthesis-failed)"
+    assert len(state.pending_escalations) == 1
+    esc = state.pending_escalations[0]
+    assert "합성 실패" in esc["reason"]
+    assert "그냥 문장" in esc["raw_response"]  # raw 보존
+    assert state.events == []
+
+
+def test_run_loop_synthesis_failure_saves_state(tmp_path):
+    """합성 실패로 끝나도 state_path가 주어지면 escalated State를 저장한다."""
+    out = tmp_path / "state.yaml"
+    client = MockClient(["not a mapping"])
+    run_loop(order="x", client=client,
+             executor=MockExecutor("noop"), gate=MockGate(Verdict.pass_),
+             prompt_dir=PROMPT_DIR, state_path=out)
+    assert out.exists()
+    reloaded = State.from_yaml(out)
+    assert reloaded.status is Status.escalated

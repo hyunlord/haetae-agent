@@ -18,6 +18,7 @@ class ParseError(Exception):
     """LLM 응답 파싱/검증 실패. 디버깅을 위해 raw 응답을 동봉한다."""
 
     def __init__(self, message: str, raw_response: str):
+        self.message = message
         self.raw_response = raw_response
         super().__init__(f"{message}\n--- raw LLM 응답 ---\n{raw_response}")
 

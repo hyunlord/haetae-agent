@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 from haetae.llm import MockClient
-from haetae.models import Action, Decision, ProjectSpec, State, Verdict
-from haetae.replan import ReplanError, replan
+from haetae.models import Action, CheckType, Decision, ProjectSpec, State, Verdict
+from haetae.replan import ReplanError, _normalize_decision_dict, replan
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPEC_DIR = REPO_ROOT / "spec"
@@ -101,3 +101,62 @@ def test_replan_rejects_invalid_verdict():
 def test_replan_rejects_broken_yaml():
     with pytest.raises(ReplanError):
         _replan("verdict: [unclosed\n : : :")
+
+
+# ──────────────────────── 정규화 (WO#12 — Decision 경로 안전망) ────────────────────────
+
+# live 실행에서 crash를 유발했던 변종: local_checks[].type=smoke + command 키
+BAD_CHECK_DECISION_YAML = """\
+verdict: pass
+action: next_order
+rationale: "smoke/command 변종이 든 응답"
+next_order:
+  unit: u2
+  goal: "데미지 로직"
+  local_checks: [{ type: smoke, command: "cargo test smoke" }]
+  executor: codex
+  deliverable: "요약"
+"""
+
+
+def test_normalize_decision_smoke_type_and_command():
+    d = _normalize_decision_dict(
+        {
+            "verdict": "pass",
+            "action": "next_order",
+            "rationale": "r",
+            "next_order": {
+                "unit": "u1",
+                "goal": "g",
+                "local_checks": [{"type": "smoke", "command": "run smoke"}],
+            },
+        }
+    )
+    chk = d["next_order"]["local_checks"][0]
+    assert chk["type"] == "test"  # enum에 없는 smoke → test로 수렴
+    assert chk["cmd"] == "run smoke"  # command → cmd
+    assert "command" not in chk
+
+
+def test_normalize_decision_leaves_valid_intact():
+    valid = {
+        "verdict": "pass",
+        "action": "next_order",
+        "rationale": "r",
+        "next_order": {
+            "unit": "u1",
+            "goal": "g",
+            "local_checks": [{"type": "bench", "cmd": "cargo bench"}],
+        },
+    }
+    assert _normalize_decision_dict(valid) == valid
+
+
+def test_replan_absorbs_smoke_and_command():
+    """정규화 콜백이 붙은 replan은 smoke/command 변종을 흡수해 유효 Decision을 낸다."""
+    d = _replan(BAD_CHECK_DECISION_YAML)
+    assert isinstance(d, Decision)
+    assert d.next_order is not None
+    chk = d.next_order.local_checks[0]
+    assert chk.type is CheckType.test
+    assert chk.cmd == "cargo test smoke"
