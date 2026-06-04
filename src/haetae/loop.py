@@ -29,6 +29,7 @@ from haetae.models import (
     Verdict,
 )
 from haetae.replan import ReplanError, replan
+from haetae.spec_change import apply_spec_change
 
 
 # ──────────────────────────── 주입 인터페이스 ────────────────────────────
@@ -282,14 +283,30 @@ def run_loop(
             last_result = "(approach reset — 이전 접근 폐기, 재계획 요청됨)"
 
         elif action == Action.propose_spec_change:
-            # 이번 WO는 governed 적용 미구현 → escalate로 라우팅(다음 WO에서 정식 처리).
-            state.status = Status.escalated
-            note: dict = {"reason": "propose_spec_change (governed 적용은 다음 WO)"}
-            if decision.spec_change is not None:
-                note["spec_change"] = decision.spec_change.model_dump(
-                    by_alias=True, mode="json"
+            # governed 적용(mutability gradient): assumptions+evidence는 자율 적용,
+            # 성공 정의(goal/criteria/done_when)·anchor(order_raw)는 자율 변경 불가.
+            proposal = decision.spec_change
+            if proposal is None:
+                state.status = Status.escalated
+                state.pending_escalations.append(
+                    {"reason": "propose_spec_change인데 spec_change 본문 없음"}
                 )
-            state.pending_escalations.append(note)
+                break
+            outcome = apply_spec_change(spec, state, proposal)
+            if outcome.applied:
+                # 감사 이벤트만 남기고 루프 계속 — 다음 replan이 갱신된 spec을 본다.
+                state.events.append(
+                    Event(
+                        seq=len(state.events) + 1,
+                        verdict=decision.verdict,
+                        result=f"spec-change applied: {outcome.reason}",
+                        learnings=outcome.reason,
+                    )
+                )
+                last_result = f"(spec-change applied — {outcome.reason})"
+            else:
+                state.status = Status.escalated
+                state.pending_escalations.append(outcome.note)
 
         else:  # 방어: 미지원 action
             state.status = Status.escalated
