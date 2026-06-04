@@ -407,6 +407,40 @@ def test_run_loop_critic_soft_triggers_resynthesis_and_records():
     assert len(client.calls) == 3  # synthesize + 재합성 + replan
 
 
+class _RaisingClient:
+    """complete()에서 예외를 던지는 critic mock — codex 다운/인증/잘못된 모델 등."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls: list[dict] = []
+
+    def complete(self, system: str, user: str, **opts) -> str:
+        self.calls.append({"system": system, "user": user, "opts": opts})
+        raise self._exc
+
+
+def test_run_loop_critic_client_exception_does_not_kill_run():
+    """critic 클라이언트가 던져도 run은 원본 spec으로 정상 완료(WO#20).
+
+    critic은 advisory라 그 실패가 본 run을 죽이면 안 된다. "(평가 불가)"로 surface되고
+    spec_critique는 기록되며 예외는 전혀 전파되지 않는다. 재합성도 없다."""
+    from haetae.llm import CodexError
+
+    client = MockClient([SPEC_YAML, _next_order("u1")])  # synthesize + replan만
+    critic = _RaisingClient(CodexError("모델 'bogus' 없음"))
+    seen: list[str] = []
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), critic_client=critic,
+                     prompt_dir=PROMPT_DIR, progress=seen.append)
+    assert state.status is Status.done  # 정상 완료
+    assert state.spec_critique is not None
+    assert state.spec_critique.verdict == "adequate"
+    assert state.spec_critique.resynthesized is False
+    assert any(s == "spec critic: (평가 불가)" for s in seen), seen
+    assert len(critic.calls) == 1  # critic 호출은 일어남(그리고 실패 흡수)
+    assert len(client.calls) == 2  # synthesize + replan, 재합성 없음
+
+
 def test_run_loop_critic_persists_through_yaml(tmp_path):
     """State.spec_critique가 YAML로 저장/재로드되는지(감사 로그)."""
     out = tmp_path / "state.yaml"

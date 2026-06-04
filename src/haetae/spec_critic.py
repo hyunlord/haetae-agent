@@ -96,17 +96,19 @@ def critique_spec(
 ) -> SpecCritique:
     """order 대비 spec을 적대적으로 비평해 SpecCritique를 반환한다.
 
-    견고성: 출력이 깨지거나 검증 불통과면 raise하지 않고 verdict="adequate"(평가 불가,
-    진행 막지 않음)로 흡수하되 note에 그 사실을 남긴다.
+    완전 best-effort(WO#20): critic은 opt-in *보조* 단계라 그 *어떤* 실패도 본 run을
+    막아선 안 된다. 따라서 critic 작업 전체(client.complete 호출 + 파싱/검증)를 감싸
+    **절대 raise하지 않는다** — 깨진 출력·클라이언트 예외(CodexError 등)·기타 예외 모두
+    verdict="adequate"(평가 불가, 진행 막지 않음)로 흡수하되 사유를 note에 남긴다.
     """
     system = Path(prompt_path).read_text(encoding="utf-8")
     user = (
         f"# 원본 주문(order)\n{order}\n\n"
         f"# 합성된 spec(검증 대상)\n```yaml\n{_dump_spec(spec)}```"
     )
-    raw = client.complete(system, user)
 
     try:
+        raw = client.complete(system, user)
         crit = parse_yaml_model(
             raw, SpecCritique, SpecCriticError, normalize=_normalize_critique_dict
         )
@@ -116,6 +118,13 @@ def critique_spec(
             verdict="adequate",
             gaps=[],
             note=f"평가 불가: critic 출력 파싱/검증 실패 ({e.message})",
+        )
+    except Exception as e:  # noqa: BLE001 — critic은 advisory: 어떤 클라이언트/실행 실패도 run을 죽이면 안 된다
+        # client.complete가 던지는 예외(CodexError 등) + 기타 전부 흡수. 사유를 note에.
+        return SpecCritique(
+            verdict="adequate",
+            gaps=[],
+            note=f"critic 실행 실패: {e} (평가 불가)",
         )
 
     # verdict 정규화(영문 canonical 보장 — 'SOFT'/'Soft' 등 흡수, 미지값은 adequate).

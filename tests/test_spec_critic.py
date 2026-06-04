@@ -69,6 +69,19 @@ def _spec(yaml_text: str) -> ProjectSpec:
     return ProjectSpec.model_validate(_y.safe_load(yaml_text))
 
 
+class _RaisingClient:
+    """complete()에서 예외를 던지는 mock — critic 클라이언트 실패(잘못된 모델·codex
+    다운·인증·타임아웃 등)를 흉내낸다. calls로 호출 여부를 검증할 수 있다."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls: list[dict] = []
+
+    def complete(self, system: str, user: str, **opts) -> str:
+        self.calls.append({"system": system, "user": user, "opts": opts})
+        raise self._exc
+
+
 CRIT_SOFT = """\
 verdict: soft
 gaps:
@@ -120,6 +133,34 @@ def test_critique_spec_normalizes_verdict_variants():
     client2 = MockClient(["verdict: maybe\ngaps: []\n"])
     crit2 = critique_spec(ORDER, _spec(SPEC_WEAK), client2, prompt_path=CRITIC_PROMPT)
     assert crit2.verdict == "adequate"
+
+
+def test_critique_spec_absorbs_client_exception_as_adequate():
+    """critic *클라이언트*가 던지는 예외(CodexError 등)도 crash 말고 adequate로 흡수.
+
+    WO#19는 깨진 *출력*만 흡수했지만 클라이언트 *예외*는 전파돼 run을 죽였다(WO#20).
+    이제 critique_spec은 어떤 실패든 SpecCritique를 반환하고 절대 raise하지 않는다.
+    """
+    from haetae.llm import CodexError
+
+    client = _RaisingClient(CodexError("모델 'bogus'를 찾을 수 없음"))
+    crit = critique_spec(ORDER, _spec(SPEC_WEAK), client, prompt_path=CRITIC_PROMPT)
+    assert crit.verdict == "adequate"
+    assert crit.gaps == []
+    assert crit.note is not None
+    assert "평가 불가" in crit.note  # surface가 "(평가 불가)"로 키잉됨
+    assert "bogus" in crit.note  # 사유(원본 에러)가 기록됨
+    assert len(client.calls) == 1  # 호출은 실제로 일어났음
+
+
+def test_critique_spec_absorbs_generic_exception():
+    """파싱/클라이언트 외 임의 예외(RuntimeError 등)도 동일하게 흡수(broad-except)."""
+    client = _RaisingClient(RuntimeError("예기치 못한 내부 오류"))
+    crit = critique_spec(ORDER, _spec(SPEC_WEAK), client, prompt_path=CRITIC_PROMPT)
+    assert crit.verdict == "adequate"
+    assert crit.gaps == []
+    assert crit.note is not None
+    assert "평가 불가" in crit.note
 
 
 # ──────────────────── synthesize_with_critique (하이브리드) ────────────────────
@@ -175,6 +216,27 @@ def test_resynthesis_is_bounded_to_one_shot():
     assert crit.resynthesized is True
     assert len(client.calls) == 2  # 정확히 2회 (3회차 없음)
     assert len(critic.calls) == 1  # critic 재호출 없음(바운드)
+
+
+def test_synthesize_with_critique_absorbs_critic_client_exception():
+    """critic 클라이언트가 던져도 (원본 spec, adequate critique) 반환 — crash·재합성 없음.
+
+    첫 synthesize는 정상(SPEC_WEAK)이고 critic만 실패하는 상황. spec은 그대로,
+    critique는 평가 불가(adequate)로 흡수되고 synthesize는 1회뿐(재합성 없음)."""
+    from haetae.llm import CodexError
+
+    client = MockClient([SPEC_WEAK])  # 합성만, 재합성 응답 없음(있어선 안 됨)
+    critic = _RaisingClient(CodexError("codex 인증 실패"))
+    spec, crit = synthesize_with_critique(
+        ORDER, client, critic, syn_prompt_path=SYN_PROMPT, critic_prompt_path=CRITIC_PROMPT
+    )
+    assert spec.version == 1  # 원본 spec 유지
+    assert crit is not None
+    assert crit.verdict == "adequate"
+    assert crit.resynthesized is False
+    assert "평가 불가" in crit.note
+    assert len(client.calls) == 1  # 재합성 없음(synthesize 1회뿐)
+    assert len(critic.calls) == 1
 
 
 def test_resynthesis_failure_falls_back_to_original():
