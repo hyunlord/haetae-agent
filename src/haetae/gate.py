@@ -21,6 +21,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from haetae.deps import Runner, ensure_deps
 from haetae.judge import (
     DEFAULT_JUDGE_PROMPT_PATH,
     DEFAULT_RUN_JUDGE_PROMPT_PATH,
@@ -154,6 +155,9 @@ class CompositeGate:
         judge_prompt_path: str | Path = DEFAULT_JUDGE_PROMPT_PATH,
         run_judge_prompt_path: str | Path = DEFAULT_RUN_JUDGE_PROMPT_PATH,
         run_timeout: float = 120,
+        install_deps: bool = True,
+        install_timeout: int = 300,
+        deps_runner: Runner | None = None,
         max_file_bytes: int = 64_000,
         max_total_bytes: int = 200_000,
     ):
@@ -162,6 +166,9 @@ class CompositeGate:
         self.judge_prompt_path = judge_prompt_path
         self.run_judge_prompt_path = run_judge_prompt_path
         self.run_timeout = run_timeout
+        self.install_deps = install_deps
+        self.install_timeout = install_timeout
+        self.deps_runner = deps_runner
         self.max_file_bytes = max_file_bytes
         self.max_total_bytes = max_total_bytes
         # 기계 per-check 평가는 CheckRunner에 위임(중복 로직 금지).
@@ -169,6 +176,12 @@ class CompositeGate:
 
     # ── Gate 인터페이스 ───────────────────────────────────────────────
     def judge(self, result: str, spec: ProjectSpec) -> GateResult:
+        # 호스트-사이드 install(WO#23): 기계 체크(npm test)·run-harness가 설치된 deps로
+        # 동작하도록 체크 평가 *전에* 1회. non-fatal(실패해도 그냥 진행 → gate가 자연히 fail).
+        # 해시 캐시로 매니페스트 불변이면 스킵. 매니페스트 없으면 no-op.
+        if self.install_deps:
+            ensure_deps(self.workdir, timeout=self.install_timeout, runner=self.deps_runner)
+
         # run 타입: judge 유무와 무관하게 항상 harness로 실행해 RunEvidence 캡처.
         run_acs = [ac for ac in spec.acceptance_criteria if ac.check.type == CheckType.run]
         run_reports = self._judge_run_acs(run_acs, result, spec)

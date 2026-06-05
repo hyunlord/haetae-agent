@@ -107,6 +107,21 @@ def main(argv: list[str] | None = None) -> int:
         help="run 체크(산출물 실행)의 타임아웃 초 (기본 120). 호스트에서 실행, 바운드 필수.",
     )
     parser.add_argument(
+        "--install-deps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "gate 체크 전에 호스트(네트워크 O)가 npm/pip install을 대신 수행 (기본 on). "
+            "--no-install-deps로 끈다. executor sandbox는 그대로 offline."
+        ),
+    )
+    parser.add_argument(
+        "--install-timeout",
+        type=int,
+        default=300,
+        help="호스트 install 타임아웃 초 (기본 300). non-fatal — 초과해도 run은 진행.",
+    )
+    parser.add_argument(
         "--max-parallel",
         type=int,
         default=4,
@@ -124,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
         workdir=args.workdir,
         judge_client=CodexClient(model=args.judge_model),
         run_timeout=args.run_timeout,
+        install_deps=args.install_deps,
+        install_timeout=args.install_timeout,
     )
     if args.executor == "codex":
         # 자율 쓰기 실행 — gate와 같은 --workdir로 범위 한정.
@@ -142,7 +159,8 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt: HumanRelayExecutor()
         gate_factory = lambda wt: CompositeGate(
             workdir=wt, judge_client=CodexClient(model=args.judge_model),
-            run_timeout=args.run_timeout)
+            run_timeout=args.run_timeout,
+            install_deps=args.install_deps, install_timeout=args.install_timeout)
 
     # spec critic: --critic-model 줄 때만 ON(read-only, 합성기와 다른 모델 권장 = 독립성).
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
