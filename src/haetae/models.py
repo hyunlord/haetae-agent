@@ -45,6 +45,7 @@ class CheckType(str, Enum):
     lint = "lint"
     build = "build"
     schema = "schema"
+    run = "run"  # 산출물을 실행해 동적 행동(부팅/트레이스)을 캡처·판정 (WO#22)
     judge = "judge"
     human = "human"
 
@@ -153,12 +154,38 @@ class PlanItem(BaseModel):
     deps: list[str] | None = None
 
 
+class RunEvidence(BaseModel):
+    """산출물을 *실행*해 캡처한 동적 행동 증거 (WO#22 — judge-runs-it).
+
+    정적 체크(exit code/파일 읽기)가 못 보는 *실행 시 행동*을 잡는다. judge가 이 증거로
+    "그냥 돌기만" vs "행동이 진짜 성립"을 적대적으로 판정한다. CheckReport에 실려 감사된다.
+
+    booted:      크래시/타임아웃 없이 정상 종료(exit 0)했는가.
+    exit_code:   프로세스 종료 코드(타임아웃/실행불가면 None).
+    trace:       캡처한 stdout(구조화 트레이스면 JSON 텍스트 그대로). 상한 cap 적용.
+    stderr_tail: stderr 끝부분(에러 진단용). 상한 cap 적용.
+    timed_out:   타임아웃으로 강제 종료됐는가.
+    duration_s:  벽시계 실행 시간(초).
+    reason:      booted=False일 때 사유(타임아웃/실행 실패/예외). 정상이면 None.
+    """
+
+    booted: bool
+    exit_code: int | None = None
+    trace: str = ""
+    stderr_tail: str = ""
+    timed_out: bool = False
+    duration_s: float = 0.0
+    reason: str | None = None
+
+
 class CheckReport(BaseModel):
     """gate가 ac 하나를 평가한 per-check 증거.
 
     gate(CheckRunner)가 무엇을(cmd) 돌려 어떤 결과(status/exit_code)를 얻었는지
     감사 추적으로 남긴다. verdict의 *근거*. Event.checks에 그대로 실린다.
     status는 pass | fail | skipped.
+
+    run_evidence: run 타입 체크일 때 캡처한 실행 증거(그 외 타입은 None).
     """
 
     ac_id: str
@@ -167,6 +194,7 @@ class CheckReport(BaseModel):
     status: str  # pass | fail | skipped
     exit_code: int | None = None
     detail: str | None = None
+    run_evidence: RunEvidence | None = None
 
 
 class GateResult(BaseModel):

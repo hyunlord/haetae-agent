@@ -21,9 +21,21 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from haetae.judge import DEFAULT_JUDGE_PROMPT_PATH, LLMJudge
+from haetae.judge import (
+    DEFAULT_JUDGE_PROMPT_PATH,
+    DEFAULT_RUN_JUDGE_PROMPT_PATH,
+    LLMJudge,
+)
 from haetae.llm import LLMClient
-from haetae.models import CheckReport, CheckType, GateResult, ProjectSpec, Verdict
+from haetae.models import (
+    CheckReport,
+    CheckType,
+    GateResult,
+    ProjectSpec,
+    RunEvidence,
+    Verdict,
+)
+from haetae.run_harness import run_artifact
 
 # 기계로 자동 실행 불가한 check 타입
 _UNEVALUATABLE_TYPES = {CheckType.human, CheckType.judge}
@@ -109,6 +121,15 @@ def _tail(s: str, n: int = 300) -> str:
     return s if len(s) <= n else "…" + s[-n:]
 
 
+def _run_degrade_detail(ev: RunEvidence) -> str:
+    """judge 없이 booted만으로 판정할 때 CheckReport.detail 한 줄(감사용)."""
+    if ev.timed_out:
+        return f"degrade(booted 판정): 타임아웃 — {ev.reason or 'timed_out'}"
+    if not ev.booted:
+        return f"degrade(booted 판정): 미부팅 — {ev.reason or _tail(ev.stderr_tail)}"
+    return f"degrade(booted 판정): 정상 부팅(exit {ev.exit_code}, {ev.duration_s:.2f}s)"
+
+
 class CompositeGate:
     """기계 체크(CheckRunner)와 LLM judge를 기준별로 라우팅해 하나의 GateResult로 합친다.
 
@@ -131,12 +152,16 @@ class CompositeGate:
         *,
         timeout: float = 120,
         judge_prompt_path: str | Path = DEFAULT_JUDGE_PROMPT_PATH,
+        run_judge_prompt_path: str | Path = DEFAULT_RUN_JUDGE_PROMPT_PATH,
+        run_timeout: float = 120,
         max_file_bytes: int = 64_000,
         max_total_bytes: int = 200_000,
     ):
         self.workdir = str(workdir)
         self.judge_client = judge_client
         self.judge_prompt_path = judge_prompt_path
+        self.run_judge_prompt_path = run_judge_prompt_path
+        self.run_timeout = run_timeout
         self.max_file_bytes = max_file_bytes
         self.max_total_bytes = max_total_bytes
         # 기계 per-check 평가는 CheckRunner에 위임(중복 로직 금지).
@@ -144,6 +169,10 @@ class CompositeGate:
 
     # ── Gate 인터페이스 ───────────────────────────────────────────────
     def judge(self, result: str, spec: ProjectSpec) -> GateResult:
+        # run 타입: judge 유무와 무관하게 항상 harness로 실행해 RunEvidence 캡처.
+        run_acs = [ac for ac in spec.acceptance_criteria if ac.check.type == CheckType.run]
+        run_reports = self._judge_run_acs(run_acs, result, spec)
+
         # judge 타입은 judge_client이 있을 때만 LLM 경로로. 없으면 _run_check→skipped.
         route_to_judge = self.judge_client is not None
         judge_acs = [
@@ -164,12 +193,67 @@ class CompositeGate:
             for rep in llm_judge.judge_criteria(judge_acs, result, spec):
                 judged[rep.ac_id] = rep
 
-        # spec 순서를 보존하며 기계/ judge 보고를 합친다.
+        # spec 순서를 보존하며 run/judge/기계 보고를 합친다(run·judge 우선, 나머지는 기계).
         report: list[CheckReport] = []
         for ac in spec.acceptance_criteria:
-            if ac.id in judged:
+            if ac.id in run_reports:
+                report.append(run_reports[ac.id])
+            elif ac.id in judged:
                 report.append(judged[ac.id])
             else:
                 report.append(self._runner._run_check(ac.id, ac.check))
 
         return GateResult(verdict=aggregate_verdict(report), checks=report)
+
+    # ── run 타입 라우팅: harness 실행 + (judge | booted degrade) ─────────
+    def _judge_run_acs(
+        self, run_acs: list, result: str, spec: ProjectSpec
+    ) -> dict[str, CheckReport]:
+        """run 타입 ac를 harness로 실행해 RunEvidence 캡처 후 판정한다.
+
+          - cmd 없음 → skipped(run인데 실행할 게 없음).
+          - judge_client 있음 → run-judge로 동적 행동 적대 판정(pass/fail/skipped).
+          - judge_client 없음 → **graceful degrade**: pass = evidence.booted
+            (크래시/타임아웃 없이 부팅됐는가).
+        모든 보고에 RunEvidence를 실어 감사한다.
+        """
+        reports: dict[str, CheckReport] = {}
+        if not run_acs:
+            return reports
+
+        items: list[tuple] = []  # (ac, RunEvidence) — cmd 있는 것만
+        for ac in run_acs:
+            if not ac.check.cmd:
+                reports[ac.id] = CheckReport(
+                    ac_id=ac.id, check_type=CheckType.run, cmd=None,
+                    status="skipped", exit_code=None, detail="run 체크에 cmd 없음",
+                )
+                continue
+            ev = run_artifact(ac.check.cmd, workdir=self.workdir, timeout=self.run_timeout)
+            items.append((ac, ev))
+
+        if not items:
+            return reports
+
+        if self.judge_client is not None:
+            llm_judge = LLMJudge(
+                self.judge_client,
+                workdir=self.workdir,
+                prompt_path=self.judge_prompt_path,
+                run_prompt_path=self.run_judge_prompt_path,
+                max_file_bytes=self.max_file_bytes,
+                max_total_bytes=self.max_total_bytes,
+            )
+            for rep in llm_judge.judge_run_criteria(items, result, spec):
+                reports[rep.ac_id] = rep
+        else:
+            # degrade: 비전/judge 없을 때 "크래시·타임아웃 없이 부팅됨" 여부만으로 판정.
+            for ac, ev in items:
+                reports[ac.id] = CheckReport(
+                    ac_id=ac.id, check_type=CheckType.run, cmd=ac.check.cmd,
+                    status=("pass" if ev.booted else "fail"),
+                    exit_code=ev.exit_code,
+                    detail=_run_degrade_detail(ev),
+                    run_evidence=ev,
+                )
+        return reports

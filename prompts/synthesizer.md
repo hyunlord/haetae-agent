@@ -79,10 +79,15 @@ open_questions: []
 
 ### 1. 모든 acceptance_criterion은 `check`를 가진다
 check 없는 기준은 기준이 아니다. `check.type`은
-`test | bench | lint | build | schema | judge | human` 중 하나.
+`test | bench | lint | build | schema | run | judge | human` 중 하나.
 check를 *기계로* 만들 수 없으면, 그 항목의 type을 `human`으로 두고
 spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge` 또는 `human_checkpoint`).
 = "이건 자동 종료가 불가능하다"는 신호다.
+
+**동적/인터랙티브 요구**(시뮬레이션·게임·에이전트·런타임 행동 등 "돌려봐야 아는" 것)는
+`run` 체크를 써라: 산출물에 **헤드리스 트레이스 진입점**을 만들고(예:
+`check: { type: run, cmd: "npm run sim:trace -- --ticks 200 --spawn high" }`) 그 실행
+**트레이스로 동적 행동을 검증**한다. 정적 `test`만으로는 "통과는 하는데 행동은 틀림"을 못 잡는다.
 
 ### 2. 묻지 말고 가정하라 (assume-don't-ask)
 주문에서 비어 있는 부분은 **네가 가장 합리적인 방향을 골라 채우고**,

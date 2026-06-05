@@ -101,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
     parser.add_argument("--max-iters", type=int, default=20, help="최대 루프 횟수 (기본 20)")
     parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=120.0,
+        help="run 체크(산출물 실행)의 타임아웃 초 (기본 120). 호스트에서 실행, 바운드 필수.",
+    )
+    parser.add_argument(
         "--max-parallel",
         type=int,
         default=4,
@@ -117,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     gate = CompositeGate(
         workdir=args.workdir,
         judge_client=CodexClient(model=args.judge_model),
+        run_timeout=args.run_timeout,
     )
     if args.executor == "codex":
         # 자율 쓰기 실행 — gate와 같은 --workdir로 범위 한정.
@@ -134,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             executor_factory = lambda wt: HumanRelayExecutor()
         gate_factory = lambda wt: CompositeGate(
-            workdir=wt, judge_client=CodexClient(model=args.judge_model))
+            workdir=wt, judge_client=CodexClient(model=args.judge_model),
+            run_timeout=args.run_timeout)
 
     # spec critic: --critic-model 줄 때만 ON(read-only, 합성기와 다른 모델 권장 = 독립성).
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
