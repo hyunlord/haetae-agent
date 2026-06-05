@@ -103,6 +103,21 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
 
 정적 `test`만으로는 "통과는 하는데 행동은 틀림"을 못 잡는다 — 그게 `run`의 존재 이유다.
 
+**스캐폴드된 진짜 스택이 있으면 run/build 기준은 *그 실제 앱*을 행사하라.** director가
+주문의 스택(React/Vite/Express 등)을 미리 스캐폴드해 깔아두므로(host-install된 진짜 deps),
+executor는 plain-Node로 *스택을 치환할 수 없다*. 따라서 기준을 그 실제 앱에 걸어라:
+
+- `build`: `npm run build`(또는 스택 표준 빌드)가 성공해야 한다 — *실제 번들러*로.
+- 부팅: 빌드 산출물/dev 서버가 크래시 없이 **boot**한다.
+- `run` 트레이스: 헤드리스 트레이스 진입점이 **실제 엔진을 import**해 동적 상태를 방출한다
+  (toy 더미가 아니라 *그 앱*의 모듈을 호출).
+- **자가채점 금지**: 빌드 자체가 합격을 *선언*하는 `sim:judge` 식 자가채점·손수 만든
+  toy judge/test-runner로 cheap-satisfy하지 마라. run-judge가 그런 자기채점을 거부한다
+  (캡스톤 ac8). 채점은 독립 게이트(표준 테스트 러너·run-judge)가 한다.
+
+(브라우저 스크린샷·시각 렌더 검증은 아직 사람 눈 영역 — 자동 기준은 build 성공 + boot +
+실제 엔진 트레이스까지다.)
+
 ### 1b. 각 acceptance_criterion에 `unit`을 배정하라 (per-unit vs 통합)
 병렬 실행에서 각 기준이 *어디서* 검사되는지가 `unit` 태그로 갈린다:
 

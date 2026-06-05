@@ -13,9 +13,17 @@ from typing import Callable, Protocol, runtime_checkable
 
 import yaml
 
-from haetae import intake, replan as replan_mod, spec_critic as critic_mod
+from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_critic as critic_mod
+from haetae.deps import Runner as DepsRunner, ensure_deps
 from haetae.intake import SynthesisError, synthesize
 from haetae.llm import LLMClient
+from haetae.scaffold import (
+    Scaffold,
+    commit_scaffold,
+    generate_scaffold,
+    prepare_worktree_deps,
+    write_scaffold,
+)
 from haetae.models import (
     Action,
     CheckReport,
@@ -260,6 +268,9 @@ def run_loop(
     gate_factory: GateFactory | None = None,
     unit_retries: int = 1,
     worktree_manager: WorktreeManager | None = None,
+    scaffold_client: LLMClient | None = None,
+    install_deps: bool = True,
+    deps_runner: DepsRunner | None = None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -312,6 +323,11 @@ def run_loop(
         if prompt_dir
         else critic_mod.DEFAULT_CRITIC_PROMPT_PATH
     )
+    scaffold_prompt = (
+        Path(prompt_dir) / "scaffold.md"
+        if prompt_dir
+        else scaffold_mod.DEFAULT_SCAFFOLD_PROMPT_PATH
+    )
 
     emit("합성 중…")
     critique: SpecCritique | None = None
@@ -338,6 +354,19 @@ def run_loop(
         emit(_critique_label(critique))
         try_save()
 
+    # 선제 스캐폴드(WO#27): executor *dispatch 전에* host가 진짜 스택을 깐다.
+    # scaffold_client 없으면 None → 모든 신규 경로 no-op(기존 동작 불변, critic 패턴과 동형).
+    # generate_scaffold는 best-effort라 dep 스택 불필요/실패면 None을 돌려준다.
+    scaffold: Scaffold | None = None
+    if scaffold_client is not None:
+        emit("scaffold 생성 중…")
+        scaffold = generate_scaffold(spec, scaffold_client, prompt_path=scaffold_prompt)
+        emit(
+            f"scaffold: {len(scaffold.files)}개 파일 (install={scaffold.install})"
+            if scaffold is not None
+            else "scaffold: 불필요 — 스킵(no-op)"
+        )
+
     # 병렬 모드: worktree 격리 + 결정적 DAG 스케줄러로 분기.
     # max_parallel<=1은 아래 순차 경로 그대로(현행 동작 불변 — 무회귀).
     if max_parallel > 1:
@@ -356,7 +385,20 @@ def run_loop(
             rep_prompt=rep_prompt,
             emit=emit,
             try_save=try_save,
+            scaffold=scaffold,
+            install_deps=install_deps,
+            deps_runner=deps_runner,
         )
+
+    # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
+    # scaffold=None이면 no-op → 기존 순차 경로 불변.
+    if scaffold is not None:
+        wd = Path(workdir or ".")
+        written = write_scaffold(scaffold, wd)
+        emit(f"scaffold 적용: {len(written)}개 파일 (workdir, executor 전)")
+        if scaffold.install and install_deps:
+            res = ensure_deps(wd, runner=deps_runner)
+            emit(f"scaffold host-install: {res.manager} ok={res.ok}")
 
     last_result = "(시작 — 아직 실행 없음)"
     # WO#25 Part A: 직전에 dispatch한 작업 유닛. brain이 다른 유닛으로 넘어가면(advance)
@@ -522,6 +564,9 @@ def _parallel_loop(
     rep_prompt: str | Path,
     emit: Callable[[str], None],
     try_save: Callable[[], None],
+    scaffold: Scaffold | None = None,
+    install_deps: bool = True,
+    deps_runner: DepsRunner | None = None,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -682,6 +727,17 @@ def _parallel_loop(
             try_save()
             return state
 
+        # 선제 스캐폴드(WO#27): worktree 분기 *전에* main에 스택을 깐다 → worktree가 상속.
+        # 순서: write(main) → ensure_deps(main; .gitignore+node_modules) → commit(scaffold+
+        # .gitignore staged, node_modules 제외). scaffold=None이면 전부 no-op(기존 경로 불변).
+        if scaffold is not None:
+            written = write_scaffold(scaffold, wm.workdir)
+            emit(f"scaffold 적용: {len(written)}개 파일 (main, worktree 분기 전)")
+            if scaffold.install and install_deps:
+                res = ensure_deps(wm.workdir, runner=deps_runner)
+                emit(f"scaffold host-install(main): {res.manager} ok={res.ok}")
+            commit_scaffold(wm.workdir)  # worktree가 분기 시 상속(node_modules는 gitignore 제외)
+
         if not state.plan:
             state.status = Status.escalated
             state.pending_escalations.append(
@@ -705,6 +761,14 @@ def _parallel_loop(
                     if order is None:  # escalate/stop/replan-소진 → terminal 세팅됨
                         break
                     wt = wm.create(u)
+                    # 선제 스캐폴드: executor dispatch *전에* node_modules를 worktree에 준비.
+                    # (gitignore라 git 상속 못 함 → main에서 symlink/copy, 없으면 host-install 폴백.)
+                    if scaffold is not None and scaffold.install and install_deps:
+                        how = prepare_worktree_deps(
+                            wm.workdir, wt,
+                            ensure_deps_fn=lambda p: ensure_deps(p, runner=deps_runner),
+                        )
+                        emit(f"worktree node_modules 준비: {u} ({how})")
                     _set_plan_state(state, u, PlanState.in_progress)
                     in_flight.add(u)
                     fut = pool.submit(

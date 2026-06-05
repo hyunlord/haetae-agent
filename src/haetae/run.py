@@ -35,6 +35,8 @@ def run(
     executor_factory: Callable | None = None,
     gate_factory: Callable | None = None,
     unit_retries: int = 2,
+    scaffold_client: LLMClient | None = None,
+    install_deps: bool = True,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -52,6 +54,8 @@ def run(
         executor_factory=executor_factory,
         gate_factory=gate_factory,
         unit_retries=unit_retries,
+        scaffold_client=scaffold_client,
+        install_deps=install_deps,
     )
 
 
@@ -133,6 +137,16 @@ def main(argv: list[str] | None = None) -> int:
         help="호스트 install 타임아웃 초 (기본 300). non-fatal — 초과해도 run은 진행.",
     )
     parser.add_argument(
+        "--scaffold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "executor dispatch 전에 director(host=네트워크 O)가 진짜 스택 스캐폴드를 깔고 "
+            "deps 설치 (기본 on=auto: dep 스택 필요할 때만, 아니면 자동 스킵). "
+            "--no-scaffold로 끈다(기존 동작 그대로). executor sandbox는 그대로 offline."
+        ),
+    )
+    parser.add_argument(
         "--max-parallel",
         type=int,
         default=4,
@@ -177,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
     critic_client = CodexClient(model=args.critic_model) if args.critic_model else None
 
+    # 선제 스캐폴드(WO#27): --scaffold(기본 on)면 brain client를 scaffold 생성에 재사용.
+    # --no-scaffold면 None → 스캐폴드 OFF(기존 동작 그대로). 생성기는 dep 스택 필요할 때만
+    # 골격을 내고 아니면 자동 스킵(auto). 호스트 install은 --install-deps 토글을 공유한다.
+    scaffold_client = client if args.scaffold else None
+
     # 진행 표시: 느린 codex 호출이 "행"으로 안 보이게 stderr로 한 줄씩.
     def progress(msg: str) -> None:
         print(f"… {msg}", file=sys.stderr, flush=True)
@@ -195,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
         executor_factory=executor_factory,
         gate_factory=gate_factory,
         unit_retries=args.unit_retries,
+        scaffold_client=scaffold_client,
+        install_deps=args.install_deps,
     )
     print(format_summary(state))
     return 0

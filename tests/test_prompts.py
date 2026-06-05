@@ -33,6 +33,37 @@ def test_synthesizer_prompt_has_run_check_example():
     assert "type: run" in text  # 실제 check 예시
 
 
+# ──────────────────── A3: synthesizer 스캐폴드 실앱 가이드 (WO#27 Part C) ────────────────────
+
+
+def test_synthesizer_prompt_has_scaffolded_real_app_guidance():
+    """스캐폴드된 진짜 스택이면 run/build 기준을 *실제 앱*에 걸고 자가채점을 금지하는 가이드."""
+    text = SYNTH.read_text(encoding="utf-8")
+    assert "스캐폴드" in text  # 스캐폴드된 진짜 스택 언급
+    assert "npm run build" in text  # 실제 빌드 행사
+    assert "자가채점" in text  # sim:judge 식 자가채점 금지
+    assert "run-judge" in text  # 독립 게이트가 거부
+    # exact-keys 보존(행동 불변): 핵심 구조 계약이 그대로 남아 있나
+    assert "type: run" in text
+    assert "decomposition" in text
+
+
+# ──────────────────── A4: scaffold 프롬프트 (WO#27 Part A) ────────────────────
+
+
+def test_scaffold_prompt_exists_and_guides_minimal_skeleton():
+    scaffold = PROMPT_DIR / "scaffold.md"
+    text = scaffold.read_text(encoding="utf-8")
+    # 출력 구조 계약: files / install 키
+    assert "files" in text and "install" in text
+    # 최소 골격 + 표준 도구(손수 test-runner 금지) + 표준 스크립트
+    assert "package.json" in text
+    assert "build" in text and "test" in text
+    assert "vitest" in text  # 표준 테스트 도구 선언 권장
+    # 스택 불필요면 스킵(빈/none)
+    assert "스킵" in text or "불필요" in text
+
+
 # ──────────────────────── A2: spec_critic 가이드 ────────────────────────
 
 
