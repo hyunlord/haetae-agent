@@ -283,6 +283,52 @@ def test_cleanup_after_normal_run(tmp_path):
     assert_clean(tmp_path)
 
 
+def test_unit_retries_exhausted_then_escalate(tmp_path):
+    """유닛 gate가 계속 실패하면 unit_retries회 재시도(=총 retries+1 시도) 후 escalate."""
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def make_ex(wt):
+        class E:
+            def run(self, order):
+                with lock:
+                    calls.append(order.unit)
+                return "ran"
+        return E()
+
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, unit_retries=2,
+    )
+    assert state.status is Status.escalated
+    assert len(calls) == 3  # 최초 1 + 재시도 2 = unit_retries + 1
+    assert_clean(tmp_path)
+
+
+def test_unit_retries_zero_single_attempt(tmp_path):
+    """unit_retries=0이면 첫 실패에서 바로 escalate(시도 1회)."""
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def make_ex(wt):
+        class E:
+            def run(self, order):
+                with lock:
+                    calls.append(order.unit)
+                return "ran"
+        return E()
+
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, unit_retries=0,
+    )
+    assert state.status is Status.escalated
+    assert len(calls) == 1  # 재시도 없음
+    assert_clean(tmp_path)
+
+
 def test_cleanup_after_inflight_executor_exception(tmp_path):
     """워커(executor) 예외 → 그 unit 실패로 흡수·재시도 소진→escalate, 흔적 0."""
     def make_ex(wt):

@@ -26,7 +26,7 @@ def run(
     executor: Executor,
     gate: Gate,
     critic_client: LLMClient | None = None,
-    max_iters: int = 20,
+    max_iters: int = 30,
     state_path: str | Path | None = None,
     prompt_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -34,6 +34,7 @@ def run(
     workdir: str | Path | None = None,
     executor_factory: Callable | None = None,
     gate_factory: Callable | None = None,
+    unit_retries: int = 2,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -50,6 +51,7 @@ def run(
         workdir=workdir,
         executor_factory=executor_factory,
         gate_factory=gate_factory,
+        unit_retries=unit_retries,
     )
 
 
@@ -99,7 +101,16 @@ def main(argv: list[str] | None = None) -> int:
         help="실행자 (기본: human=사람 릴레이). codex=자율 쓰기 실행(opt-in)",
     )
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
-    parser.add_argument("--max-iters", type=int, default=20, help="최대 루프 횟수 (기본 20)")
+    parser.add_argument("--max-iters", type=int, default=30, help="최대 루프 횟수 (기본 30)")
+    parser.add_argument(
+        "--unit-retries",
+        type=int,
+        default=2,
+        help=(
+            "병렬 경로: 유닛 gate 실패/머지 충돌 시 그 유닛 재dispatch 최대 횟수 (기본 2). "
+            "소진 후 escalate. (LLM 출력 재시도 replan_retries와는 별개.)"
+        ),
+    )
     parser.add_argument(
         "--run-timeout",
         type=float,
@@ -183,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         workdir=args.workdir,
         executor_factory=executor_factory,
         gate_factory=gate_factory,
+        unit_retries=args.unit_retries,
     )
     print(format_summary(state))
     return 0

@@ -249,7 +249,7 @@ def run_loop(
     gate: Gate,
     *,
     critic_client: LLMClient | None = None,
-    max_iters: int = 20,
+    max_iters: int = 30,
     replan_retries: int = 2,
     prompt_dir: str | Path | None = None,
     state_path: str | Path | None = None,

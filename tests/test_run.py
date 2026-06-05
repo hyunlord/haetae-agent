@@ -116,3 +116,30 @@ def test_main_executor_defaults_to_human(monkeypatch):
     rc = main(["--order", "x"])
     assert rc == 0
     assert isinstance(captured["executor"], HumanRelayExecutor)
+
+
+# ──────────────────────────── 헤드룸 기본값/배선 (WO#24 Part B) ────────────────────────────
+
+
+def test_main_max_iters_default_is_30(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x"])
+    assert captured["max_iters"] == 30  # 캡스톤 헤드룸: 10/20 → 30
+
+
+def test_main_unit_retries_default_is_2(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x"])
+    assert captured["unit_retries"] == 2  # 큰 빌드: 유닛 한 번 더 시도 후 escalate
+
+
+def test_main_unit_retries_override(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--unit-retries", "5"])
+    assert captured["unit_retries"] == 5
+
+
+def test_main_max_iters_override(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--max-iters", "7"])
+    assert captured["max_iters"] == 7
