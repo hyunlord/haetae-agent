@@ -177,10 +177,13 @@ class CompositeGate:
     # ── Gate 인터페이스 ───────────────────────────────────────────────
     def judge(self, result: str, spec: ProjectSpec) -> GateResult:
         # 호스트-사이드 install(WO#23): 기계 체크(npm test)·run-harness가 설치된 deps로
-        # 동작하도록 체크 평가 *전에* 1회. non-fatal(실패해도 그냥 진행 → gate가 자연히 fail).
+        # 동작하도록 체크 평가 *전에* 1회. ensure_deps 자체는 여전히 raise 안 함(non-fatal).
         # 해시 캐시로 매니페스트 불변이면 스킵. 매니페스트 없으면 no-op.
+        install_res = None
         if self.install_deps:
-            ensure_deps(self.workdir, timeout=self.install_timeout, runner=self.deps_runner)
+            install_res = ensure_deps(
+                self.workdir, timeout=self.install_timeout, runner=self.deps_runner
+            )
 
         # run 타입: judge 유무와 무관하게 항상 harness로 실행해 RunEvidence 캡처.
         run_acs = [ac for ac in spec.acceptance_criteria if ac.check.type == CheckType.run]
@@ -215,6 +218,26 @@ class CompositeGate:
                 report.append(judged[ac.id])
             else:
                 report.append(self._runner._run_check(ac.id, ac.check))
+
+        # WO#25 Part B: 매니페스트가 있었고 호스트 install이 *실제로 실패*하면(skipped/none
+        # 아님) 명시적 fail 체크를 추가 → aggregate_verdict가 pass를 못 내고 replan이
+        # 매니페스트를 고치게 한다. "clean에서 설치됨"이 매니페스트 있을 때 암묵 기준.
+        if (
+            install_res is not None
+            and install_res.manager != "none"
+            and not install_res.skipped_cached
+            and not install_res.ok
+        ):
+            report.append(
+                CheckReport(
+                    ac_id="(install)",
+                    check_type=CheckType.build,
+                    cmd=None,
+                    status="fail",
+                    exit_code=None,
+                    detail=f"의존성 설치 실패: {install_res.reason}",
+                )
+            )
 
         return GateResult(verdict=aggregate_verdict(report), checks=report)
 

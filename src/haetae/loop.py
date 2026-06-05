@@ -104,15 +104,6 @@ class MockGate:
 
 # ──────────────────────────── 내부 헬퍼 ────────────────────────────
 
-# verdict → 해당 unit의 plan 상태 매핑
-_VERDICT_TO_PLAN = {
-    Verdict.pass_: PlanState.done,
-    Verdict.done: PlanState.done,
-    Verdict.fail_recoverable: PlanState.in_progress,
-    Verdict.fail_replan: PlanState.failed,
-    Verdict.stuck: PlanState.failed,
-}
-
 
 def _init_state(spec: ProjectSpec) -> State:
     plan = [
@@ -143,15 +134,17 @@ def _escalated_no_spec(reason: str, raw_response: str | None) -> State:
     )
 
 
-def _update_plan(state: State, unit: str, verdict: Verdict) -> None:
-    new = _VERDICT_TO_PLAN.get(verdict)
-    if new is None:
-        return
+def _advance_done(state: State, unit: str) -> None:
+    """직전 작업 유닛 수용 표시(brain advance = done). 단, failed 유닛은 보존한다.
+
+    전체-spec gate라 중간 유닛은 개별 done 신호를 못 받는다(WO#25 #3). brain이 다음
+    유닛으로 넘어가는 것 자체가 직전 유닛을 수용한 신호 → done으로 올린다.
+    """
     for item in state.plan:
         if item.unit == unit:
-            item.state = new
+            if item.state != PlanState.failed:
+                item.state = PlanState.done
             return
-    state.plan.append(PlanItem(unit=unit, state=new))
 
 
 def _set_plan_state(state: State, unit: str, plan_state: PlanState) -> None:
@@ -359,6 +352,9 @@ def run_loop(
         )
 
     last_result = "(시작 — 아직 실행 없음)"
+    # WO#25 Part A: 직전에 dispatch한 작업 유닛. brain이 다른 유닛으로 넘어가면(advance)
+    # 이 유닛을 done으로 수용하고, escalate면 이 유닛을 failed로 표시한다.
+    worked_unit: str | None = None
 
     iters = 0
     while iters < max_iters and state.status == Status.running:
@@ -406,6 +402,12 @@ def run_loop(
                     {"reason": "next_order 본문 없음", "action": action.value}
                 )
                 break
+            # WO#25 Part A: brain이 다른 유닛으로 넘어가면 직전 작업 유닛을 수용(done).
+            # dispatch하는 유닛은 in_progress. (gate/replan/종료 로직은 불변 — plan state만.)
+            if worked_unit is not None and worked_unit != no.unit:
+                _advance_done(state, worked_unit)
+            _set_plan_state(state, no.unit, PlanState.in_progress)
+            worked_unit = no.unit
             emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
             result = executor.run(no)
             emit("gate 검사 중…")
@@ -422,7 +424,6 @@ def run_loop(
                     checks=gr.checks,
                 )
             )
-            _update_plan(state, no.unit, verdict)
             try_save()  # 증분: 매 이벤트마다 감사 로그 보존(비치명적)
             last_result = f"unit={no.unit} verdict={verdict.value} :: {result}"
             if verdict == Verdict.done:
@@ -433,6 +434,9 @@ def run_loop(
 
         elif action == Action.escalate:
             state.status = Status.escalated
+            # WO#25 Part A: brain이 작업 중이던 유닛을 포기(escalate) → 그 유닛 failed.
+            if worked_unit is not None:
+                _set_plan_state(state, worked_unit, PlanState.failed)
             if decision.escalation is not None:
                 state.pending_escalations.append(
                     decision.escalation.model_dump(by_alias=True, mode="json")
@@ -474,6 +478,13 @@ def run_loop(
         else:  # 방어: 미지원 action
             state.status = Status.escalated
             state.pending_escalations.append({"reason": f"미지원 action: {action.value}"})
+
+    # WO#25 Part A: 종료가 done이면 작업된(=pending 아닌) 모든 유닛을 done으로.
+    # done = 전체 spec 통과 = 모든 작업 유닛 반영됨 → "전부 in_progress 고착" 해소.
+    if state.status == Status.done:
+        for item in state.plan:
+            if item.state != PlanState.pending:
+                item.state = PlanState.done
 
     # max_iters 도달 등으로 여전히 running이면 임시로 stopped_stuck.
     if state.status == Status.running:

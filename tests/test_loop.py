@@ -465,6 +465,74 @@ def test_mocks_satisfy_protocols():
     assert isinstance(MockGate(Verdict.pass_), Gate)
 
 
+# ──────────── plan unit-state 현실 반영 (WO#25 Part A) ────────────
+
+SPEC3_YAML = """\
+spec_id: plan-001
+version: 1
+order_raw: "x"
+goal: "g"
+task_type: feature_impl
+verifiability: objective
+mode: normal
+constraints: []
+acceptance_criteria:
+  - id: ac1
+    desc: "d"
+    check: { type: test, cmd: "true" }
+assumptions: []
+non_goals: ["a", "b"]
+done_when: "ac1"
+decomposition:
+  - { unit: u1, desc: a, deps: [] }
+  - { unit: u2, desc: b, deps: [u1] }
+  - { unit: u3, desc: c, deps: [u2] }
+open_questions: []
+"""
+
+
+def _plan_states(state) -> dict:
+    return {p.unit: p.state.value for p in state.plan}
+
+
+def test_advance_marks_prev_unit_done_and_terminal_catch_all():
+    """전체-spec gate가 중간 유닛에 fail_recoverable을 줘도, advance + 종료 done catch-all로
+    작업된 유닛이 전부 done이 된다('전부 in_progress 고착' 회귀 방지)."""
+    client = MockClient([SPEC3_YAML, _next_order("u1"), _next_order("u2"), _next_order("u3")])
+    # 중간 유닛은 부분 통과(fail_recoverable), 마지막에 done — 예전이면 u1·u2가 in_progress 고착.
+    gate = MockGate([Verdict.fail_recoverable, Verdict.fail_recoverable, Verdict.done])
+    state = run_loop(order="x", client=client, executor=MockExecutor(["a", "b", "c"]),
+                     gate=gate, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert _plan_states(state) == {"u1": "done", "u2": "done", "u3": "done"}
+
+
+def test_escalate_marks_worked_unit_failed():
+    """brain이 작업 중이던 유닛을 포기(escalate)하면 그 유닛은 failed, 나머지는 pending 보존."""
+    client = MockClient([SPEC3_YAML, _next_order("u1"), DEC_ESCALATE])
+    gate = MockGate(Verdict.fail_recoverable)
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=gate, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.escalated
+    ps = _plan_states(state)
+    assert ps["u1"] == "failed"
+    assert ps["u2"] == "pending"  # 도달 안 한 유닛은 보존
+    assert ps["u3"] == "pending"
+
+
+def test_advance_done_preserved_when_later_unit_escalates():
+    """u1 advance로 done 후 u2에서 escalate → u1=done 보존, u2=failed."""
+    client = MockClient([SPEC3_YAML, _next_order("u1"), _next_order("u2"), DEC_ESCALATE])
+    gate = MockGate([Verdict.pass_, Verdict.fail_recoverable])
+    state = run_loop(order="x", client=client, executor=MockExecutor(["a", "b"]),
+                     gate=gate, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.escalated
+    ps = _plan_states(state)
+    assert ps["u1"] == "done"  # advance로 수용된 유닛 보존
+    assert ps["u2"] == "failed"  # escalate된 작업 유닛
+    assert ps["u3"] == "pending"
+
+
 # ──────────────────── 루프 내성 (WO#12 — LLM 출력으로 crash 금지) ────────────────────
 
 # 정규화로도 못 고치는 검증 실패(action enum 위반) → replan이 ReplanError를 낸다.

@@ -173,15 +173,70 @@ def test_gate_installs_before_checks(tmp_path):
     assert gr.verdict is Verdict.pass_
 
 
-def test_gate_proceeds_when_install_fails(tmp_path):
-    """install 실패해도 gate는 진행(non-fatal) — 체크가 자연히 평가된다."""
+def test_gate_install_failure_is_explicit_fail_signal(tmp_path):
+    """WO#25 Part B: 매니페스트 + install 실패 → 명시적 fail 체크 추가, verdict pass 아님.
+
+    ensure_deps 자체는 여전히 raise 안 함(non-fatal). gate가 결과를 *해석*해 fail 신호로
+    올릴 뿐. invalid package.json version 같은 매니페스트 버그를 여기서 잡는다.
+    """
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
-    rec = RecRunner(rc=1, out="blocked")
+    rec = RecRunner(rc=1, out="invalid version field")
     spec = _spec([{"id": "ac1", "desc": "d", "check": {"type": "test", "cmd": "true"}}])
     gate = CompositeGate(workdir=tmp_path, judge_client=None, deps_runner=rec)
     gr = gate.judge("결과", spec)  # raise 없음
     assert rec.calls  # 시도는 함
-    assert gr.verdict is Verdict.pass_  # 체크는 그대로 평가
+    # 가짜 fail CheckReport가 추가됨
+    install_checks = [c for c in gr.checks if c.ac_id == "(install)"]
+    assert len(install_checks) == 1
+    assert install_checks[0].status == "fail"
+    assert "의존성 설치 실패" in install_checks[0].detail
+    assert "invalid version field" in install_checks[0].detail
+    # 체크(true)는 통과하지만 install fail이 verdict를 pass에서 끌어내린다
+    assert gr.verdict is Verdict.fail_recoverable
+
+
+def test_gate_install_success_adds_no_fake_fail(tmp_path):
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    rec = RecRunner(rc=0, out="")
+    spec = _spec([{"id": "ac1", "desc": "d", "check": {"type": "test", "cmd": "true"}}])
+    gate = CompositeGate(workdir=tmp_path, judge_client=None, deps_runner=rec)
+    gr = gate.judge("결과", spec)
+    assert [c for c in gr.checks if c.ac_id == "(install)"] == []  # 성공 → 가짜 fail 없음
+    assert gr.verdict is Verdict.pass_
+
+
+def test_gate_no_manifest_adds_no_install_check(tmp_path):
+    # 매니페스트 없음 → install 체크 추가 안 함(매니페스트 없는 프로젝트는 페널티 0).
+    spec = _spec([{"id": "ac1", "desc": "d", "check": {"type": "test", "cmd": "true"}}])
+    gate = CompositeGate(workdir=tmp_path, judge_client=None)
+    gr = gate.judge("결과", spec)
+    assert [c for c in gr.checks if c.ac_id == "(install)"] == []
+    assert gr.verdict is Verdict.pass_
+
+
+def test_gate_cached_install_adds_no_install_check(tmp_path):
+    # 두 번째 judge는 매니페스트 불변 → skipped_cached → install 체크 없음(캐시 히트 페널티 0).
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    rec = RecRunner(rc=0, out="")
+    spec = _spec([{"id": "ac1", "desc": "d", "check": {"type": "test", "cmd": "true"}}])
+    gate = CompositeGate(workdir=tmp_path, judge_client=None, deps_runner=rec)
+    gate.judge("결과", spec)  # 1회 설치
+    gr2 = gate.judge("결과", spec)  # 캐시 히트
+    assert len(rec.calls) == 1
+    assert [c for c in gr2.checks if c.ac_id == "(install)"] == []
+    assert gr2.verdict is Verdict.pass_
+
+
+def test_gate_install_disabled_no_install_gating(tmp_path):
+    # --no-install-deps → install 자체를 안 하므로 install-gating도 없음.
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    rec = RecRunner(rc=1, out="would fail")
+    spec = _spec([{"id": "ac1", "desc": "d", "check": {"type": "test", "cmd": "true"}}])
+    gate = CompositeGate(workdir=tmp_path, judge_client=None, deps_runner=rec, install_deps=False)
+    gr = gate.judge("결과", spec)
+    assert rec.calls == []
+    assert [c for c in gr.checks if c.ac_id == "(install)"] == []
+    assert gr.verdict is Verdict.pass_
 
 
 def test_gate_no_install_when_disabled(tmp_path):
