@@ -38,8 +38,11 @@
   `acceptance_criteria`(list), `non_goals`(list), `done_when`(str).
 - `constraints`, `non_goals`는 **문자열의 리스트**(`list[str]`). `{id, desc}` 같은 객체 리스트 **금지**.
 - `decomposition[]` 항목의 키는 **`unit`**(절대 `id` 아님), `desc`, 선택 `deps`(`list[str]`).
-- `acceptance_criteria[]`는 `id`, `desc`, `check`. `check`의 명령 키는 **`cmd`**(절대 `command` 아님),
-  그리고 `type`(enum), 선택 `pass`. `check`에 다른 키(`command`, `desc` 등)를 **추가하지 마라**.
+- `acceptance_criteria[]`는 `id`, `desc`, `check`, 선택 `unit`(str). `check`의 명령 키는
+  **`cmd`**(절대 `command` 아님), 그리고 `type`(enum), 선택 `pass`. `check`에 다른
+  키(`command`, `desc` 등)를 **추가하지 마라**.
+  - `unit`은 acceptance_criterion *최상위* 키다(`check` 안이 **아님**). 값은
+    `decomposition`의 unit-id(예: `u1`) 또는 `"integration"`. 생략하면 통합 기준이다.
 - `assumptions[]`는 `id`, `text`, `confidence`(0~1 float), `checkpoint`(bool).
 
 ## 완성 예시 (이 모양을 그대로 베껴라)
@@ -56,11 +59,13 @@ constraints:
   - "구현 언어는 Python (표준 라이브러리만)"
 acceptance_criteria:
   - id: ac1
-    desc: "add 명령으로 새 할 일이 미완료로 저장되고 id가 출력된다"
-    check: { type: test, cmd: "python -m pytest -k add" }
+    desc: "저장 모델이 할 일을 JSON으로 영속화한다(라운드트립)"
+    unit: u1
+    check: { type: test, cmd: "python -m pytest -k storage" }
   - id: ac2
-    desc: "complete 명령으로 해당 id가 완료 처리되고 list에 반영된다"
-    check: { type: test, cmd: "python -m pytest -k complete" }
+    desc: "add/complete/list가 end-to-end로 동작한다"
+    unit: integration
+    check: { type: test, cmd: "python -m pytest -k cli_e2e" }
 assumptions:
   - { id: as1, text: "데이터는 로컬 JSON 파일에 저장", confidence: 0.7, checkpoint: false }
 non_goals:
@@ -97,6 +102,21 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
   거기에 의존하지 말고, 트레이스 기반 `run` 기준으로 *동적 행동 자체*를 검증하라.
 
 정적 `test`만으로는 "통과는 하는데 행동은 틀림"을 못 잡는다 — 그게 `run`의 존재 이유다.
+
+### 1b. 각 acceptance_criterion에 `unit`을 배정하라 (per-unit vs 통합)
+병렬 실행에서 각 기준이 *어디서* 검사되는지가 `unit` 태그로 갈린다:
+
+- **그 유닛 하나만으로 검증되는 기준** → 그 기준을 충족하는 `decomposition` unit-id를 `unit`에
+  적어라. 예: 유닛별 물리/큐 단위테스트, 그 유닛의 API/스키마 계약 → 해당 unit.
+  그 유닛의 per-unit gate(격리 worktree)에서만 검사된다.
+- **전체 시스템이 있어야 검증되는 기준** → `unit: integration`(또는 생략).
+  예: end-to-end 실행, `run` 트레이스(`npm run sim:trace -- --ticks N` 같은 풀-행동),
+  교차-유닛 통합, "기존 스위트 무회귀". 전 유닛 머지 후 통합 gate(main)에서 검사된다.
+
+**왜 중요한가**: per-unit gate가 *전체-시스템* 기준을 기반 유닛(예: API 뼈대 u1)에 들이대면
+그 유닛은 혼자 충족 불가 → 재시도 소진 → 잘못된 escalate로 run이 죽는다. `run` 트레이스나
+교차-유닛 기준은 *반드시* `integration`(또는 미태그)으로 둬서 통합에서만 검사하라.
+unit-id를 적을 땐 `decomposition`에 실제로 존재하는 unit이어야 한다(없는 unit은 죽은 기준).
 
 ### 2. 묻지 말고 가정하라 (assume-don't-ask)
 주문에서 비어 있는 부분은 **네가 가장 합리적인 방향을 골라 채우고**,
@@ -147,6 +167,8 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
 ## 자기검열 (출력 직전 반드시 통과)
 
 - 모든 ac에 check가 있나?
+- 각 ac의 `unit`이 맞나? 전체-시스템 기준(run 트레이스·end-to-end·교차 유닛)이 기반
+  유닛에 잘못 태그돼 있지 않나? 그런 건 `integration`이어야 한다.
 - 게으른 구현이 ac를 전부 통과하면서도 `goal`을 놓칠 수 있나? 있으면 그 ac를 더 조여라.
 - `non_goals`가 사실 사용자의 *진짜 의도*를 잘라먹고 있지 않나?
 - "방향이 갈리는" 가정이 `checkpoint: false`로 숨어 있지 않나?

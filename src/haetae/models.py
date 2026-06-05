@@ -100,9 +100,21 @@ class Check(BaseModel):
 
 
 class AcceptanceCriterion(BaseModel):
+    """완료 기준 한 항목.
+
+    unit: 이 기준을 *어디서* 검사하는지 결정하는 옵셔널 태그 (WO#26).
+      - decomposition unit-id(예: "u1") → 그 유닛의 per-unit gate(worktree)에서 검사.
+      - None 또는 "integration" → 통합 기준. 병렬 per-unit gate는 안 돌리고,
+        전 유닛 머지 후 통합 gate(main)에서만 검사한다.
+    병렬 모델 정합성: 기반 유닛이 *전체-시스템* 기준(풀 시뮬·교차 유닛)을 혼자 못 채워
+    escalate하던 회귀를 막는다. 미태그(None)는 통합으로 흡수 = 후방호환.
+    순차(N=1) 경로는 이 필드를 무시하고 전체 spec을 그대로 검사한다(무회귀).
+    """
+
     id: str
     desc: str
     check: Check
+    unit: str | None = None
 
 
 class Assumption(BaseModel):

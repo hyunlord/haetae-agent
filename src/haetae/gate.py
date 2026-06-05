@@ -42,6 +42,21 @@ from haetae.run_harness import run_artifact
 _UNEVALUATABLE_TYPES = {CheckType.human, CheckType.judge}
 
 
+def select_criteria(spec: ProjectSpec, unit: str | None) -> list:
+    """gate가 *어떤* acceptance_criteria를 검사할지 unit 태그로 고른다 (WO#26).
+
+      - unit is None → 전체 검사. 통합 gate(머지된 main)와 순차(N=1) 경로가 쓴다.
+        권위 있는 done 판정 — unit 태그 무관하게 전부 실행.
+      - unit == "uX" → 그 유닛 per-unit gate(worktree). `ac.unit == "uX"`인 기준만.
+        유닛에 자기 기준이 없으면 빈 리스트 → 호출부가 executor-ok(pass)로 흡수한다
+        (aggregate_verdict([]) == pass_, 통합 gate가 나중에 전체를 잡음).
+    미태그(ac.unit is None) 기준은 통합 기준 → per-unit 선택에서 제외된다(후방호환).
+    """
+    if unit is None:
+        return list(spec.acceptance_criteria)
+    return [ac for ac in spec.acceptance_criteria if ac.unit == unit]
+
+
 def aggregate_verdict(reports: list[CheckReport]) -> Verdict:
     """per-check 보고들을 하나의 verdict로 집계하는 공유 규칙(중복 금지).
 
@@ -74,8 +89,11 @@ class CheckRunner:
         self.timeout = timeout
 
     # ── Gate 인터페이스 ───────────────────────────────────────────────
-    def judge(self, result: str, spec: ProjectSpec) -> GateResult:
-        report = [self._run_check(ac.id, ac.check) for ac in spec.acceptance_criteria]
+    def judge(self, result: str, spec: ProjectSpec, unit: str | None = None) -> GateResult:
+        # unit이 주어지면 그 유닛 태그된 기준만(WO#26). 비면(자기 기준 없음)
+        # report=[] → aggregate_verdict([])==pass_ → executor-ok(블록 안 함).
+        acs = select_criteria(spec, unit)
+        report = [self._run_check(ac.id, ac.check) for ac in acs]
         # 집계 규칙은 공유 헬퍼로 일원화 — 근거(report)만 반환에 동봉한다.
         return GateResult(verdict=aggregate_verdict(report), checks=report)
 
@@ -175,7 +193,14 @@ class CompositeGate:
         self._runner = CheckRunner(workdir=workdir, timeout=timeout)
 
     # ── Gate 인터페이스 ───────────────────────────────────────────────
-    def judge(self, result: str, spec: ProjectSpec) -> GateResult:
+    def judge(self, result: str, spec: ProjectSpec, unit: str | None = None) -> GateResult:
+        # WO#26: unit이 주어지면(per-unit gate, worktree) 그 유닛 태그된 기준만 검사한다.
+        # 자기 기준이 하나도 없으면 install/run/judge 모두 건너뛰고 executor-ok(pass).
+        # 통합 gate·순차 경로는 unit=None → 전체 검사(권위 있는 done 판정, 무회귀).
+        acs = select_criteria(spec, unit)
+        if unit is not None and not acs:
+            return GateResult(verdict=Verdict.pass_, checks=[])
+
         # 호스트-사이드 install(WO#23): 기계 체크(npm test)·run-harness가 설치된 deps로
         # 동작하도록 체크 평가 *전에* 1회. ensure_deps 자체는 여전히 raise 안 함(non-fatal).
         # 해시 캐시로 매니페스트 불변이면 스킵. 매니페스트 없으면 no-op.
@@ -186,14 +211,14 @@ class CompositeGate:
             )
 
         # run 타입: judge 유무와 무관하게 항상 harness로 실행해 RunEvidence 캡처.
-        run_acs = [ac for ac in spec.acceptance_criteria if ac.check.type == CheckType.run]
+        run_acs = [ac for ac in acs if ac.check.type == CheckType.run]
         run_reports = self._judge_run_acs(run_acs, result, spec)
 
         # judge 타입은 judge_client이 있을 때만 LLM 경로로. 없으면 _run_check→skipped.
         route_to_judge = self.judge_client is not None
         judge_acs = [
             ac
-            for ac in spec.acceptance_criteria
+            for ac in acs
             if route_to_judge and ac.check.type == CheckType.judge
         ]
 
@@ -211,7 +236,7 @@ class CompositeGate:
 
         # spec 순서를 보존하며 run/judge/기계 보고를 합친다(run·judge 우선, 나머지는 기계).
         report: list[CheckReport] = []
-        for ac in spec.acceptance_criteria:
+        for ac in acs:
             if ac.id in run_reports:
                 report.append(run_reports[ac.id])
             elif ac.id in judged:

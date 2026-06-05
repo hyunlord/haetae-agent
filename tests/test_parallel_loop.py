@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from haetae.gate import CheckRunner
 from haetae.llm import MockClient
 from haetae.loop import MockExecutor, MockGate, run_loop
 from haetae.models import GateResult, State, Status, Verdict
@@ -91,7 +92,7 @@ class PassGate:
     def __init__(self, verdict: Verdict = Verdict.pass_):
         self.verdict = verdict
 
-    def judge(self, result, spec):
+    def judge(self, result, spec, unit=None):
         return GateResult(verdict=self.verdict)
 
 
@@ -103,7 +104,7 @@ class SpyGate:
         self.calls: list[str] = []
         self._lock = threading.Lock()
 
-    def judge(self, result, spec):
+    def judge(self, result, spec, unit=None):
         with self._lock:
             self.calls.append(result)
         return GateResult(verdict=self.verdict)
@@ -393,6 +394,105 @@ def test_integration_gate_failure_escalates(tmp_path):
 
 
 # ──────────────────────── 8. 이벤트 결정적 정렬 ────────────────────────
+
+
+# ──────────────────────── 9. per-unit acceptance criteria (WO#26) ────────────────────────
+
+
+def _tagged_spec(ac_int_cmd: str) -> str:
+    """u1·u2 + 유닛별 ac(true) + 통합 ac(ac_int_cmd). 진짜 CheckRunner로 gate한다."""
+    return f"""\
+spec_id: par-tag-001
+version: 1
+order_raw: "x"
+goal: "g"
+task_type: feature_impl
+verifiability: objective
+mode: normal
+constraints: []
+acceptance_criteria:
+  - id: ac_u1
+    desc: "u1 자기 기준"
+    unit: u1
+    check: {{ type: test, cmd: "true" }}
+  - id: ac_u2
+    desc: "u2 자기 기준"
+    unit: u2
+    check: {{ type: test, cmd: "true" }}
+  - id: ac_int
+    desc: "전체-시스템 기준"
+    unit: integration
+    check: {{ type: test, cmd: "{ac_int_cmd}" }}
+assumptions: []
+non_goals: ["n"]
+done_when: "ac_u1~ac_int 전부"
+decomposition:
+  - {{ unit: u1, desc: a, deps: [] }}
+  - {{ unit: u2, desc: b, deps: [] }}
+open_questions: []
+"""
+
+
+def test_per_unit_gate_runs_only_its_own_criteria(tmp_path):
+    """per-unit gate(real CheckRunner)는 자기 ac만, 통합 gate는 전체 ac를 돌린다."""
+    state = run_loop(
+        "x", BrainClient(_tagged_spec("true")), executor=None,
+        gate=CheckRunner(workdir=tmp_path),  # 통합 gate(머지된 main)
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=lambda wt: CheckRunner(workdir=wt),  # per-unit gate
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+    )
+    assert state.status is Status.done
+    # per-unit 이벤트: 그 유닛 ac만 평가됨(u1 gate가 u2/integration ac를 안 돌림)
+    by_unit = {e.unit: [c.ac_id for c in e.checks] for e in state.events if e.unit}
+    assert by_unit == {"u1": ["ac_u1"], "u2": ["ac_u2"]}
+    # 통합 이벤트: 전체 ac 평가됨(권위 done 판정)
+    integ = [e for e in state.events if e.unit is None][0]
+    assert {c.ac_id for c in integ.checks} == {"ac_u1", "ac_u2", "ac_int"}
+    assert_clean(tmp_path)
+
+
+def test_capstone_foundational_unit_progresses_not_escalates(tmp_path):
+    """캡스톤 회귀: 전체-시스템 기준(ac_int=false)이 있어도 기반 유닛은 *자기 기준만*
+    통과하면 progress한다 → u1/u2는 done까지 가고, 실패는 *통합* gate에서 난다.
+    (구버전: per-unit gate가 전체 spec을 검사해 기반 유닛이 ac_int 때문에 escalate)
+    """
+    state = run_loop(
+        "x", BrainClient(_tagged_spec("false")), executor=None,
+        gate=CheckRunner(workdir=tmp_path),
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=lambda wt: CheckRunner(workdir=wt),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=1,
+    )
+    # 유닛은 *자기 기준* 통과 → done까지 진행(머지됨). escalate는 통합에서.
+    assert {p.unit: p.state.value for p in state.plan} == {"u1": "done", "u2": "done"}
+    assert state.status is Status.escalated
+    # 실패 원인이 *통합* breakage이지, 기반 유닛 자기 기준 실패가 아니다.
+    assert any("통합 gate" in str(e) for e in state.pending_escalations), state.pending_escalations
+    assert not any("gate" in str(e) and "u1" in str(e) for e in state.pending_escalations)
+    assert_clean(tmp_path)
+
+
+def test_untagged_spec_parallel_backcompat(tmp_path):
+    """미태그 spec: per-unit은 trivial pass(자기 기준 0), 통합 gate가 전체를 잡는다.
+    전부 통과(true)면 기존 병렬 의미 그대로 최종 done.
+    """
+    state = run_loop(
+        "x", BrainClient(SPEC_TWO_INDEP), executor=None,  # ac1 미태그(true)
+        gate=CheckRunner(workdir=tmp_path),
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=lambda wt: CheckRunner(workdir=wt),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+    )
+    assert state.status is Status.done
+    # per-unit 이벤트는 미태그라 빈 checks(자기 기준 없음 → executor-ok)
+    by_unit = {e.unit: e.checks for e in state.events if e.unit}
+    assert all(checks == [] for checks in by_unit.values())
+    # 통합이 미태그 ac1을 검사
+    integ = [e for e in state.events if e.unit is None][0]
+    assert [c.ac_id for c in integ.checks] == ["ac1"]
+    assert_clean(tmp_path)
 
 
 def test_events_sorted_deterministically_by_unit(tmp_path):

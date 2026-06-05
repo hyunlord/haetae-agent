@@ -159,6 +159,66 @@ def test_timeout_is_fail(tmp_path):
     assert "timeout" in gr.checks[0].detail
 
 
+# ──────────────────────── per-unit gating (WO#26) ────────────────────────
+
+
+def test_judge_unit_runs_only_that_units_criteria(tmp_path):
+    """unit='u1'이면 unit==u1 태그된 ac만 검사한다(u2/integration ac는 무시)."""
+    spec = _spec(
+        [
+            {"id": "ac_u1", "desc": "d", "unit": "u1", "check": {"type": "test", "cmd": "true"}},
+            {"id": "ac_u2", "desc": "d", "unit": "u2", "check": {"type": "test", "cmd": "false"}},
+            {"id": "ac_int", "desc": "d", "unit": "integration", "check": {"type": "test", "cmd": "false"}},
+        ]
+    )
+    g = CheckRunner(workdir=tmp_path)
+    gr = g.judge("noop", spec, unit="u1")
+    # u1의 ac만 평가됐고(다른 unit/integration의 false는 안 돌림) → pass.
+    assert [c.ac_id for c in gr.checks] == ["ac_u1"]
+    assert gr.verdict is Verdict.pass_
+
+
+def test_judge_unit_with_no_criteria_is_executor_ok_pass(tmp_path):
+    """자기 기준이 하나도 없는 유닛 → 빈 report → pass_(블록 안 함)."""
+    spec = _spec(
+        [
+            {"id": "ac_int", "desc": "d", "unit": "integration", "check": {"type": "test", "cmd": "false"}},
+        ]
+    )
+    g = CheckRunner(workdir=tmp_path)
+    gr = g.judge("noop", spec, unit="u1")
+    assert gr.checks == []
+    assert gr.verdict is Verdict.pass_
+
+
+def test_judge_integration_runs_whole_spec(tmp_path):
+    """unit=None(통합/순차)이면 unit 태그 무관 전체 ac를 검사한다(권위 done 판정)."""
+    spec = _spec(
+        [
+            {"id": "ac_u1", "desc": "d", "unit": "u1", "check": {"type": "test", "cmd": "true"}},
+            {"id": "ac_u2", "desc": "d", "unit": "u2", "check": {"type": "test", "cmd": "true"}},
+            {"id": "ac_int", "desc": "d", "unit": "integration", "check": {"type": "test", "cmd": "false"}},
+        ]
+    )
+    g = CheckRunner(workdir=tmp_path)
+    gr = g.judge("noop", spec)  # unit 생략 = None = 전체
+    assert {c.ac_id for c in gr.checks} == {"ac_u1", "ac_u2", "ac_int"}
+    # integration ac(false)가 실패 → 전체에선 fail.
+    assert gr.verdict is Verdict.fail_recoverable
+
+
+def test_judge_untagged_criteria_only_run_at_integration(tmp_path):
+    """미태그(unit None) ac는 per-unit gate에서 안 돌고, 통합(unit=None)에서만 돈다."""
+    spec = _spec(
+        [{"id": "ac1", "desc": "d", "check": {"type": "test", "cmd": "false"}}]  # 미태그
+    )
+    g = CheckRunner(workdir=tmp_path)
+    # per-unit: 미태그는 자기 기준 아님 → 빈 → pass(블록 안 함)
+    assert g.judge("noop", spec, unit="u1").verdict is Verdict.pass_
+    # 통합: 미태그는 통합 기준 → 전체에 포함 → false라 fail
+    assert g.judge("noop", spec).verdict is Verdict.fail_recoverable
+
+
 # ──────────────────────────── Protocol 적합성 ────────────────────────────
 
 

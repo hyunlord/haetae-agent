@@ -58,9 +58,12 @@ class Gate(Protocol):
 
     근거(per-check 증거)는 mutable 속성이 아니라 반환 계약이다 — 루프가 그대로
     Event.checks에 실어 state 파일을 진짜 감사 로그로 만든다.
+
+    unit (WO#26): per-unit gate(worktree)는 unit=그 유닛-id로 호출돼 *그 유닛 태그된
+    기준만* 검사한다. 통합 gate·순차 경로는 unit=None(기본)으로 전체 spec을 검사한다.
     """
 
-    def judge(self, result: str, spec: ProjectSpec) -> GateResult: ...
+    def judge(self, result: str, spec: ProjectSpec, unit: str | None = None) -> GateResult: ...
 
 
 class MockExecutor:
@@ -95,7 +98,7 @@ class MockGate:
         self._i = 0
         self.calls: list[str] = []
 
-    def judge(self, result: str, spec: ProjectSpec) -> GateResult:
+    def judge(self, result: str, spec: ProjectSpec, unit: str | None = None) -> GateResult:
         self.calls.append(result)
         v = self._v[min(self._i, len(self._v) - 1)]
         self._i += 1
@@ -165,9 +168,13 @@ def _exec_and_gate(
 
     brain(work order 생성)과 worktree 생성/머지는 main 스레드에서 직렬·결정적으로
     처리하므로 여기엔 mock 시퀀스 race가 없다. 예외는 fut.result()로 전파된다.
+
+    WO#26: per-unit gate는 order.unit으로 호출돼 *그 유닛 태그된 기준만* 검사한다
+    (전체-spec 기준은 통합 gate로 연기 → 기반 유닛이 전체-시스템 기준 때문에
+    escalate하던 회귀 해소). 통합 gate는 main에서 unit 없이(전체) 호출된다.
     """
     result = executor.run(order)
-    return result, gate.judge(result, spec)
+    return result, gate.judge(result, spec, unit=order.unit)
 
 
 def _save_state(state: State, state_path: str | Path) -> None:

@@ -139,6 +139,48 @@ def test_state_invalid_event_verdict_rejected():
         State.model_validate(bad)
 
 
+# ──────────────────────── acceptance_criterion.unit (WO#26) ────────────────────────
+
+
+def _min_spec(acs: list[dict]) -> dict:
+    return {
+        "spec_id": "u-001",
+        "version": 1,
+        "order_raw": "x",
+        "goal": "g",
+        "task_type": "feature_impl",
+        "verifiability": "objective",
+        "mode": "normal",
+        "acceptance_criteria": acs,
+        "non_goals": ["a", "b"],
+        "done_when": "끝",
+    }
+
+
+def test_acceptance_criterion_unit_parsed():
+    """unit이 unit-id / 'integration' / 생략 세 형태로 파싱된다(생략→None)."""
+    spec = ProjectSpec.model_validate(
+        _min_spec(
+            [
+                {"id": "ac1", "desc": "d", "unit": "u1", "check": {"type": "test", "cmd": "true"}},
+                {"id": "ac2", "desc": "d", "unit": "integration", "check": {"type": "test", "cmd": "true"}},
+                {"id": "ac3", "desc": "d", "check": {"type": "test", "cmd": "true"}},  # unit 생략
+            ]
+        )
+    )
+    assert spec.acceptance_criteria[0].unit == "u1"
+    assert spec.acceptance_criteria[1].unit == "integration"
+    # 미태그 → None = 통합 기준(후방호환)
+    assert spec.acceptance_criteria[2].unit is None
+
+
+def test_acceptance_criterion_unit_backcompat_default_none():
+    """unit 필드가 전혀 없는 기존 spec도 그대로 로드된다(전부 None=통합)."""
+    spec = ProjectSpec.from_yaml(SPEC_DIR / "projectspec.schema.yaml")
+    # 예시 스키마는 이제 unit을 명시하지만, 모델은 미태그도 받아야 한다.
+    assert all(ac.unit is None or isinstance(ac.unit, str) for ac in spec.acceptance_criteria)
+
+
 # ──────────────────────────── Decision ────────────────────────────
 
 

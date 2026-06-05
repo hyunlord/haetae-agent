@@ -30,16 +30,27 @@ constraints:                    # project_context에서만 주입. 지어내지 
   - "Rust hecs ECS + rayon, 10 TPS 유지"
 
 # ★핵심★ 각 항목은 반드시 check를 가진다. check 없는 기준은 기준이 아니다.
-# check.type: test | bench | lint | build | schema | judge | human
+# check.type: test | bench | lint | build | schema | run | judge | human
+#
+# unit (선택): 이 기준을 *어디서* 검사하는지 (WO#26 — 병렬 per-unit gate 정합성).
+#   - decomposition unit-id(예: u1) → 그 유닛의 per-unit gate(worktree)에서만 검사.
+#   - "integration" 또는 생략 → 통합 기준. 병렬 per-unit gate는 안 돌리고,
+#     전 유닛 머지 후 통합 gate(main)에서 전체와 함께 검사한다.
+#   유닛별로 *그 유닛만으로 검증되는* 기준(단위테스트 등)은 그 유닛에, *전체 시스템이
+#   있어야* 검증되는 기준(풀 시뮬·교차 유닛 run 트레이스)은 integration에 둔다.
+#   순차(N=1) 경로는 이 필드를 무시하고 전체 spec을 검사한다(무회귀).
 acceptance_criteria:
   - id: ac1
     desc: "전투 컴포넌트가 ECS에 등록되고 10 TPS가 깨지지 않음"
+    unit: u1
     check: { type: bench, cmd: "cargo bench tps", pass: ">=10" }
   - id: ac2
     desc: "전투 결과가 스트레스/Trait 시스템에 반영됨"
+    unit: u3
     check: { type: test, cmd: "cargo test combat_stress_integration" }
   - id: ac3
     desc: "신규 UI 텍스트 하드코딩 0개"
+    unit: integration
     check: { type: lint, cmd: "scripts/i18n_check.sh", pass: "0" }
 
 # 주문이 모호해 합성기가 채운 것. 사람에게 묻지 않고 진행하되 반드시 기록.
