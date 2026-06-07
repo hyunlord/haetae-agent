@@ -40,6 +40,7 @@ from haetae.models import (
 )
 from haetae.replan import ReplanError, replan
 from haetae.scheduler import all_done, is_stuck, ready_units
+from haetae.skills import Skill, inject_skills, load_skills, match_skills
 from haetae.spec_change import apply_spec_change
 from haetae.spec_critic import synthesize_with_critique
 from haetae.worktree import WorktreeError, WorktreeManager
@@ -271,8 +272,14 @@ def run_loop(
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
+    skills_dir: str | Path | None = None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
+
+    스킬 주입(WO#32, Phase B): skills_dir가 주어지면 읽기전용 패턴 문서를 로드해
+      각 유닛 work order에 *executor 넘기기 직전* 매칭 주입한다(빌더 전용). judge/
+      gate/critic 경로엔 절대 주입하지 않는다(검증 독립성). skills_dir=None이거나
+      매칭 0이면 no-op(기존 동작 불변).
 
     내성(WO#12): LLM 출력 하나로 루프가 crash하지 않는다.
       - 합성(synthesize) 실패: traceback 대신 escalated State 반환.
@@ -328,6 +335,28 @@ def run_loop(
         if prompt_dir
         else scaffold_mod.DEFAULT_SCAFFOLD_PROMPT_PATH
     )
+
+    # 스킬 레지스트리(빌더 전용) — best-effort 로드. 매칭 주입은 executor dispatch 직전에만.
+    skills: list[Skill] = load_skills(skills_dir) if skills_dir else []
+    if skills:
+        emit(f"스킬 로드: {len(skills)}개")
+
+    def apply_skills(order: NextOrder) -> NextOrder:
+        """work order에 매칭 스킬을 주입한 *복사본*을 반환(executor에만 전달).
+
+        매칭은 유닛 작업지시서 텍스트(goal/scope/deliverable/context_refs)에 대해,
+        주입은 scope 필드에 `## 참고 패턴 (스킬)` 섹션으로. 원본 order는 불변이라
+        Event/gate로 흘러가는 값엔 스킬이 새지 않는다(분리 보존).
+        """
+        if not skills:
+            return order
+        match_text = "\n".join(
+            t for t in [order.goal, order.scope, order.deliverable, *order.context_refs] if t
+        )
+        matched = match_skills(skills, match_text)
+        if not matched:
+            return order
+        return order.model_copy(update={"scope": inject_skills(order.scope or "", matched)})
 
     emit("합성 중…")
     critique: SpecCritique | None = None
@@ -388,6 +417,7 @@ def run_loop(
             scaffold=scaffold,
             install_deps=install_deps,
             deps_runner=deps_runner,
+            apply_skills=apply_skills,
         )
 
     # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
@@ -458,7 +488,7 @@ def run_loop(
             _set_plan_state(state, no.unit, PlanState.in_progress)
             worked_unit = no.unit
             emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
-            result = executor.run(no)
+            result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
             emit("gate 검사 중…")
             gr = gate.judge(result, spec)
             verdict = gr.verdict
@@ -567,6 +597,7 @@ def _parallel_loop(
     scaffold: Scaffold | None = None,
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
+    apply_skills: Callable[[NextOrder], NextOrder] = lambda o: o,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -771,8 +802,11 @@ def _parallel_loop(
                         emit(f"worktree node_modules 준비: {u} ({how})")
                     _set_plan_state(state, u, PlanState.in_progress)
                     in_flight.add(u)
+                    # 스킬 주입은 executor로 가는 order에만. gate는 order.unit만 읽으므로
+                    # 증강 order를 _exec_and_gate에 줘도 gate엔 스킬이 새지 않는다(분리 보존).
                     fut = pool.submit(
-                        _exec_and_gate, executor_factory(wt), gate_factory(wt), order, spec)
+                        _exec_and_gate, executor_factory(wt), gate_factory(wt),
+                        apply_skills(order), spec)
                     futures[fut] = (u, order, wt)
 
             dispatch_ready()

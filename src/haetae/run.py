@@ -18,6 +18,9 @@ from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
 from haetae.models import State
 
+# 기본 스킬 디렉토리 = 이 repo의 skills/ (src/haetae/run.py → parents[2] = repo 루트).
+_DEFAULT_SKILLS_DIR = str(Path(__file__).resolve().parents[2] / "skills")
+
 
 def run(
     order: str,
@@ -37,6 +40,7 @@ def run(
     unit_retries: int = 2,
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
+    skills_dir: str | Path | None = None,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -56,6 +60,7 @@ def run(
         unit_retries=unit_retries,
         scaffold_client=scaffold_client,
         install_deps=install_deps,
+        skills_dir=skills_dir,
     )
 
 
@@ -155,6 +160,20 @@ def main(argv: list[str] | None = None) -> int:
             ">1이면 git worktree per unit 격리 + 결정적 DAG 스케줄링."
         ),
     )
+    parser.add_argument(
+        "--skills-dir",
+        default=_DEFAULT_SKILLS_DIR,
+        help=(
+            "읽기전용 패턴 스킬(skills/<name>/SKILL.md) 디렉토리 (기본: 이 repo의 skills/). "
+            "매칭된 스킬을 유닛 work order에 빌더 가이드로 주입한다(judge/gate엔 안 들어감)."
+        ),
+    )
+    parser.add_argument(
+        "--skills",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="스킬 주입 on/off (기본 on). --no-skills로 끄면 주입 없음(기존 동작 불변).",
+    )
     args = parser.parse_args(argv)
 
     client = CodexClient(model=args.model)
@@ -196,6 +215,9 @@ def main(argv: list[str] | None = None) -> int:
     # 골격을 내고 아니면 자동 스킵(auto). 호스트 install은 --install-deps 토글을 공유한다.
     scaffold_client = client if args.scaffold else None
 
+    # 스킬 주입(빌더 전용): --skills(기본 on)면 --skills-dir에서 로드. --no-skills면 None.
+    skills_dir = args.skills_dir if args.skills else None
+
     # 진행 표시: 느린 codex 호출이 "행"으로 안 보이게 stderr로 한 줄씩.
     def progress(msg: str) -> None:
         print(f"… {msg}", file=sys.stderr, flush=True)
@@ -216,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         unit_retries=args.unit_retries,
         scaffold_client=scaffold_client,
         install_deps=args.install_deps,
+        skills_dir=skills_dir,
     )
     print(format_summary(state))
     return 0
