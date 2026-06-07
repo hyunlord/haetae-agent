@@ -31,6 +31,8 @@ def run(
     gate: Gate,
     critic_client: LLMClient | None = None,
     max_iters: int = 30,
+    decomp_critic: bool = True,
+    decomp_retries: int = 1,
     state_path: str | Path | None = None,
     prompt_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -52,6 +54,8 @@ def run(
         gate,
         critic_client=critic_client,
         max_iters=max_iters,
+        decomp_critic=decomp_critic,
+        decomp_retries=decomp_retries,
         state_path=state_path,
         prompt_dir=prompt_dir,
         progress=progress,
@@ -135,6 +139,26 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "spec critic 전용 codex 모델 (주면 적대적 spec 비평 ON — 다른 모델 권장 = 독립성). "
             "없으면 critic OFF(추가 비용 0, 기존 동작 불변)"
+        ),
+    )
+    parser.add_argument(
+        "--decomp-critic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "분해 critic at replan (기본 on, Phase C = LEAP LLM 리뷰어). replan이 낸 매 work "
+            "order의 *진전성*을 독립 critic(critic-model)이 판정 → 무진전/재진술이면 reject·재계획. "
+            "--no-decomp-critic으로 끔. **--critic-model이 있어야 동작**(없으면 자동 OFF). "
+            "verifier-side·soft·best-effort(실패 시 진행)."
+        ),
+    )
+    parser.add_argument(
+        "--decomp-retries",
+        type=int,
+        default=1,
+        help=(
+            "분해 critic이 weak(무진전) 판정 시 재계획하는 최대 횟수 (기본 1). "
+            "소진 후에도 weak면 *진행*(데드락 금지)하고 critique를 state에 기록."
         ),
     )
     parser.add_argument(
@@ -290,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         gate=gate,
         critic_client=critic_client,
         max_iters=args.max_iters,
+        decomp_critic=args.decomp_critic,
+        decomp_retries=args.decomp_retries,
         state_path=args.state_path,
         progress=progress,
         max_parallel=args.max_parallel,

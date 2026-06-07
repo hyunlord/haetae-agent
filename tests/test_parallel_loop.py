@@ -508,3 +508,27 @@ def test_events_sorted_deterministically_by_unit(tmp_path):
     # seq는 1..N 연속
     assert [e.seq for e in state.events] == list(range(1, len(state.events) + 1))
     assert_clean(tmp_path)
+
+
+# ──────────────────── 분해 critic at replan (WO#40, 병렬 경로) ────────────────────
+
+_DC_WEAK = "verdict: weak\nreason: 무진전\n"
+_DC_PROGRESS = "verdict: progress\nreason: 진전\n"
+_CRIT_ADEQUATE = "verdict: adequate\ngaps: []\n"
+
+
+def test_parallel_decomp_critic_weak_then_progress_rereplans(tmp_path):
+    """병렬 gen_order에서도 weak → 재replan → progress dispatch. reject가 기록된다."""
+    # 공유 critic-model(main 스레드 직렬 호출): spec(adequate) → 분해 weak → 분해 progress.
+    critic = MockClient([_CRIT_ADEQUATE, _DC_WEAK, _DC_PROGRESS])
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        critic_client=critic, max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+    )
+    assert state.status is Status.done
+    assert len(critic.calls) == 3  # spec + 분해 2회(weak→progress) — 바운드
+    rejected = [c for c in state.decomp_critiques if c.rejected]
+    assert len(rejected) == 1 and rejected[0].verdict == "weak"
+    assert any(t.stage == "decomp-reject" for t in state.transitions)
+    assert_clean(tmp_path)

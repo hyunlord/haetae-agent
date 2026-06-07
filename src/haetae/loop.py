@@ -36,6 +36,7 @@ from haetae.models import (
     Activity,
     CheckReport,
     Cost,
+    DecompCritique,
     Event,
     GateResult,
     NextOrder,
@@ -63,6 +64,13 @@ STAGE_VERIFY = "verify"
 STAGE_REPLAN = "replan"
 STAGE_DONE = "done"
 STAGE_ESCALATE = "escalate"
+STAGE_DECOMP_REJECT = "decomp-reject"  # WO#40: 분해 critic이 무진전 work order를 reject→재replan
+from haetae.decomp_critic import (
+    DEFAULT_DECOMP_CRITIC_PROMPT_PATH,
+    build_decomp_feedback,
+    critique_decomposition,
+    is_weak,
+)
 from haetae.replan import ReplanError, replan
 from haetae.scheduler import all_done, is_stuck, ready_units
 from haetae.skills import Skill, inject_skills, load_skills, match_skills
@@ -309,6 +317,8 @@ def run_loop(
     critic_client: LLMClient | None = None,
     max_iters: int = 30,
     replan_retries: int = 2,
+    decomp_critic: bool = True,
+    decomp_retries: int = 1,
     prompt_dir: str | Path | None = None,
     state_path: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -460,6 +470,11 @@ def run_loop(
         if prompt_dir
         else critic_mod.DEFAULT_CRITIC_PROMPT_PATH
     )
+    decomp_critic_prompt = (
+        Path(prompt_dir) / "decomp_critic.md"
+        if prompt_dir
+        else DEFAULT_DECOMP_CRITIC_PROMPT_PATH
+    )
     scaffold_prompt = (
         Path(prompt_dir) / "scaffold.md"
         if prompt_dir
@@ -487,6 +502,25 @@ def run_loop(
         if not matched:
             return order
         return order.model_copy(update={"scope": inject_skills(order.scope or "", matched)})
+
+    # 분해 critic(WO#40, Phase C): replan이 낸 work order의 *진전성*을 독립 critic이 판정.
+    # **적대적 분리**: 독립 client(critic-model)만 쓰고, 스킬 미주입 *원본* order를 본다
+    #   (apply_skills는 executor로 가는 복사본에만 — critic은 raw order). 빌더/검증 분리.
+    # **기본 on, opt-out**: decomp_critic=False(--no-decomp-critic)면 OFF. critic_client가
+    #   없으면(=--critic-model 미설정) 돌릴 독립 모델이 없으므로 자동 OFF(미설정→진행).
+    decomp_critic_on = decomp_critic and critic_client is not None
+
+    def run_decomp_critic(no: NextOrder, last: str) -> DecompCritique | None:
+        """원본 work order(스킬 미주입)를 독립 critic으로 판정. OFF면 None.
+
+        m_critic(독립 critic-model의 metered 래퍼)로 호출 → 비용은 호출부가 drain/account.
+        best-effort: critique_decomposition 자체가 절대 raise하지 않는다(progress로 흡수).
+        """
+        if not decomp_critic_on or m_critic is None:
+            return None
+        return critique_decomposition(
+            no, spec, state, m_critic, last_result=last, prompt_path=decomp_critic_prompt
+        )
 
     emit("합성 중…")
     critique: SpecCritique | None = None
@@ -566,6 +600,13 @@ def run_loop(
             record_transition=record_transition,
             activity_start=activity_start,
             activity_end=activity_end,
+            decomp_retries=decomp_retries,
+            run_decomp_critic=run_decomp_critic,
+            account_decomp_cost=(
+                (lambda: account(combine_costs(m_critic.drain())))
+                if m_critic is not None
+                else (lambda: None)
+            ),
         )
 
     # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
@@ -587,30 +628,67 @@ def run_loop(
     while iters < max_iters and state.status == Status.running:
         iters += 1
 
-        # replan: 비결정적 LLM 출력 → 검증 실패를 흡수(재시도 → 소진 시 escalate).
+        # replan(비결정 LLM 출력 → 검증 실패 흡수) + 분해 critic(WO#40).
+        # 바깥 루프 = 분해 critic 재계획(bounded decomp_retries), 안쪽 = replan 파싱 재시도.
+        # weak 판정 → 피드백 주고 재replan; 재시도 소진 후에도 weak면 *진행*(데드락 금지)+기록.
         record_transition(STAGE_REPLAN)
         decision = None
-        feedback: str | None = None
         last_err: ReplanError | None = None
-        for _attempt in range(replan_retries + 1):
-            if _attempt == 0:
-                emit("replan 중…")
-            else:
-                emit(
-                    f"replan 재시도 {_attempt}: "
-                    f"{_truncate(feedback or 'Decision 검증 실패')}"
-                )
-            try:
-                decision = replan(
-                    spec, state, last_result, m_client,
-                    prompt_path=rep_prompt, feedback=feedback,
-                )
+        decomp_feedback: str | None = None  # weak 판정 시 다음 replan에 얹는 피드백
+        for _decomp_attempt in range(decomp_retries + 1):
+            decision = None
+            feedback: str | None = decomp_feedback
+            for _attempt in range(replan_retries + 1):
+                if _attempt == 0:
+                    emit(
+                        "replan 중…" if decomp_feedback is None
+                        else f"replan(분해 재계획): {_truncate(decomp_feedback)}"
+                    )
+                else:
+                    emit(
+                        f"replan 재시도 {_attempt}: "
+                        f"{_truncate(feedback or 'Decision 검증 실패')}"
+                    )
+                try:
+                    decision = replan(
+                        spec, state, last_result, m_client,
+                        prompt_path=rep_prompt, feedback=feedback,
+                    )
+                    break
+                except ReplanError as e:
+                    last_err = e
+                    feedback = e.message  # raw는 빼고 검증 메시지만 다시 태운다
+            # 파싱 소진 / 분해 critic 비대상 action(next_order/retry 아님) → 그대로 채택.
+            if decision is None or decision.action not in (Action.next_order, Action.retry):
                 break
-            except ReplanError as e:
-                last_err = e
-                feedback = e.message  # raw는 빼고 검증 메시지만 다시 태운다
-        # 이 iteration의 replan(재시도 포함) orchestration 비용을 꺼낸다.
+            no_candidate = decision.next_order
+            if no_candidate is None:
+                break  # 본문 없음 → 아래 action 처리에서 방어 escalate
+            crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입 원본
+            if crit is None or not is_weak(crit):
+                break  # progress(또는 OFF/평가불가) → 이 분해 채택
+            # weak: 재시도 남았으면 reject→재replan, 소진이면 진행(데드락 금지).
+            if _decomp_attempt < decomp_retries:
+                crit.rejected = True
+                state.decomp_critiques.append(crit)
+                record_transition(STAGE_DECOMP_REJECT, no_candidate.unit)
+                emit(
+                    f"분해 critic: weak → reject·재계획 ({no_candidate.unit}): "
+                    f"{_truncate(crit.reason or '')}"
+                )
+                decomp_feedback = build_decomp_feedback(crit)
+                try_save()  # 증분: reject 판정도 즉시 감사 로그에 보존
+            else:
+                state.decomp_critiques.append(crit)  # 소진 — rejected=False(진행함)
+                emit(
+                    f"분해 critic: weak이나 재시도 소진 → 진행 ({no_candidate.unit}): "
+                    f"{_truncate(crit.reason or '')}"
+                )
+        # 이 iteration의 replan(재계획 재시도 포함) orchestration 비용을 꺼낸다.
         replan_cost = combine_costs(m_client.drain())
+        # 분해 critic(verifier-side) 비용도 정직하게 누적(코스트 패널에 보임).
+        if m_critic is not None:
+            account(combine_costs(m_critic.drain()))
         if decision is None:
             account(replan_cost)  # 실패한 replan도 비용은 정직하게 누적
             state.status = Status.escalated
@@ -782,6 +860,9 @@ def _parallel_loop(
     record_transition: Callable[[str, str | None], None] = lambda s, u=None: None,
     activity_start: Callable[[str | None, str], None] = lambda u, s: None,
     activity_end: Callable[[str | None], None] = lambda u: None,
+    decomp_retries: int = 1,
+    run_decomp_critic: Callable[[NextOrder, str], "DecompCritique | None"] = lambda no, last: None,
+    account_decomp_cost: Callable[[], None] = lambda: None,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -844,21 +925,48 @@ def _parallel_loop(
             f"이 unit의 work order만 생성하라(action=next_order, unit={unit}).\n"
             f"# 직전 진행\n{last_result}"
         )
+        # replan(파싱 재시도) + 분해 critic(WO#40, bounded decomp_retries). weak → 재계획,
+        # 소진 후에도 weak면 진행(데드락 금지)+기록. critic은 독립 client·스킬 미주입 원본.
         decision = None
-        feedback: str | None = None
         last_err: ReplanError | None = None
-        for attempt in range(replan_retries + 1):
-            emit("replan 중…" if attempt == 0
-                 else f"replan 재시도 {attempt}: {_truncate(feedback or 'Decision 검증 실패')}")
-            try:
-                decision = replan(spec, state, ctx, client,
-                                  prompt_path=rep_prompt, feedback=feedback)
+        decomp_feedback: str | None = None
+        for _decomp_attempt in range(decomp_retries + 1):
+            decision = None
+            feedback: str | None = decomp_feedback
+            for attempt in range(replan_retries + 1):
+                if attempt == 0:
+                    emit("replan 중…" if decomp_feedback is None
+                         else f"replan(분해 재계획): {_truncate(decomp_feedback)}")
+                else:
+                    emit(f"replan 재시도 {attempt}: {_truncate(feedback or 'Decision 검증 실패')}")
+                try:
+                    decision = replan(spec, state, ctx, client,
+                                      prompt_path=rep_prompt, feedback=feedback)
+                    break
+                except ReplanError as e:
+                    last_err = e
+                    feedback = e.message
+            if decision is None or decision.action not in (Action.next_order, Action.retry):
                 break
-            except ReplanError as e:
-                last_err = e
-                feedback = e.message
-        # 이 unit replan(재시도 포함) orchestration 비용 적립(머지 시 event에 귀속).
+            no_candidate = decision.next_order
+            if no_candidate is None:
+                break
+            no_candidate.unit = unit  # 스케줄러 권위 — critic도 올바른 unit으로 본다
+            crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입
+            if crit is None or not is_weak(crit):
+                break  # progress(또는 OFF/평가불가) → 채택
+            if _decomp_attempt < decomp_retries:
+                crit.rejected = True
+                state.decomp_critiques.append(crit)
+                record_transition(STAGE_DECOMP_REJECT, unit)
+                emit(f"분해 critic: weak → reject·재계획 ({unit}): {_truncate(crit.reason or '')}")
+                decomp_feedback = build_decomp_feedback(crit)
+            else:
+                state.decomp_critiques.append(crit)  # 소진 — rejected=False(진행)
+                emit(f"분해 critic: weak이나 재시도 소진 → 진행 ({unit}): {_truncate(crit.reason or '')}")
+        # 이 unit replan(재계획 재시도 포함) orchestration 비용 적립(머지 시 event에 귀속).
         orch_cost_of[unit] = combine_costs(client.drain())
+        account_decomp_cost()  # 분해 critic(verifier-side) 비용 누적(코스트 패널에 보임)
         if decision is None:
             account(orch_cost_of.pop(unit, None))  # event 없음 → budget에만
             terminal = "escalated"

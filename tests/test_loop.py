@@ -380,9 +380,11 @@ def test_run_loop_critic_adequate_surfaces_and_persists():
     client = MockClient([SPEC_YAML, _next_order("u1")])
     critic = MockClient([_CRIT_ADEQUATE])
     seen: list[str] = []
+    # decomp_critic=False: 이 테스트는 *spec* critic을 격리 검증 — 공유 critic-model을
+    #   분해 critic이 추가 호출하지 않도록 끔(분해 critic은 별도 테스트에서 검증).
     state = run_loop(order="x", client=client, executor=MockExecutor("a"),
                      gate=MockGate(Verdict.done), critic_client=critic,
-                     prompt_dir=PROMPT_DIR, progress=seen.append)
+                     decomp_critic=False, prompt_dir=PROMPT_DIR, progress=seen.append)
     assert state.status is Status.done
     assert state.spec_critique is not None
     assert state.spec_critique.verdict == "adequate"
@@ -429,9 +431,10 @@ def test_run_loop_critic_client_exception_does_not_kill_run():
     client = MockClient([SPEC_YAML, _next_order("u1")])  # synthesize + replan만
     critic = _RaisingClient(CodexError("모델 'bogus' 없음"))
     seen: list[str] = []
+    # decomp_critic=False: *spec* critic 격리(공유 critic-model 추가 호출 방지).
     state = run_loop(order="x", client=client, executor=MockExecutor("a"),
                      gate=MockGate(Verdict.done), critic_client=critic,
-                     prompt_dir=PROMPT_DIR, progress=seen.append)
+                     decomp_critic=False, prompt_dir=PROMPT_DIR, progress=seen.append)
     assert state.status is Status.done  # 정상 완료
     assert state.spec_critique is not None
     assert state.spec_critique.verdict == "adequate"
@@ -455,6 +458,127 @@ def test_run_loop_critic_persists_through_yaml(tmp_path):
     assert reloaded.spec_critique.verdict == "soft"
     assert reloaded.spec_critique.resynthesized is True
     assert len(reloaded.spec_critique.gaps) == 1
+
+
+# ──────────────────── 분해 critic at replan (WO#40, Phase C) ────────────────────
+
+# 분해 critic 응답(spec critic과 별개 — 독립 critic-model이 매 replan마다 판정).
+_DC_PROGRESS = "verdict: progress\nreason: \"한 조각만 좁힘 — 진전\"\n"
+_DC_WEAK = "verdict: weak\nreason: \"전체 goal 재진술 — 무진전\"\n"
+
+
+def _write_skill(base: Path, name: str, triggers, body: str) -> None:
+    sk = base / name
+    sk.mkdir(parents=True, exist_ok=True)
+    (sk / "SKILL.md").write_text(
+        f"---\ntriggers: [{', '.join(triggers)}]\n---\n\n{body}\n", encoding="utf-8"
+    )
+
+
+def test_decomp_critic_weak_then_progress_rereplans_then_dispatches():
+    """weak → 피드백 주고 재replan → progress면 dispatch. reject가 state에 기록된다."""
+    # 공유 critic-model: 호출0=spec critic(adequate), 호출1=분해 weak, 호출2=분해 progress.
+    critic = MockClient([_CRIT_ADEQUATE, _DC_WEAK, _DC_PROGRESS])
+    # brain: synthesize + replan + 재replan(분해 reject 후).
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u1")])
+    ex = MockExecutor("a")
+    state = run_loop(order="x", client=client, executor=ex, gate=MockGate(Verdict.done),
+                     critic_client=critic, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert len(critic.calls) == 3      # spec + 분해 2회(weak→progress)
+    assert len(client.calls) == 3      # synthesize + replan + 재replan
+    assert len(ex.calls) == 1          # progress 후에야 dispatch
+    # reject가 감사 로그에 기록(rejected=True) + 전이에 decomp-reject 단계.
+    rejected = [c for c in state.decomp_critiques if c.rejected]
+    assert len(rejected) == 1 and rejected[0].verdict == "weak"
+    assert any(t.stage == "decomp-reject" for t in state.transitions)
+
+
+def test_decomp_critic_exhausted_proceeds_no_deadlock():
+    """재시도 소진(decomp_retries=1) 후에도 weak면 *진행*(데드락 금지) + critique 기록."""
+    critic = MockClient([_CRIT_ADEQUATE, _DC_WEAK, _DC_WEAK])  # 분해는 계속 weak
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u1")])
+    ex = MockExecutor("a")
+    state = run_loop(order="x", client=client, executor=ex, gate=MockGate(Verdict.done),
+                     critic_client=critic, prompt_dir=PROMPT_DIR, decomp_retries=1)
+    assert state.status is Status.done   # 소진 후 진행 → 정상 종료(데드락 안 함)
+    assert len(critic.calls) == 3        # 바운드: spec + 분해 2회(무한 아님)
+    assert len(ex.calls) == 1            # 소진 후 그 order를 dispatch함
+    # 2건 기록: reject(True) + 소진-진행(False).
+    assert len(state.decomp_critiques) == 2
+    assert state.decomp_critiques[0].rejected is True
+    assert state.decomp_critiques[1].rejected is False
+
+
+def test_decomp_critic_progress_dispatches_without_extra_replan():
+    """progress 판정이면 추가 replan 없이 바로 dispatch(기록 없음)."""
+    critic = MockClient([_CRIT_ADEQUATE, _DC_PROGRESS])
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    ex = MockExecutor("a")
+    state = run_loop(order="x", client=client, executor=ex, gate=MockGate(Verdict.done),
+                     critic_client=critic, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert len(critic.calls) == 2   # spec + 분해 1회
+    assert len(client.calls) == 2   # synthesize + replan(재replan 없음)
+    assert len(ex.calls) == 1
+    assert state.decomp_critiques == []   # progress는 기록 안 함
+
+
+def test_decomp_critic_client_exception_degrades_and_dispatches():
+    """best-effort: 분해 critic이 던져도 progress로 흡수 → 정상 dispatch(루프 안 죽음)."""
+    from haetae.llm import CodexError
+
+    critic = _RaisingClient(CodexError("codex 다운"))  # spec+분해 모두 흡수
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    ex = MockExecutor("a")
+    state = run_loop(order="x", client=client, executor=ex, gate=MockGate(Verdict.done),
+                     critic_client=critic, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert len(critic.calls) == 2   # spec critic + 분해 critic 둘 다 호출(둘 다 흡수)
+    assert len(ex.calls) == 1       # 흡수 후 진행
+    assert state.decomp_critiques == []  # 평가불가-degrade는 weak 아님 → 기록 안 함
+
+
+def test_decomp_critic_off_not_called_during_replan():
+    """--no-decomp-critic: 분해 critic 미호출(critic-model은 spec critic에만). 기존 동작."""
+    critic = MockClient([_CRIT_ADEQUATE])  # spec critic 1회만 소비
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), critic_client=critic,
+                     decomp_critic=False, prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert len(critic.calls) == 1         # spec critic만(분해 critic 미호출)
+    assert state.decomp_critiques == []
+    assert not any(t.stage == "decomp-reject" for t in state.transitions)
+
+
+def test_decomp_critic_no_critic_model_means_off():
+    """critic_client=None(=--critic-model 미설정)이면 분해 critic 자동 OFF(미설정→진행)."""
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    state = run_loop(order="x", client=client, executor=MockExecutor("a"),
+                     gate=MockGate(Verdict.done), critic_client=None,
+                     prompt_dir=PROMPT_DIR)  # decomp_critic 기본 True지만 client 없음
+    assert state.status is Status.done
+    assert state.decomp_critiques == []
+
+
+def test_decomp_critic_gets_no_skill_injection(tmp_path):
+    """**적대적 분리**: 분해 critic은 스킬 미주입 *원본* order를 본다(executor엔 주입)."""
+    from haetae.skills import SKILL_SECTION_HEADER
+
+    _write_skill(tmp_path, "frontend-build", ["u1"], body="SKILL_BODY_MARKER")
+    critic = MockClient([_CRIT_ADEQUATE, _DC_PROGRESS])  # spec + 분해 progress
+    client = MockClient([SPEC_YAML, _next_order("u1")])  # goal "u1 구현" → 트리거 u1 매칭
+    ex = MockExecutor("a")
+    state = run_loop(order="x", client=client, executor=ex, gate=MockGate(Verdict.done),
+                     critic_client=critic, prompt_dir=PROMPT_DIR, skills_dir=tmp_path)
+    assert state.status is Status.done
+    # 분해 critic이 받은 user 프롬프트엔 스킬 섹션/본문이 없다(빌더 전용과 분리).
+    decomp_user = critic.calls[1]["user"]  # calls[0]=spec critic, calls[1]=분해 critic
+    assert SKILL_SECTION_HEADER not in decomp_user
+    assert "SKILL_BODY_MARKER" not in decomp_user
+    # 반면 executor가 받은 order.scope엔 스킬이 주입됐다(분리 증명).
+    assert SKILL_SECTION_HEADER in (ex.calls[0].scope or "")
 
 
 # ──────────────────────────── Protocol 적합성 ────────────────────────────

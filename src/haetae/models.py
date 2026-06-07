@@ -327,6 +327,29 @@ class SpecCritique(BaseModel):
     resynthesized: bool = False
 
 
+# ──────────────────── DecompCritique (분해 critic at replan, WO#40) ────────────────────
+
+
+class DecompCritique(BaseModel):
+    """분해 critic의 구조화 출력 + 오케스트레이션 결과(감사용).
+
+    LEAP의 LLM 리뷰어처럼 *매 분해(replan이 낸 work order)*가 "유닛을 단순화/진전시키나
+    vs 전체 goal/spec을 재진술만/헛도나"를 적대적으로 판정한다(verifier-side, 독립 client).
+
+    verdict: "progress"(유닛을 단순화/진전 — dispatch OK) | "weak"(전체 goal/spec 재진술,
+             분해 안 됨, gap 안 줄임, 직전 실패 접근 반복 = 무진전). 파싱/평가 불가 시
+             견고성 차원에서 "progress"로 흡수(진행 막지 않음 — best-effort soft).
+    reason:  판정 근거(한 줄). surface/감사용.
+    unit:    어느 유닛 분해에 대한 판정인지.
+    rejected: 이 분해가 weak로 reject돼 재replan을 트리거했는지(루프가 설정).
+    """
+
+    verdict: str
+    reason: str | None = None
+    unit: str | None = None
+    rejected: bool = False
+
+
 # ──────────────────────────── State ────────────────────────────
 
 
@@ -343,6 +366,9 @@ class State(BaseModel):
     pending_escalations: list[Any] = Field(default_factory=list)
     # synthesize 직후 적대적 critic이 남긴 비평(opt-in; critic OFF면 None).
     spec_critique: SpecCritique | None = None
+    # replan이 낸 분해(work order)에 대한 적대적 critic 판정 이력(WO#40, append-only 감사 로그).
+    # weak로 reject→재replan했거나 재시도 소진 후 진행한 경우를 기록한다(critic OFF면 빈 리스트).
+    decomp_critiques: list[DecompCritique] = Field(default_factory=list)
     # 현재 in-flight 유닛 라이브 스냅샷(WO#33 Part B). 완료 시 비워진다.
     activity: list[Activity] = Field(default_factory=list)
     # 단계 전이 이력(WO#33 Part B) — append-only 타임라인.
