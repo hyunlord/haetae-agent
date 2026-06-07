@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -77,6 +80,50 @@ def _verdict_val(v: Any) -> str | None:
     return v.value if hasattr(v, "value") else v
 
 
+def _parse_ts(ts: str | None) -> datetime | None:
+    """ISO 8601(끝 Z 허용)을 aware datetime으로. 실패하면 None(날조 금지)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _elapsed_s(started_at: str | None, now_dt: datetime | None) -> float | None:
+    """now - started_at(초). 둘 중 하나라도 못 파싱하면 None. 음수는 0으로 클램프."""
+    start = _parse_ts(started_at)
+    if start is None or now_dt is None:
+        return None
+    delta = (now_dt - start).total_seconds()
+    return delta if delta >= 0 else 0.0
+
+
+def _cost_view(c: Any) -> dict[str, Any] | None:
+    """Cost 모델(또는 None) → JSON dict. 새 필드 부재도 getattr로 흡수."""
+    if c is None:
+        return None
+    return {
+        "tokens": getattr(c, "tokens", None),
+        "usd": getattr(c, "usd", None),
+        "input": getattr(c, "input", None),
+        "output": getattr(c, "output", None),
+        "source": getattr(c, "source", None),
+        "note": getattr(c, "note", None),
+    }
+
+
+def _accumulate_cost(acc: dict[str, Any], c: Any) -> None:
+    """source/unit 집계 버킷에 Cost를 합산(None-safe). count는 cost가 있는 event 수."""
+    acc["count"] = acc.get("count", 0) + 1
+    for field in ("tokens", "usd", "input", "output"):
+        v = getattr(c, field, None)
+        if v is not None:
+            acc[field] = (acc.get(field) or 0) + v
+        else:
+            acc.setdefault(field, None)
+
+
 def _topo_levels(nodes: list[dict[str, Any]]) -> list[list[str]]:
     """의존 깊이로 층 배치 — level(u)=0(deps 없음) | 1+max(level(deps)). 순환/누락은 안전 흡수."""
     state_by_id = {n["id"]: n for n in nodes}
@@ -102,14 +149,30 @@ def _topo_levels(nodes: list[dict[str, Any]]) -> list[list[str]]:
     return levels
 
 
-def state_to_view(state: State, spec: ProjectSpec | None = None) -> dict[str, Any]:
+def state_to_view(
+    state: State, spec: ProjectSpec | None = None, *, now: str | None = None
+) -> dict[str, Any]:
     """State(+옵션 ProjectSpec) → JSON 직렬화 가능 ViewModel(read-only).
 
     DAG/blocking은 `plan[].deps`로(스크래치엔 spec yaml이 없어 spec 보통 None). spec이 주어지면
     유닛 desc·spec goal/done_when을 보강한다. 유닛 goal 폴백: 그 유닛의 최신 event.work_order_ref.
+
+    v2(WO#35) — #33/#34 계측을 라이브로 표면화(전부 best-effort, 부재 시 빈 섹션):
+      - activity: 현재 in-flight 유닛 + 단계(build/verify) + 경과시간(now-started_at).
+      - transitions: 단계 전이 이력(합성→build→verify→replan…)을 시간순.
+      - cost: budget.spent(total) + event.cost를 source/unit별로 집계. usd 미상은 None 유지.
+      - DAG 노드/유닛에 in_progress면 현재 단계 배지.
+    now: 경과시간 계산 기준 시각(ISO; 테스트 주입용). 기본 None=실제 UTC.
     """
+    now_dt = _parse_ts(now) if now is not None else datetime.now(timezone.utc)
     plan = state.plan
     state_by_unit = {p.unit: p.state.value for p in plan}
+
+    # 라이브 activity: unit → 현재 단계(노드/유닛 배지에 사용). best-effort.
+    activity_list = getattr(state, "activity", None) or []
+    activity_by_unit: dict[str, str] = {
+        a.unit: a.stage for a in activity_list if a.unit is not None
+    }
 
     # 유닛별 최신 event(seq 최대) + 통합 event(unit=None) 분리.
     latest_event: dict[str, Any] = {}
@@ -137,7 +200,14 @@ def state_to_view(state: State, spec: ProjectSpec | None = None) -> dict[str, An
     for p in plan:
         deps = list(p.deps or [])
         nodes.append(
-            {"id": p.unit, "goal": unit_goal(p.unit), "state": p.state.value, "deps": deps}
+            {
+                "id": p.unit,
+                "goal": unit_goal(p.unit),
+                "state": p.state.value,
+                "deps": deps,
+                # in_progress면 현재 세부 단계(build/verify) 배지, 아니면 None.
+                "stage": activity_by_unit.get(p.unit),
+            }
         )
         for d in deps:
             edges.append({"from": d, "to": p.unit})
@@ -158,10 +228,12 @@ def state_to_view(state: State, spec: ProjectSpec | None = None) -> dict[str, An
         units[p.unit] = {
             "goal": unit_goal(p.unit),
             "state": p.state.value,
+            "stage": activity_by_unit.get(p.unit),  # in_progress면 현재 단계
             "work_order_ref": ev.work_order_ref if ev else None,
             "verdict": _verdict_val(ev.verdict) if ev else None,
             "result": (ev.result if ev else None),
             "checks": [_check_view(c) for c in (ev.checks if ev else [])],
+            "cost": _cost_view(ev.cost) if ev else None,
         }
 
     # ── 통합(unit=None) event: 통합 gate 증거 ──
@@ -220,6 +292,45 @@ def state_to_view(state: State, spec: ProjectSpec | None = None) -> dict[str, An
             "cap": {"tokens": b.cap.tokens, "usd": b.cap.usd},
         }
 
+    # ── v2: 라이브 activity(+경과) / 단계 전이 이력 / 코스트 집계 ──
+    activity = [
+        {
+            "unit": a.unit,
+            "stage": a.stage,
+            "started_at": a.started_at,
+            "elapsed_s": _elapsed_s(a.started_at, now_dt),
+        }
+        for a in activity_list
+    ]
+    transitions = [
+        {"stage": t.stage, "unit": t.unit, "ts": t.ts}
+        for t in (getattr(state, "transitions", None) or [])
+    ]
+
+    # 코스트: total(budget.spent, 권위) + event.cost를 source/unit별로 집계(귀속 분해).
+    spent = state.budget.spent if state.budget is not None else None
+    cap = state.budget.cap if state.budget is not None else None
+    by_source: dict[str, Any] = {}
+    by_unit: dict[str, Any] = {}
+    for ev in state.events:
+        c = ev.cost
+        if c is None:
+            continue
+        src = getattr(c, "source", None) or "unknown"
+        _accumulate_cost(by_source.setdefault(src, {}), c)
+        _accumulate_cost(by_unit.setdefault(ev.unit or "(integration)", {}), c)
+    cost = {
+        "total": {
+            "tokens": getattr(spent, "tokens", None),
+            "usd": getattr(spent, "usd", None),
+            "input": getattr(spent, "input", None),
+            "output": getattr(spent, "output", None),
+        },
+        "cap": {"tokens": getattr(cap, "tokens", None), "usd": getattr(cap, "usd", None)},
+        "by_source": by_source,
+        "by_unit": by_unit,
+    }
+
     return {
         "status": state.status.value,
         "spec": spec_view,
@@ -235,6 +346,9 @@ def state_to_view(state: State, spec: ProjectSpec | None = None) -> dict[str, An
             for s in state.spec_changes
         ],
         "budget": budget,
+        "activity": activity,
+        "transitions": transitions,
+        "cost": cost,
     }
 
 
@@ -275,8 +389,16 @@ def _index_html(poll_ms: int) -> bytes:
 
 
 def make_handler(
-    state_path: str | Path, spec_path: str | Path | None, poll_ms: int
+    state_path: str | Path,
+    spec_path: str | Path | None,
+    poll_ms: int,
+    stream_interval: float = 1.0,
 ) -> type[BaseHTTPRequestHandler]:
+    def _view_payload() -> bytes:
+        return json.dumps(
+            load_view(state_path, spec_path), ensure_ascii=False, default=str
+        ).encode("utf-8")
+
     class DashboardHandler(BaseHTTPRequestHandler):
         def _send(self, code: int, body: bytes, ctype: str) -> None:
             self.send_response(code)
@@ -285,13 +407,49 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
+        def _stream(self) -> None:
+            """SSE: state.yaml mtime을 폴링해 변경 시 새 view를 push(라이브).
+
+            ThreadingHTTPServer가 요청마다 (daemon) 스레드를 주므로 장수명 응답이 가능.
+            파일 부재도 {error} view를 한 번 push(서버 안 죽음). 클라이언트 끊김은
+            BrokenPipe로 조용히 종료. ~15s 하트비트 주석으로 끊김 감지 + 연결 유지.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # 프록시 버퍼링 비활성
+            self.end_headers()
+            last_sig: Any = object()  # 센티넬 → 첫 루프에서 무조건 push
+            idle = 0
+            ping_every = max(1, int(15.0 / stream_interval))
+            try:
+                while True:
+                    try:
+                        sig = os.path.getmtime(state_path)
+                    except OSError:
+                        sig = None  # 파일 부재 → load_view가 {error}를 내고 그대로 push
+                    if sig != last_sig:
+                        last_sig = sig
+                        self.wfile.write(b"data: " + _view_payload() + b"\n\n")
+                        self.wfile.flush()
+                        idle = 0
+                    else:
+                        idle += 1
+                        if idle >= ping_every:  # 하트비트(끊김 감지/keepalive)
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            idle = 0
+                    time.sleep(stream_interval)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return  # 클라이언트 끊김 — 조용히 종료
+
         def do_GET(self) -> None:  # noqa: N802 — http.server 계약
             path = self.path.split("?", 1)[0]
             if path == "/api/state":
-                body = json.dumps(
-                    load_view(state_path, spec_path), ensure_ascii=False, default=str
-                ).encode("utf-8")
-                self._send(200, body, "application/json; charset=utf-8")
+                self._send(200, _view_payload(), "application/json; charset=utf-8")
+            elif path == "/api/stream":
+                self._stream()
             elif path == "/":
                 self._send(200, _index_html(poll_ms), "text/html; charset=utf-8")
             else:
@@ -310,11 +468,14 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
     poll_interval: float = 2.0,
+    stream_interval: float = 1.0,
 ) -> None:
-    handler = make_handler(state_path, spec_path, int(poll_interval * 1000))
+    handler = make_handler(
+        state_path, spec_path, int(poll_interval * 1000), stream_interval=stream_interval
+    )
     httpd = ThreadingHTTPServer((host, port), handler)  # localhost 바인드
-    print(f"haetae dashboard → http://{host}:{port}  (state: {state_path}, poll {poll_interval}s)")
-    print("read-only · Ctrl-C 종료")
+    print(f"haetae dashboard → http://{host}:{port}  (state: {state_path}, SSE {stream_interval}s)")
+    print("read-only · live(SSE) · Ctrl-C 종료")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -330,7 +491,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="바인드 호스트(기본 localhost)")
     parser.add_argument("--port", type=int, default=8000, help="포트(기본 8000)")
     parser.add_argument(
-        "--poll-interval", type=float, default=2.0, help="프런트 폴링 간격 초(기본 2)"
+        "--poll-interval", type=float, default=2.0, help="프런트 폴링 폴백 간격 초(기본 2)"
+    )
+    parser.add_argument(
+        "--stream-interval", type=float, default=1.0,
+        help="SSE 서버측 state.yaml mtime 폴링 간격 초(기본 1, 라이브 갱신 주기)",
     )
     args = parser.parse_args(argv)
     serve(
@@ -339,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         poll_interval=args.poll_interval,
+        stream_interval=args.stream_interval,
     )
     return 0
 

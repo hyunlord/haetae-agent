@@ -3,12 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>haetae · state dashboard</title>
+<title>haetae · live dashboard</title>
 <style>
   :root {
     --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --bd:#2a2f3a; --tx:#e6e9ef; --mut:#9aa3b2;
     --pend:#6b7280; --prog:#3b82f6; --done:#22c55e; --fail:#ef4444;
     --pass:#22c55e; --failc:#ef4444; --skip:#6b7280; --accent:#f59e0b;
+    --build:#3b82f6; --verify:#a855f7; --synth:#14b8a6; --replan:#f59e0b; --judge:#a855f7; --exec:#22c55e; --orch:#3b82f6;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--tx);
@@ -21,11 +22,33 @@
   .s-running{background:#1e3a8a;color:#bfdbfe} .s-done{background:#14532d;color:#bbf7d0}
   .s-escalated{background:#7c2d12;color:#fed7aa} .s-stopped_budget,.s-stopped_stuck{background:#3f3f46;color:#e4e4e7}
   .mut { color:var(--mut); }
+  /* live indicator */
+  #live { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; }
+  #live .dot { width:8px; height:8px; border-radius:50%; background:var(--mut); }
+  #live.live .dot { background:var(--done); box-shadow:0 0 6px var(--done); animation:pulse 1.6s infinite; }
+  #live.polling .dot { background:var(--accent); }
+  #live.reconnecting .dot { background:var(--accent); animation:blink 1s infinite; }
+  #live.offline .dot { background:var(--fail); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
   .grid { display:grid; grid-template-columns: 1fr 360px; gap:14px; padding:14px 18px; align-items:start; }
   @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
   .card { background:var(--panel); border:1px solid var(--bd); border-radius:10px; padding:14px; margin-bottom:14px; }
   .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 10px; }
   .banner { background:#7c2d12; border:1px solid #b45309; color:#fed7aa; padding:10px 14px; border-radius:8px; margin:0 18px 0; }
+  /* 현재 활동 */
+  .act-card { border-color:#2c3550; background:linear-gradient(180deg,#191e2b,#171a21); }
+  .act { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--bd);
+    border-left:3px solid var(--prog); border-radius:8px; margin-bottom:8px; background:var(--panel2); }
+  .act .spin { width:12px; height:12px; border:2px solid #334; border-top-color:var(--prog); border-radius:50%; animation:rot .8s linear infinite; flex:none; }
+  @keyframes rot { to{ transform:rotate(360deg); } }
+  .act .u { font-weight:700; font-size:13px; }
+  .act .el { margin-left:auto; font-variant-numeric:tabular-nums; color:var(--mut); font-size:12px; }
+  /* stage badge */
+  .stage { font-size:10px; font-weight:700; padding:1px 7px; border-radius:5px; text-transform:uppercase; letter-spacing:.04em; }
+  .stg-build{background:#172554;color:#bfdbfe} .stg-verify{background:#3b0764;color:#e9d5ff}
+  .stg-synthesize{background:#042f2e;color:#99f6e4} .stg-scaffold{background:#1c1917;color:#d6d3d1}
+  .stg-replan{background:#451a03;color:#fed7aa} .stg-done{background:#14532d;color:#bbf7d0} .stg-escalate{background:#450a0a;color:#fecaca}
   /* DAG */
   #dagwrap { position:relative; overflow:auto; }
   #edges { position:absolute; inset:0; pointer-events:none; z-index:0; }
@@ -36,7 +59,8 @@
   .node:hover { border-color:var(--prog); transform:translateY(-1px); }
   .node.sel { outline:2px solid var(--accent); }
   .node.blocked { box-shadow:0 0 0 1.5px var(--fail) inset; }
-  .node .id { font-weight:700; font-size:13px; }
+  .node.running { box-shadow:0 0 0 1.5px var(--prog) inset; }
+  .node .id { font-weight:700; font-size:13px; display:flex; align-items:center; gap:6px; }
   .node .goal { font-size:11.5px; color:var(--mut); margin-top:3px;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden; }
   .node .st { font-size:10.5px; font-weight:700; text-transform:uppercase; margin-top:5px; letter-spacing:.05em; }
@@ -56,12 +80,31 @@
   details.ev[open] summary { margin-bottom:6px; }
   pre.trace { background:#0b0d11; border:1px solid var(--bd); border-radius:6px; padding:8px; max-height:280px;
     overflow:auto; font-size:11px; white-space:pre-wrap; color:#cbd5e1; margin:6px 0 0; }
-  .kv { display:flex; gap:6px; font-size:11.5px; } .kv b{color:var(--mut);font-weight:600}
+  .kv { display:flex; gap:6px; font-size:11.5px; flex-wrap:wrap; } .kv b{color:var(--mut);font-weight:600}
   .ev-good{color:var(--done)} .ev-bad{color:var(--fail)}
-  /* timeline */
+  /* timelines */
   .tl-row { display:flex; gap:10px; align-items:baseline; padding:5px 0; border-bottom:1px solid var(--bd); font-size:12.5px; }
   .tl-row:last-child{border-bottom:0}
   .seq { color:var(--mut); font-variant-numeric:tabular-nums; min-width:26px; }
+  .flow { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .flow .step { display:flex; align-items:center; gap:5px; padding:3px 8px; border:1px solid var(--bd); border-radius:7px; background:var(--panel2); font-size:11.5px; }
+  .flow .arr { color:var(--mut); }
+  .flow .ts { color:var(--mut); font-size:10px; font-variant-numeric:tabular-nums; }
+  /* cost */
+  .cost-total { display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; margin-bottom:10px; }
+  .cost-total .big { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .cost-total .usd { font-size:15px; color:var(--done); font-variant-numeric:tabular-nums; }
+  .bar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#0b0d11; margin:8px 0; border:1px solid var(--bd); }
+  .bar span { display:block; height:100%; }
+  .seg-orchestration{background:var(--orch)} .seg-executor{background:var(--exec)} .seg-judge{background:var(--judge)}
+  .seg-mixed{background:#64748b} .seg-unknown{background:#3f3f46}
+  .legend { display:flex; flex-wrap:wrap; gap:10px; font-size:11.5px; margin-top:6px; }
+  .legend .lg { display:flex; align-items:center; gap:5px; }
+  .legend .sw { width:10px; height:10px; border-radius:3px; }
+  .cost-tbl { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  .cost-tbl td,.cost-tbl th { text-align:right; padding:3px 6px; border-bottom:1px solid var(--bd); font-variant-numeric:tabular-nums; }
+  .cost-tbl th { color:var(--mut); font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:.05em; }
+  .cost-tbl td:first-child,.cost-tbl th:first-child { text-align:left; }
   .gap { font-size:12px; padding:7px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent); border-radius:6px; margin-bottom:8px; background:var(--panel2); }
   .empty { color:var(--mut); font-size:12.5px; }
   #detail .ph { color:var(--mut); font-size:13px; }
@@ -71,21 +114,25 @@
 </head>
 <body>
 <header>
-  <h1>haetae <span class="mut">· state dashboard</span></h1>
+  <h1>haetae <span class="mut">· live dashboard</span></h1>
   <span id="status" class="pill mut">…</span>
   <span id="specref" class="mut small"></span>
   <span style="flex:1"></span>
-  <span id="tick" class="mut small">read-only</span>
+  <span id="live"><span class="dot"></span><span id="live-tx">연결 중…</span></span>
+  <span id="tick" class="mut small"></span>
 </header>
 <div id="banner-slot"></div>
 <div id="root" class="grid">
   <div id="left">
+    <div class="card act-card"><h2>현재 활동 (라이브)</h2><div id="activity"></div></div>
     <div class="card"><h2>유닛 DAG</h2><div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div></div>
-    <div class="card"><h2>이벤트 타임라인</h2><div id="timeline"></div></div>
-    <div class="card" id="integration-card" style="display:none"><h2>통합 gate (unit=none)</h2><div id="integration"></div></div>
+    <div class="card"><h2>단계 타임라인 (transitions)</h2><div id="transitions" class="flow"></div></div>
+    <div class="card"><h2>검증 · 이벤트 타임라인</h2><div id="timeline"></div></div>
+    <div class="card" id="integration-card" style="display:none"><h2>통합 gate (verify · unit=none)</h2><div id="integration"></div></div>
   </div>
   <div id="right">
-    <div class="card"><h2 id="detail-h">상세</h2><div id="detail"><div class="ph">DAG 노드를 클릭하면 work order·gate 체크·실행 증거가 여기에.</div></div></div>
+    <div class="card" id="cost-card"><h2>코스트</h2><div id="cost"></div></div>
+    <div class="card"><h2 id="detail-h">상세</h2><div id="detail"><div class="ph">DAG 노드를 클릭하면 work order·gate 체크·실행 증거·비용이 여기에.</div></div></div>
     <div class="card" id="critique-card" style="display:none"><h2>spec critique</h2><div id="critique"></div></div>
     <div class="card" id="esc-card" style="display:none"><h2>pending escalations</h2><div id="esc"></div></div>
   </div>
@@ -95,37 +142,81 @@
 const POLL_MS = __POLL_MS__;
 let SEL = null;       // 선택된 유닛 id
 let VIEW = null;
+let sseConnected = false;
+let lastMsg = 0;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s==null?"":String(s)).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const num = (n) => (n==null? "—" : Number(n).toLocaleString());
+const usd = (n) => (n==null? "—" : "$"+Number(n).toFixed(4));
+const dur = (s) => { if(s==null) return "—"; s=Math.round(s); if(s<60) return s+"s"; const m=Math.floor(s/60); return m+"m"+(s%60)+"s"; };
 
-async function poll() {
+function setLive(state, txt){
+  const el=$("live"); el.className=state; $("live-tx").textContent=txt;
+}
+
+// ── 라이브: SSE 우선, 폴링 폴백 ──
+function applyView(v){ VIEW=v; render(v); lastMsg=Date.now(); $("tick").textContent="갱신 "+new Date().toLocaleTimeString(); }
+
+function startSSE(){
+  if (!window.EventSource) { setLive("polling","폴링(SSE 미지원)"); return; }
+  try {
+    const es = new EventSource("/api/stream");
+    es.onopen = ()=>{ sseConnected=true; setLive("live","라이브 (SSE)"); };
+    es.onmessage = (e)=>{ sseConnected=true; setLive("live","라이브 (SSE)"); try{ applyView(JSON.parse(e.data)); }catch(_){} };
+    es.onerror = ()=>{ sseConnected=false; setLive("reconnecting","재연결 중…"); }; // EventSource가 자동 재연결
+  } catch(_) { sseConnected=false; setLive("polling","폴링"); }
+}
+
+async function pollOnce(){
+  // SSE가 살아 최근 수신했으면 폴백은 쉰다(중복 방지). 끊기면 폴백이 채운다.
+  if (sseConnected && (Date.now()-lastMsg) < POLL_MS*3) return;
   try {
     const r = await fetch("/api/state", {cache:"no-store"});
-    const v = await r.json();
-    VIEW = v; render(v);
-    $("tick").textContent = "갱신 " + new Date().toLocaleTimeString();
-  } catch (e) {
-    $("tick").textContent = "연결 끊김 — 재시도…";
+    applyView(await r.json());
+    if (!sseConnected) setLive("polling","폴링(폴백)");
+  } catch(e) {
+    setLive("offline","연결 끊김 — 재시도…");
   }
 }
 
 function render(v) {
   if (v.error) { document.body.innerHTML = '<div class="err">state 로드 실패: '+esc(v.error)+'</div>'; return; }
-  // status
   const st = $("status"); st.textContent = v.status; st.className = "pill s-"+v.status;
   $("specref").textContent = v.spec.spec_ref + " · v" + v.spec.spec_version + (v.spec.goal? " · "+v.spec.goal : "");
-  // banner (escalated)
   const bs = $("banner-slot");
   if (v.status==="escalated" || (v.pending_escalations||[]).length) {
     const e0 = (v.pending_escalations||[])[0] || {};
     bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
   } else bs.innerHTML = "";
+  renderActivity(v);
   renderDag(v);
+  renderTransitions(v);
   renderTimeline(v);
   renderIntegration(v);
+  renderCost(v);
   renderCritique(v);
   renderEsc(v);
   if (SEL) renderDetail(SEL);
+}
+
+const STAGE_KO = {build:"코딩", verify:"검증", synthesize:"합성", scaffold:"스캐폴드", replan:"재계획", done:"완료", escalate:"에스컬레이트"};
+function stageBadge(stg){
+  if(!stg) return "";
+  return '<span class="stage stg-'+esc(stg)+'">'+esc(STAGE_KO[stg]||stg)+'</span>';
+}
+
+function liveElapsed(a){
+  // 서버가 push 시점에 준 elapsed_s를 기준점으로, 수신 후 흐른 시간을 더해 매초 틱.
+  if (a.elapsed_s==null) return null;
+  return a.elapsed_s + Math.max(0, (Date.now()-lastMsg)/1000);
+}
+function renderActivity(v) {
+  const acts = v.activity||[];
+  $("activity").innerHTML = acts.length ? acts.map(a=>
+    '<div class="act"><span class="spin"></span><span class="u">'+esc(a.unit||"(전역)")+'</span>'
+    + stageBadge(a.stage)
+    + '<span class="el">'+dur(liveElapsed(a))+' 경과</span></div>'
+  ).join("") : '<div class="empty">지금 도는 작업 없음 (idle)</div>';
 }
 
 function renderDag(v) {
@@ -135,12 +226,13 @@ function renderDag(v) {
   (v.dag.levels||[]).forEach(level => {
     const row = document.createElement("div"); row.className="level";
     level.forEach(uid => {
-      const n = v.dag.nodes.find(x=>x.id===uid) || {id:uid,state:"pending",goal:null,deps:[]};
+      const n = v.dag.nodes.find(x=>x.id===uid) || {id:uid,state:"pending",goal:null,deps:[],stage:null};
       const d = document.createElement("div");
-      d.className = "node b-"+n.state + (SEL===uid?" sel":"") + (blockedMap[uid]?" blocked":"");
+      d.className = "node b-"+n.state + (SEL===uid?" sel":"") + (blockedMap[uid]?" blocked":"") + (n.stage?" running":"");
       d.dataset.id = uid;
       const blk = blockedMap[uid] ? '<div class="blk">⛔ blocked by '+esc(blockedMap[uid].join(", "))+'</div>' : "";
-      d.innerHTML = '<div class="id">'+esc(uid)+'</div><div class="goal">'+esc(n.goal||"")+'</div>'
+      d.innerHTML = '<div class="id">'+esc(uid)+(n.stage?stageBadge(n.stage):"")+'</div>'
+        + '<div class="goal">'+esc(n.goal||"")+'</div>'
         + '<div class="st t-'+n.state+'">'+esc(n.state)+'</div>'+blk;
       d.onclick = () => { SEL=uid; renderDetail(uid); document.querySelectorAll(".node").forEach(x=>x.classList.toggle("sel", x.dataset.id===uid)); };
       row.appendChild(d);
@@ -170,6 +262,18 @@ function drawEdges(v) {
   svg.innerHTML = p;
 }
 
+function tsShort(ts){ if(!ts) return ""; const m=String(ts).match(/T(\d\d:\d\d:\d\d)/); return m?m[1]:String(ts); }
+
+function renderTransitions(v) {
+  const tr = v.transitions||[];
+  if (!tr.length) { $("transitions").innerHTML = '<div class="empty">단계 이력 없음</div>'; return; }
+  $("transitions").innerHTML = tr.map((t,i)=>
+    (i? '<span class="arr">→</span>':"")
+    + '<span class="step">'+stageBadge(t.stage)+(t.unit?'<span class="mono">'+esc(t.unit)+'</span>':"")
+    + '<span class="ts">'+esc(tsShort(t.ts))+'</span></span>'
+  ).join("");
+}
+
 function checkHtml(c) {
   const ev = c.run_evidence;
   let evHtml = "";
@@ -189,13 +293,21 @@ function checkHtml(c) {
     + evHtml + '</div>';
 }
 
+function costLine(c){
+  if(!c) return "";
+  const src = c.source? '<span class="stage stg-'+esc(c.source==="judge"?"verify":(c.source==="executor"?"done":"build"))+'">'+esc(c.source)+'</span> ' : "";
+  return '<div class="kv" style="margin-top:8px"><b>cost</b> '+src+num(c.tokens)+' tok · '+usd(c.usd)+'</div>';
+}
+
 function renderDetail(uid) {
   const u = (VIEW.units||{})[uid];
   $("detail-h").textContent = "상세 · " + uid;
   if (!u) { $("detail").innerHTML = '<div class="ph">데이터 없음</div>'; return; }
   let h = '<div class="kv"><b>state</b> <span class="t-'+u.state+'">'+esc(u.state)+'</span>';
+  if (u.stage) h += ' '+stageBadge(u.stage);
   if (u.verdict) h += ' &nbsp;<b>verdict</b> '+esc(u.verdict);
   h += '</div>';
+  h += costLine(u.cost);
   if (u.work_order_ref) h += '<p class="small" style="margin:8px 0"><b class="mut">work order</b><br>'+esc(u.work_order_ref)+'</p>';
   const blk = (VIEW.blocking||[]).find(b=>b.unit===uid);
   if (blk) h += '<div class="gap" style="border-left-color:var(--fail)">⛔ blocked by <b>'+esc(blk.blocked_by.join(", "))+'</b> (미완료 의존)</div>';
@@ -225,6 +337,40 @@ function renderIntegration(v) {
   }).join("");
 }
 
+const SRC_KO = {orchestration:"오케스트레이션", executor:"실행자(codex)", judge:"검증(judge)", mixed:"혼합", unknown:"미상"};
+function renderCost(v) {
+  const c = v.cost; if(!c){ $("cost").innerHTML='<div class="empty">비용 데이터 없음</div>'; return; }
+  const t = c.total||{};
+  let h = '<div class="cost-total"><span class="big">'+num(t.tokens)+'</span><span class="mut small">tokens</span>'
+    + '<span class="usd">'+usd(t.usd)+'</span>';
+  if (t.usd==null) h += '<span class="mut small">(usd 미상 — tokens only)</span>';
+  if (c.cap && c.cap.usd!=null) h += '<span class="mut small">/ cap '+usd(c.cap.usd)+'</span>';
+  h += '</div>';
+  if (t.input!=null||t.output!=null) h += '<div class="kv mut small">in '+num(t.input)+' · out '+num(t.output)+'</div>';
+
+  // source별 막대 + 범례 (tokens 기준)
+  const bs = c.by_source||{};
+  const srcs = Object.keys(bs);
+  const tot = srcs.reduce((s,k)=> s+(bs[k].tokens||0), 0);
+  if (tot>0) {
+    h += '<div class="bar">'+srcs.map(k=>{ const w=((bs[k].tokens||0)/tot*100).toFixed(1); return '<span class="seg-'+esc(k)+'" style="width:'+w+'%"></span>'; }).join("")+'</div>';
+    h += '<div class="legend">'+srcs.map(k=>'<span class="lg"><span class="sw seg-'+esc(k)+'"></span>'+esc(SRC_KO[k]||k)+' '+num(bs[k].tokens)+(bs[k].usd!=null?' / '+usd(bs[k].usd):'')+'</span>').join("")+'</div>';
+  } else if (srcs.length) {
+    h += '<div class="legend">'+srcs.map(k=>'<span class="lg"><span class="sw seg-'+esc(k)+'"></span>'+esc(SRC_KO[k]||k)+' '+num(bs[k].tokens)+'</span>').join("")+'</div>';
+  } else {
+    h += '<div class="empty">귀속된 비용 없음</div>';
+  }
+
+  // unit별 표
+  const bu = c.by_unit||{}; const units = Object.keys(bu);
+  if (units.length) {
+    h += '<table class="cost-tbl"><tr><th>unit</th><th>tokens</th><th>usd</th></tr>'
+      + units.map(u=>'<tr><td>'+esc(u)+'</td><td>'+num(bu[u].tokens)+'</td><td>'+usd(bu[u].usd)+'</td></tr>').join("")
+      + '</table>';
+  }
+  $("cost").innerHTML = h;
+}
+
 function renderCritique(v) {
   const c = v.spec_critique;
   $("critique-card").style.display = c? "block":"none";
@@ -246,8 +392,13 @@ function renderEsc(v) {
     + (e.why_now? '<br><span class="mut small">왜 지금: '+esc(e.why_now)+'</span>':'')+'</div>').join("");
 }
 
-poll();
-setInterval(poll, POLL_MS);
+// 부팅: 즉시 1회 폴링(첫 페인트) → SSE 구독 → 폴링 폴백 인터벌(SSE 살면 자동 휴면).
+setLive("reconnecting","연결 중…");
+pollOnce();
+startSSE();
+setInterval(pollOnce, POLL_MS);
+// 경과시간이 SSE 갱신 사이에도 흐르게 보이도록 활동 패널만 1s마다 다시 그림.
+setInterval(()=>{ if (VIEW && !VIEW.error) renderActivity(VIEW); }, 1000);
 </script>
 </body>
 </html>

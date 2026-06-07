@@ -17,9 +17,12 @@ import pytest
 from haetae.dashboard import load_view, make_handler, state_to_view
 from haetae.models import (
     AcceptanceCriterion,
+    Activity,
+    Budget,
     Check,
     CheckReport,
     CheckType,
+    Cost,
     DecompositionUnit,
     Event,
     PlanItem,
@@ -28,6 +31,7 @@ from haetae.models import (
     RunEvidence,
     SpecCritique,
     SpecGap,
+    StageTransition,
     State,
     Status,
     Verdict,
@@ -164,6 +168,135 @@ def test_spec_enrichment_optional():
     assert {n["id"]: n["goal"] for n in v["dag"]["nodes"]}["u1"] == "엔진 코어"
 
 
+# ──────────────────── v2: activity / transitions / cost (WO#35) ────────────────────
+
+
+def _state_v2() -> State:
+    """activity(라이브) + transitions(이력) + budget/event.cost(계측)를 가진 state."""
+    plan = [
+        PlanItem(unit="u1", state=PlanState.done, deps=None),
+        PlanItem(unit="u2", state=PlanState.in_progress, deps=["u1"]),
+        PlanItem(unit="u3", state=PlanState.in_progress, deps=["u1"]),
+    ]
+    events = [
+        Event(seq=1, unit="u1", work_order_ref="코어", verdict=Verdict.pass_, ts="2026-06-07T14:00:10Z",
+              cost=Cost(tokens=150, usd=0.0015, input=100, output=50, source="orchestration")),
+        Event(seq=2, unit="u2", work_order_ref="기능", verdict=Verdict.pass_, ts="2026-06-07T14:00:20Z",
+              cost=Cost(tokens=4000, usd=0.04, input=3000, output=1000, source="executor")),
+        Event(seq=3, unit="u3", work_order_ref="검증", verdict=Verdict.pass_, ts="2026-06-07T14:00:25Z",
+              cost=Cost(tokens=600, usd=0.006, input=500, output=100, source="judge")),
+    ]
+    return State(
+        spec_ref="sim-001", spec_version=1, status=Status.running, plan=plan, events=events,
+        budget=Budget(spent=Cost(tokens=4750, usd=0.0475, input=3600, output=1150),
+                      cap=Cost(usd=5.0)),
+        activity=[
+            Activity(unit="u2", stage="build", started_at="2026-06-07T14:00:15Z"),
+            Activity(unit="u3", stage="verify", started_at="2026-06-07T14:00:24Z"),
+        ],
+        transitions=[
+            StageTransition(stage="synthesize", unit=None, ts="2026-06-07T14:00:00Z"),
+            StageTransition(stage="build", unit="u1", ts="2026-06-07T14:00:05Z"),
+            StageTransition(stage="verify", unit="u1", ts="2026-06-07T14:00:09Z"),
+            StageTransition(stage="build", unit="u2", ts="2026-06-07T14:00:15Z"),
+        ],
+    )
+
+
+def test_activity_surfaced_with_elapsed():
+    v = state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")
+    act = {a["unit"]: a for a in v["activity"]}
+    assert set(act) == {"u2", "u3"}
+    assert act["u2"]["stage"] == "build"
+    assert act["u3"]["stage"] == "verify"
+    # 경과 = now - started_at
+    assert act["u2"]["elapsed_s"] == 15.0  # 14:00:30 - 14:00:15
+    assert act["u3"]["elapsed_s"] == 6.0
+
+
+def test_activity_empty_when_absent():
+    v = state_to_view(_state())  # 구버전 state엔 activity 없음
+    assert v["activity"] == []
+
+
+def test_activity_bad_timestamp_elapsed_none():
+    s = State(spec_ref="x", spec_version=1, status=Status.running,
+              activity=[Activity(unit="u1", stage="build", started_at="not-a-ts")])
+    v = state_to_view(s, now="2026-06-07T14:00:30Z")
+    assert v["activity"][0]["elapsed_s"] is None  # 파싱 실패 → null(날조 금지)
+
+
+def test_dag_node_and_unit_carry_current_stage():
+    v = state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")
+    nodes = {n["id"]: n for n in v["dag"]["nodes"]}
+    assert nodes["u2"]["stage"] == "build"   # in_progress → 현재 단계 배지
+    assert nodes["u3"]["stage"] == "verify"
+    assert nodes["u1"]["stage"] is None      # done → 단계 없음
+    assert v["units"]["u2"]["stage"] == "build"
+
+
+def test_transitions_surfaced_in_order():
+    v = state_to_view(_state_v2())
+    stages = [(t["stage"], t["unit"]) for t in v["transitions"]]
+    assert stages == [
+        ("synthesize", None), ("build", "u1"), ("verify", "u1"), ("build", "u2"),
+    ]
+    assert v["transitions"][0]["ts"] == "2026-06-07T14:00:00Z"
+
+
+def test_transitions_empty_when_absent():
+    v = state_to_view(_state())
+    assert v["transitions"] == []
+
+
+def test_cost_total_from_budget():
+    v = state_to_view(_state_v2())
+    assert v["cost"]["total"]["tokens"] == 4750
+    assert v["cost"]["total"]["usd"] == 0.0475
+    assert v["cost"]["total"]["input"] == 3600
+    assert v["cost"]["cap"]["usd"] == 5.0
+
+
+def test_cost_by_source_aggregation():
+    v = state_to_view(_state_v2())
+    bs = v["cost"]["by_source"]
+    assert bs["orchestration"]["tokens"] == 150
+    assert bs["executor"]["tokens"] == 4000
+    assert bs["judge"]["tokens"] == 600
+    assert bs["judge"]["usd"] == 0.006
+    assert bs["orchestration"]["count"] == 1
+
+
+def test_cost_by_unit_aggregation():
+    v = state_to_view(_state_v2())
+    bu = v["cost"]["by_unit"]
+    assert bu["u1"]["tokens"] == 150
+    assert bu["u2"]["tokens"] == 4000
+    assert bu["u3"]["tokens"] == 600
+
+
+def test_cost_usd_null_is_tokens_only():
+    """usd 미상(구독 codex/미상 모델) → usd=None 보존(가짜 비용 금지, 프런트가 '—')."""
+    s = State(spec_ref="x", spec_version=1, status=Status.running,
+              budget=Budget(spent=Cost(tokens=1000, usd=None, input=700, output=300)),
+              events=[Event(seq=1, unit="u1", cost=Cost(tokens=1000, usd=None, source="executor"))])
+    v = state_to_view(s)
+    assert v["cost"]["total"]["tokens"] == 1000
+    assert v["cost"]["total"]["usd"] is None
+    assert v["cost"]["by_source"]["executor"]["usd"] is None
+    assert v["cost"]["by_source"]["executor"]["tokens"] == 1000
+
+
+def test_cost_empty_when_no_data():
+    v = state_to_view(_state())  # 구버전: event.cost/budget.spent 비어있음
+    assert v["cost"]["total"]["tokens"] is None
+    assert v["cost"]["by_source"] == {}
+
+
+def test_v2_view_json_serializable():
+    json.dumps(state_to_view(_state_v2(), now="2026-06-07T14:00:30Z"))
+
+
 # ──────────────────────────── 서버 라이트 ────────────────────────────
 
 
@@ -220,6 +353,78 @@ def test_load_view_parse_error_absorbed(tmp_path: Path):
     bad.write_text("status: not_a_valid_enum_value\nplan: [\n", encoding="utf-8")  # 깨진 YAML
     v = load_view(bad)
     assert "error" in v  # 파싱 에러 흡수
+
+
+# ──────────────────────── SSE 라이브 스트림 (WO#35) ────────────────────────
+
+
+def _serve_stream(tmp_state: Path, stream_interval: float = 0.05):
+    handler = make_handler(str(tmp_state), None, 2000, stream_interval=stream_interval)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, port
+
+
+def _read_sse_event(resp, timeout_lines: int = 200) -> dict:
+    """스트림에서 다음 `data:` 페이로드 한 건을 읽어 JSON 파싱(주석/하트비트 무시)."""
+    for _ in range(timeout_lines):
+        line = resp.readline()
+        if not line:
+            raise AssertionError("stream closed before data event")
+        if line.startswith(b"data:"):
+            return json.loads(line[len(b"data:"):].strip().decode("utf-8"))
+    raise AssertionError("no data event within line budget")
+
+
+def test_stream_headers_and_initial_event(tmp_path: Path):
+    sp = tmp_path / "s.yaml"
+    sp.write_text(_state_yaml(), encoding="utf-8")
+    httpd, port = _serve_stream(sp)
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stream", timeout=5)
+        assert resp.headers.get("Content-Type", "").startswith("text/event-stream")
+        v = _read_sse_event(resp)
+        assert v["status"] == "escalated" and len(v["dag"]["nodes"]) == 5
+        resp.close()
+    finally:
+        httpd.shutdown()
+
+
+def test_stream_pushes_on_file_change(tmp_path: Path):
+    import os
+    import time
+
+    sp = tmp_path / "s.yaml"
+    sp.write_text(_state_yaml(), encoding="utf-8")
+    httpd, port = _serve_stream(sp)
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stream", timeout=5)
+        first = _read_sse_event(resp)
+        assert first["status"] == "escalated"
+        # state를 done으로 바꾸고 mtime을 확실히 갱신 → 서버가 변경 감지 후 push
+        done = _state()
+        done.status = Status.done
+        import yaml
+        sp.write_text(yaml.safe_dump(done.model_dump(mode="json", by_alias=True),
+                                     allow_unicode=True), encoding="utf-8")
+        os.utime(sp, (time.time() + 5, time.time() + 5))
+        nxt = _read_sse_event(resp)
+        assert nxt["status"] == "done"
+        resp.close()
+    finally:
+        httpd.shutdown()
+
+
+def test_stream_missing_file_sends_error_event_not_crash(tmp_path: Path):
+    httpd, port = _serve_stream(tmp_path / "nope.yaml")
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stream", timeout=5)
+        v = _read_sse_event(resp)
+        assert "error" in v  # 파일 부재 → {error} 흡수(서버 안 죽음)
+        resp.close()
+    finally:
+        httpd.shutdown()
 
 
 # ──────────────────────────── 엔진 무접촉 가드 ────────────────────────────
