@@ -44,6 +44,9 @@
   - `unit`은 acceptance_criterion *최상위* 키다(`check` 안이 **아님**). 값은
     `decomposition`의 unit-id(예: `u1`) 또는 `"integration"`. 생략하면 통합 기준이다.
 - `assumptions[]`는 `id`, `text`, `confidence`(0~1 float), `checkpoint`(bool).
+- **문자열 값은 반드시 큰따옴표로 감싸라** — 특히 원문 주문을 옮기는 `order_raw`·`goal`·`desc`는
+  콜론(:)·특수문자를 품을 수 있다. unquoted 콜론은 YAML이 mapping으로 오해해 파싱 에러
+  (`mapping values are not allowed here`)를 낸다. 예: `goal: "X를 한다: 단, Y"` (O) / `goal: X를 한다: 단, Y` (X).
 
 ## 완성 예시 (이 모양을 그대로 베껴라)
 

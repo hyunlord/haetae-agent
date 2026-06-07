@@ -187,8 +187,17 @@ def synthesize_with_critique(
             crit.resynthesized = True
         except SynthesisError as e:
             # 재합성 실패 → 원본 spec 폴백. crash 금지. 사실을 note에 남긴다.
+            # critic이 *옳게* 강화책을 냈는데 적용이 깨지면 약한 원본이 그대로 남는다
+            # — 그 유실을 대시보드/사람이 명확히 보도록 "강화책 유실"로 못박는다.
             crit.resynthesized = False
-            fallback_note = f"재합성 시도가 검증 실패 — 원본 spec 유지 ({e.message})"
+            if isinstance(e.__cause__, yaml.YAMLError):
+                reason = f"재합성 YAML 파싱 반복 실패 ({e.message})"
+            else:
+                reason = f"재합성 결과 검증 실패 ({e.message})"
+            fallback_note = (
+                f"⚠️ 강화책 유실: critic의 강화 기준이 적용되지 못하고 약한 원본 spec이 "
+                f"유지됨 — {reason}"
+            )
             crit.note = f"{crit.note} | {fallback_note}" if crit.note else fallback_note
 
     return spec, crit

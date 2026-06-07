@@ -241,7 +241,7 @@ def test_synthesize_with_critique_absorbs_critic_client_exception():
 
 def test_resynthesis_failure_falls_back_to_original():
     """재합성 결과가 검증 실패 → 원본 spec 폴백(crash 금지). note에 사유 기록."""
-    bad_resynth = "이건 spec이 아니라 그냥 문장 — 검증 실패"
+    bad_resynth = "이건 spec이 아니라 그냥 문장 — 검증 실패"  # 유효 YAML(문자열) = 비-매핑
     client = MockClient([SPEC_WEAK, bad_resynth])
     critic = MockClient([CRIT_SOFT])
     spec, crit = synthesize_with_critique(
@@ -251,5 +251,27 @@ def test_resynthesis_failure_falls_back_to_original():
     assert spec.version == 1
     assert crit.resynthesized is False
     assert crit.note is not None
-    assert "폴백" in crit.note or "원본" in crit.note
-    assert len(client.calls) == 2  # 재합성 시도는 했음
+    assert "원본" in crit.note  # 비-매핑은 재시도 대상 아님 → 즉시 폴백(calls==2)
+    assert len(client.calls) == 2  # 재합성 시도는 했음(비-매핑이라 재시도 없이 폴백)
+
+
+def test_resynthesis_yaml_parse_failure_records_strengthening_loss():
+    """재합성이 *YAML 파싱 반복 실패*로 폴백 → spec_critique에 '강화책 유실' 명시 기록.
+
+    대시보드가 표면화한 실제 사례: critic이 옳은 강화책을 냈으나 재합성 출력이 line N
+    파싱 에러로 버려지고 약한 원본 기준이 유지됨. 이제 (a) synthesize가 먼저 재시도로
+    회복을 시도하고, (b) 그래도 소진되면 '강화책 유실'이 분명히 기록된다.
+    """
+    # 콜론 미인용으로 깨진 재합성 출력 — 재시도 소진까지 계속 깨지게(1 + 재시도 2 = 3).
+    broken = "goal: 콜론: 따옴표 없이 든 값\nversion: 2\n"  # mapping values not allowed here
+    client = MockClient([SPEC_WEAK, broken, broken, broken])
+    critic = MockClient([CRIT_SOFT])
+    spec, crit = synthesize_with_critique(
+        ORDER, client, critic, syn_prompt_path=SYN_PROMPT, critic_prompt_path=CRITIC_PROMPT
+    )
+    assert spec.version == 1  # 약한 원본 유지
+    assert crit.resynthesized is False
+    assert "강화책 유실" in crit.note  # 유실이 명확히 기록됨(대시보드 노출)
+    assert "파싱" in crit.note  # YAML 파싱 실패 사유
+    assert len(client.calls) == 4  # 합성 1 + 재합성 3시도(재시도로 회복 시도했음)
+    assert len(critic.calls) == 1  # critic 재호출 없음(바운드)
