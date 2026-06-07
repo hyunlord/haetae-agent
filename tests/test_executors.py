@@ -198,6 +198,56 @@ def test_codexexecutor_raises_on_empty_output(monkeypatch):
         CodexExecutor(workdir="/tmp/x")._run("p")
 
 
+def test_codexexecutor_adds_reasoning_effort_flag_when_set(monkeypatch):
+    """WO#38: reasoning_effort 설정 시 `-c model_reasoning_effort=<effort>`가 cmd에 포함."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    CodexExecutor(workdir="/tmp/x", reasoning_effort="xhigh")._run("p")
+    cmd = seen["cmd"]
+    # 확인된 형식: codex exec엔 -e 전용 플래그가 없어 -c config override로 넘긴다.
+    assert "-c" in cmd
+    assert cmd[cmd.index("-c") + 1] == "model_reasoning_effort=xhigh"
+    # 추론강도는 sandbox 권한과 무관 — 쓰기 sandbox 그대로(가드 불변).
+    assert cmd[cmd.index("-s") + 1] == "workspace-write"
+    assert "danger-full-access" not in cmd
+
+
+def test_codexexecutor_omits_reasoning_effort_when_unset(monkeypatch):
+    """미설정(기본)이면 플래그 미부착 → codex 기본(medium) 그대로(기존 동작 불변)."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    CodexExecutor(workdir="/tmp/x")._run("p")
+    cmd = seen["cmd"]
+    assert "-c" not in cmd
+    assert "model_reasoning_effort" not in " ".join(cmd)
+
+
+def test_codexexecutor_rejects_bad_reasoning_effort(monkeypatch):
+    """화이트리스트 밖 추론강도는 ValueError로 거부(subprocess 미실행)."""
+    def fake_run(cmd, **kwargs):  # 호출되면 안 됨
+        raise AssertionError("subprocess should not run for rejected reasoning_effort")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    with pytest.raises(ValueError):
+        CodexExecutor(workdir="/tmp/x", reasoning_effort="ultra")._run("p")
+
+
 def test_codexexecutor_rejects_danger_sandbox(monkeypatch):
     """방어선: danger-full-access를 sandbox로 주면 plumbing이 ValueError로 거부."""
     def fake_run(cmd, **kwargs):  # 호출되면 안 됨

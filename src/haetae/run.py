@@ -116,6 +116,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model", default=None, help="codex 모델 override (기본: codex 설정)")
     parser.add_argument(
+        "--reasoning-effort",
+        choices=["minimal", "low", "medium", "high", "xhigh"],
+        default=None,
+        help=(
+            "codex executor 추론 강도(minimal..xhigh). 미설정(기본)이면 플래그 미부착 → "
+            "codex 기본(medium) 그대로(기존 동작 불변). xhigh=거친 동선 frontier 레버."
+        ),
+    )
+    parser.add_argument(
         "--judge-model",
         default=None,
         help="judge 전용 codex 모델 (executor --model과 다르게 줘 독립성 확보; 기본: codex 설정)",
@@ -233,7 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.executor == "codex":
         # 자율 쓰기 실행 — gate와 같은 --workdir로 범위 한정.
-        executor: Executor = CodexExecutor(model=args.model, workdir=args.workdir)
+        # reasoning_effort: 미설정(None)이면 codex 기본(medium) 그대로(후방호환).
+        executor: Executor = CodexExecutor(
+            model=args.model, workdir=args.workdir,
+            reasoning_effort=args.reasoning_effort,
+        )
     else:
         executor = HumanRelayExecutor()
 
@@ -243,7 +256,9 @@ def main(argv: list[str] | None = None) -> int:
     gate_factory = None
     if args.max_parallel > 1:
         if args.executor == "codex":
-            executor_factory = lambda wt: CodexExecutor(model=args.model, workdir=wt)
+            executor_factory = lambda wt: CodexExecutor(
+                model=args.model, workdir=wt, reasoning_effort=args.reasoning_effort
+            )
         else:
             executor_factory = lambda wt: HumanRelayExecutor()
         # per-worktree gate도 metered judge client(유닛마다 새 인스턴스 → 스레드 안전).

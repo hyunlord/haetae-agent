@@ -118,6 +118,35 @@ def test_main_executor_defaults_to_human(monkeypatch):
     assert isinstance(captured["executor"], HumanRelayExecutor)
 
 
+# ──────────────────────────── --reasoning-effort 배선 (WO#38) ────────────────────────────
+
+
+def test_main_reasoning_effort_wires_into_codexexecutor(monkeypatch):
+    """--reasoning-effort가 CodexExecutor로 전달된다(설정 시)."""
+    captured = _capture_main_run(monkeypatch)
+    rc = main(["--order", "x", "--executor", "codex", "--workdir", "/tmp/s",
+               "--reasoning-effort", "xhigh"])
+    assert rc == 0
+    ex = captured["executor"]
+    assert isinstance(ex, CodexExecutor)
+    assert ex.reasoning_effort == "xhigh"
+
+
+def test_main_reasoning_effort_default_is_none(monkeypatch):
+    """미설정(기본)이면 None → codex 기본(medium) 그대로(기존 동작 불변)."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--executor", "codex", "--workdir", "/tmp/s"])
+    assert captured["executor"].reasoning_effort is None
+
+
+def test_main_rejects_bad_reasoning_effort(monkeypatch):
+    """화이트리스트 밖 값은 argparse(choices)가 SystemExit으로 거부."""
+    import pytest
+    _capture_main_run(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["--order", "x", "--executor", "codex", "--reasoning-effort", "ultra"])
+
+
 # ──────────────────────────── 헤드룸 기본값/배선 (WO#24 Part B) ────────────────────────────
 
 

@@ -197,6 +197,50 @@ def test_allowed_sandboxes_unchanged():
     assert "danger-full-access" not in codex_mod.ALLOWED_SANDBOXES
 
 
+# ──────────────────── reasoning-effort (WO#38 — sandbox 권한과 무관) ────────────────────
+
+
+def test_allowed_reasoning_efforts_whitelist():
+    """추론 강도 화이트리스트는 codex 값과 일치하며 ALLOWED_SANDBOXES를 건드리지 않는다."""
+    assert codex_mod.ALLOWED_REASONING_EFFORTS == (
+        "minimal", "low", "medium", "high", "xhigh",
+    )
+    # 추론강도 화이트리스트는 sandbox 가드를 절대 오염시키지 않는다(불변).
+    assert codex_mod.ALLOWED_SANDBOXES == ("read-only", "workspace-write")
+
+
+def test_exec_codex_with_usage_rejects_bad_reasoning_effort(monkeypatch):
+    """헬퍼 레벨에서도 화이트리스트 밖 추론강도를 ValueError로 거부(다중 가드)."""
+    def fake_run(cmd, **kwargs):  # 호출되면 안 됨
+        raise AssertionError("subprocess should not run for rejected reasoning_effort")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    with pytest.raises(ValueError):
+        codex_mod.exec_codex_with_usage(
+            "p", sandbox="read-only", cwd=None, reasoning_effort="bogus"
+        )
+
+
+def test_exec_codex_with_usage_adds_reasoning_effort_flag(monkeypatch):
+    """설정 시 `-c model_reasoning_effort=<effort>`만 부착하고 sandbox는 불변."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    codex_mod.exec_codex_with_usage(
+        "p", sandbox="read-only", cwd=None, reasoning_effort="high"
+    )
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-c") + 1] == "model_reasoning_effort=high"
+    assert cmd[cmd.index("-s") + 1] == "read-only"
+
+
 # ──────────────────────────── (선택) 실제 codex 통합 ────────────────────────────
 
 

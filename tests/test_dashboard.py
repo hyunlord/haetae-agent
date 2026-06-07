@@ -20,6 +20,7 @@ import pytest
 
 from haetae.dashboard import (
     RunManager,
+    _QuietThreadingHTTPServer,
     build_run_argv,
     generate_run_id,
     load_view,
@@ -482,6 +483,7 @@ def test_validate_options_defaults():
     assert o["unit_retries"] == 2
     assert o["scaffold"] is True and o["skills"] is True
     assert o["critic_model"] is None
+    assert o["reasoning_effort"] is None  # 미설정 = codex 기본(기존 동작 불변)
 
 
 def test_validate_options_rejects_unknown_key():
@@ -506,6 +508,27 @@ def test_validate_options_rejects_bad_critic_model():
     with pytest.raises(ValueError):
         validate_options({"critic_model": "a; rm -rf /"})  # 셸 메타문자 거부
     assert validate_options({"critic_model": "gpt-5-codex"})["critic_model"] == "gpt-5-codex"
+
+
+def test_validate_options_reasoning_effort(monkeypatch=None):
+    """WO#38: 화이트리스트만 통과, 빈/미설정은 None, 나쁜 값 거부."""
+    assert validate_options({"reasoning_effort": "xhigh"})["reasoning_effort"] == "xhigh"
+    assert validate_options({"reasoning_effort": ""})["reasoning_effort"] is None  # 빈 = 미설정
+    assert validate_options({})["reasoning_effort"] is None
+    with pytest.raises(ValueError):
+        validate_options({"reasoning_effort": "ultra"})  # 화이트리스트 밖
+    with pytest.raises(ValueError):
+        validate_options({"reasoning_effort": 5})  # 타입 불일치
+
+
+def test_build_run_argv_reasoning_effort():
+    """설정 시 `--reasoning-effort <effort>` 부착, 미설정이면 미부착(기존 동작 불변)."""
+    set_opts = validate_options({"reasoning_effort": "high"})
+    argv = build_run_argv("o", Path("/abs/runs/rid"), set_opts)
+    assert argv[argv.index("--reasoning-effort") + 1] == "high"
+    unset_opts = validate_options({})
+    argv2 = build_run_argv("o", Path("/abs/runs/rid"), unset_opts)
+    assert "--reasoning-effort" not in argv2
 
 
 def test_build_run_argv_is_arglist_not_shell():
@@ -789,3 +812,44 @@ def test_launcher_uses_only_subprocess_not_engine_import():
     src = DASH.read_text(encoding="utf-8")
     assert "subprocess.Popen" in src  # 서브프로세스 spawn(엔진 직접 호출 아님)
     assert "signal.SIGINT" in src  # stop은 SIGINT 신호로
+
+
+# ──────────────────── WO#38 Part A: 예상된 SSE 끊김 traceback 억제 ────────────────────
+
+
+def _handle_error_with_exc(server, exc: BaseException) -> None:
+    """현재 예외 컨텍스트(sys.exc_info)를 세워두고 handle_error를 호출한다."""
+    try:
+        raise exc
+    except BaseException:  # noqa: BLE001 — 의도적으로 exc 컨텍스트만 세움
+        server.handle_error(None, ("127.0.0.1", 12345))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ConnectionResetError(54, "reset"), BrokenPipeError(), ConnectionAbortedError()],
+)
+def test_handle_error_silences_expected_disconnects(exc, capsys):
+    """예상된 클라이언트 끊김은 traceback/raise 없이 조용히 무시(무-로그스팸)."""
+    server = _QuietThreadingHTTPServer(("127.0.0.1", 0), make_handler(None, None, 1000))
+    try:
+        _handle_error_with_exc(server, exc)  # raise하면 테스트가 깨짐 → 조용함을 보장
+    finally:
+        server.server_close()
+    captured = capsys.readouterr()
+    # 기본 handle_error는 stderr에 traceback/구분선을 찍는다 — 조용히면 아무것도 없어야.
+    assert captured.err == ""
+    assert "Traceback" not in captured.out
+
+
+def test_handle_error_surfaces_real_errors(capsys):
+    """예상치 못한 예외(ValueError)는 기존대로 surface(진짜 에러를 숨기지 않음)."""
+    server = _QuietThreadingHTTPServer(("127.0.0.1", 0), make_handler(None, None, 1000))
+    try:
+        _handle_error_with_exc(server, ValueError("진짜 버그"))
+    finally:
+        server.server_close()
+    captured = capsys.readouterr()
+    # stdlib 기본 handle_error는 stderr로 traceback을 찍는다 → surface됨을 단언.
+    assert "Traceback" in captured.err
+    assert "ValueError" in captured.err

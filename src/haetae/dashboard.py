@@ -399,6 +399,9 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
 _RUNS_DIR_DEFAULT = "runs"
 _STOP_GRACE_S = 5.0  # SIGINT 후 정리 대기. 초과 시 SIGTERM→SIGKILL 에스컬레이트(best-effort).
 _EXECUTOR_CHOICES = ("codex", "human")
+# codex 추론 강도 화이트리스트(WO#38). 엔진 격리 불변식상 providers.codex를 import하지
+# 않으므로 여기서 미러링한다(run.py argparse + codex 헬퍼가 재검증 — 다중 가드).
+_REASONING_EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 _CRITIC_MODEL_RE = re.compile(r"[A-Za-z0-9._\-]+\Z")
 
@@ -435,7 +438,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
     raw = raw or {}
     allowed = {
         "executor", "max_parallel", "run_timeout", "scaffold", "skills",
-        "critic_model", "max_iters", "unit_retries",
+        "critic_model", "max_iters", "unit_retries", "reasoning_effort",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -481,6 +484,16 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
         if critic_model and not _CRITIC_MODEL_RE.match(critic_model):
             raise ValueError("critic_model has invalid characters")
 
+    # reasoning_effort(WO#38): 미설정(None/빈문자)이면 플래그 미부착 → codex 기본(기존 동작
+    # 불변). 설정 시 화이트리스트 밖이면 거부. sandbox 권한과 무관(가드 불변).
+    reasoning_effort = raw.get("reasoning_effort")
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str):
+            raise ValueError("reasoning_effort must be a string")
+        reasoning_effort = reasoning_effort.strip() or None
+        if reasoning_effort and reasoning_effort not in _REASONING_EFFORT_CHOICES:
+            raise ValueError(f"reasoning_effort must be one of {_REASONING_EFFORT_CHOICES}")
+
     return {
         "executor": executor,
         "max_parallel": _int("max_parallel", 4, 1, 16),
@@ -490,6 +503,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
         "critic_model": critic_model,
         "max_iters": _int("max_iters", 30, 1, 200),
         "unit_retries": _int("unit_retries", 2, 0, 10),
+        "reasoning_effort": reasoning_effort,
     }
 
 
@@ -513,6 +527,9 @@ def build_run_argv(order: str, run_dir: Path, opts: dict[str, Any]) -> list[str]
     argv.append("--skills" if opts["skills"] else "--no-skills")
     if opts["critic_model"]:
         argv += ["--critic-model", opts["critic_model"]]
+    # reasoning_effort: 설정 시만 플래그 부착. 미설정이면 codex 기본(기존 동작 불변).
+    if opts.get("reasoning_effort"):
+        argv += ["--reasoning-effort", opts["reasoning_effort"]]
     return argv
 
 
@@ -896,6 +913,28 @@ def make_handler(
     return DashboardHandler
 
 
+# SSE는 장수명 연결이라 브라우저 재연결/탭닫기/새로고침으로 *예상되게* 끊긴다. 이때
+# stdlib(socketserver)는 ConnectionResetError 등을 traceback으로 찍어 무해한 끊김이
+# 에러처럼 보인다. 예상된 끊김만 조용히 무시하고, **그 외 예외는 그대로 surface**한다
+# (진짜 에러를 숨기면 안 됨). #37이 BrokenPipe는 SSE write에서 잡았고, 여기선 서버
+# 레벨에서 ConnectionReset/Aborted까지 동급으로 조용히 흡수한다.
+_EXPECTED_DISCONNECTS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+
+
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """예상된 클라이언트 끊김의 traceback만 억제하는 ThreadingHTTPServer.
+
+    handle_error는 요청 처리 중 핸들러에서 예외가 새어나올 때 socketserver가 부른다.
+    예상된 끊김이면 조용히(traceback/raise 없이) 무시, 그 외는 super()로 surface.
+    """
+
+    def handle_error(self, request: Any, client_address: Any) -> None:  # noqa: N802 — socketserver 계약
+        exc = sys.exc_info()[1]
+        if isinstance(exc, _EXPECTED_DISCONNECTS):
+            return  # 예상된 끊김 — traceback 없이 조용히(무해). 진짜 에러가 아님.
+        super().handle_error(request, client_address)
+
+
 def serve(
     state_path: str | Path | None = None,
     *,
@@ -912,7 +951,8 @@ def serve(
         state_path, spec_path, int(poll_interval * 1000),
         stream_interval=stream_interval, run_manager=run_manager,
     )
-    httpd = ThreadingHTTPServer((host, port), handler)  # localhost 바인드
+    # 예상된 SSE 끊김 traceback을 억제하는 서브클래스(그 외 예외는 surface). localhost 바인드.
+    httpd = _QuietThreadingHTTPServer((host, port), handler)
     print(
         f"haetae dashboard → http://{host}:{port}  (SSE {stream_interval}s, runs: {run_manager.runs_dir})",
         flush=True,

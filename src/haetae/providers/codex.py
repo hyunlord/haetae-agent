@@ -27,6 +27,11 @@ CODEX_BIN = "codex"
 # (자율 executor가 LLM이 만든 명령을 쓰기 권한으로 실행하므로 — WO#13 SAFETY).
 ALLOWED_SANDBOXES = ("read-only", "workspace-write")
 
+# 허용 추론 강도 화이트리스트(WO#38). codex의 `model_reasoning_effort` config 값과 일치.
+# **sandbox 권한과 무관** — 이 화이트리스트는 ALLOWED_SANDBOXES를 절대 건드리지 않는다.
+# codex exec엔 전용 플래그(-e 등)가 없어 `-c model_reasoning_effort=<effort>`로 넘긴다.
+ALLOWED_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
 
 class CodexError(RuntimeError):
     """codex exec 실행 실패. 디버깅용으로 stdout/stderr 일부를 동봉한다."""
@@ -86,6 +91,7 @@ def exec_codex(
     model: str | None = None,
     timeout: float | None = None,
     ephemeral: bool = True,
+    reasoning_effort: str | None = None,
 ) -> str:
     """`codex exec`를 한 턴 돌려 `-o` 최종 메시지 파일을 읽어 반환하는 공유 헬퍼.
 
@@ -93,7 +99,8 @@ def exec_codex(
     CodexExecutor)는 `exec_codex_with_usage`를 쓴다.
     """
     text, _usage = exec_codex_with_usage(
-        prompt, sandbox=sandbox, cwd=cwd, model=model, timeout=timeout, ephemeral=ephemeral
+        prompt, sandbox=sandbox, cwd=cwd, model=model, timeout=timeout,
+        ephemeral=ephemeral, reasoning_effort=reasoning_effort,
     )
     return text
 
@@ -106,6 +113,7 @@ def exec_codex_with_usage(
     model: str | None = None,
     timeout: float | None = None,
     ephemeral: bool = True,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, Usage | None]:
     """`codex exec`를 한 턴 돌려 (최종 메시지, token usage)를 반환하는 저수준 헬퍼.
 
@@ -120,11 +128,19 @@ def exec_codex_with_usage(
     sandbox: ALLOWED_SANDBOXES 중 하나. danger-full-access는 ValueError로 거부.
     cwd:     codex 작업 루트(`-C`). None이면 임시 디렉토리(완전 격리).
              CodexExecutor는 여기에 `--workdir`를 넘겨 실행 범위를 그 폴더로 한정한다.
+    reasoning_effort(WO#38): 설정 시 `-c model_reasoning_effort=<effort>`로 codex 추론
+             강도를 건다. None(기본)이면 플래그 미부착 → codex 기본(medium) 그대로(후방호환).
+             ALLOWED_REASONING_EFFORTS 화이트리스트 밖이면 ValueError. **sandbox 불변.**
     """
     if sandbox not in ALLOWED_SANDBOXES:
         raise ValueError(
             f"허용되지 않은 sandbox: {sandbox!r} "
             f"(허용: {ALLOWED_SANDBOXES}; danger-full-access 금지)"
+        )
+    if reasoning_effort is not None and reasoning_effort not in ALLOWED_REASONING_EFFORTS:
+        raise ValueError(
+            f"허용되지 않은 reasoning_effort: {reasoning_effort!r} "
+            f"(허용: {ALLOWED_REASONING_EFFORTS})"
         )
     with tempfile.TemporaryDirectory(prefix="haetae-codex-") as tmp:
         run_cwd = cwd or tmp
@@ -137,6 +153,9 @@ def exec_codex_with_usage(
         cmd += ["-s", sandbox, "-C", str(run_cwd), "-o", str(out_path)]
         if model:
             cmd += ["-m", model]
+        if reasoning_effort:
+            # codex exec엔 전용 추론강도 플래그가 없어 config override로 넘긴다(검증된 형식).
+            cmd += ["-c", f"model_reasoning_effort={reasoning_effort}"]
         cmd.append("-")  # 프롬프트는 stdin으로
 
         try:

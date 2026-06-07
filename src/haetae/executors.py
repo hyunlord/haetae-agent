@@ -112,6 +112,8 @@ class CodexExecutor:
     workdir: codex 작업 루트(cwd). 실행이 이 폴더로 한정된다.
     timeout: subprocess 타임아웃(초). 자율 구현은 느릴 수 있어 넉넉히.
     sandbox: 쓰기 sandbox. 기본 workspace-write(가장 좁은 쓰기 모드).
+    reasoning_effort(WO#38): codex 추론 강도(minimal..xhigh). None이면 미설정 →
+             codex 기본(medium) 그대로(후방호환). sandbox 권한과 무관(가드 불변).
     """
 
     def __init__(
@@ -120,11 +122,13 @@ class CodexExecutor:
         workdir: str | Path = ".",
         timeout: float = 1800.0,
         sandbox: str = "workspace-write",
+        reasoning_effort: str | None = None,
     ):
         self.model = model
         self.workdir = Path(workdir)
         self.timeout = timeout
         self.sandbox = sandbox
+        self.reasoning_effort = reasoning_effort
         # 직전 실행의 token usage(WO#33). 미노출/파싱 실패면 None(날조 금지).
         self.last_usage: Usage | None = None
 
@@ -142,6 +146,7 @@ class CodexExecutor:
                 cwd=str(self.workdir),
                 model=self.model,
                 timeout=self.timeout,
+                reasoning_effort=self.reasoning_effort,
             )
         except CodexError as e:
             raise CodexExecutorError(str(e)) from e

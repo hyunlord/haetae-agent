@@ -172,6 +172,15 @@
       <span class="opt"><label>max-iters</label><input id="f-max-iters" type="number" min="1" max="200" value="30"></span>
       <span class="opt"><label>unit-retries</label><input id="f-unit-retries" type="number" min="0" max="10" value="2"></span>
       <span class="opt"><label>critic-model</label><input id="f-critic-model" type="text" placeholder="(옵션)"></span>
+      <span class="opt"><label>reasoning-effort</label>
+        <select id="f-reasoning-effort">
+          <option value="" selected>codex 기본(medium)</option>
+          <option value="minimal">minimal</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+        </select></span>
       <span class="opt"><input id="f-scaffold" type="checkbox" checked><label>scaffold</label></span>
       <span class="opt"><input id="f-skills" type="checkbox" checked><label>skills</label></span>
     </div>
@@ -306,6 +315,7 @@ async function launchRun(){
   const errEl = $("form-err"); errEl.textContent="";
   if (!order){ errEl.textContent="order를 입력하세요."; return; }
   const cm = $("f-critic-model").value.trim();
+  const re = $("f-reasoning-effort").value;
   const options = {
     executor: $("f-executor").value,
     max_parallel: parseInt($("f-max-parallel").value,10),
@@ -316,6 +326,7 @@ async function launchRun(){
     skills: $("f-skills").checked,
   };
   if (cm) options.critic_model = cm;
+  if (re) options.reasoning_effort = re;  // 미설정(빈값)이면 안 붙임 → codex 기본
   const btn = $("launch-btn"); btn.disabled=true; btn.textContent="실행 중…";
   try {
     const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"},
