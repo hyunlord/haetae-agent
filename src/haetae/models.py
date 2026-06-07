@@ -350,6 +350,32 @@ class DecompCritique(BaseModel):
     rejected: bool = False
 
 
+# ──────────────────── OR-node / approach 추적 (WO#41, Phase D) ────────────────────
+
+
+class ApproachAttempt(BaseModel):
+    """OR-node: 한 goal(유닛 또는 통합)에 대해 시도한 한 *접근*의 기록(append-only 감사).
+
+    LEAP의 AND-OR DAG처럼, gate가 정상 재시도까지 소진하고도 실패하면 *같은 acceptance
+    criteria/done_when을 둔 채* 근본적으로 다른 접근으로 갈아탄다. 그 시도 이력이다.
+
+    **bar 불변(anti-erosion)**: 대안은 접근(알고리즘/구조)만 바꾼다 — criteria/done_when은
+    절대 건드리지 않는다. evidence는 gate 실패 *증거*일 뿐, 기준 약화 신호가 아니다.
+
+    scope:    "unit:<id>" | "integration".
+    approach: 시도한 접근 요약(work order goal 또는 통합 접근 라벨).
+    outcome:  "fail"(판정 실패) | "abandoned"(대안으로 갈아탐) | "exhausted"(대안 소진).
+    evidence: gate 실패 증거 요약(독립 gate/run-judge가 뭐가 부족하다 했는지).
+    index:    0=원본 접근, 1+=대안 순번.
+    """
+
+    scope: str
+    approach: str | None = None
+    outcome: str
+    evidence: str | None = None
+    index: int = 0
+
+
 # ──────────────────────────── State ────────────────────────────
 
 
@@ -369,6 +395,9 @@ class State(BaseModel):
     # replan이 낸 분해(work order)에 대한 적대적 critic 판정 이력(WO#40, append-only 감사 로그).
     # weak로 reject→재replan했거나 재시도 소진 후 진행한 경우를 기록한다(critic OFF면 빈 리스트).
     decomp_critiques: list[DecompCritique] = Field(default_factory=list)
+    # OR-node(WO#41): goal(유닛/통합)별 시도한 접근 이력(append-only). gate 실패로 다른
+    # 접근으로 갈아탄 백트래킹을 기록한다(or_alternatives=0이면 빈 리스트 = 기존 동작).
+    approaches: list[ApproachAttempt] = Field(default_factory=list)
     # 현재 in-flight 유닛 라이브 스냅샷(WO#33 Part B). 완료 시 비워진다.
     activity: list[Activity] = Field(default_factory=list)
     # 단계 전이 이력(WO#33 Part B) — append-only 타임라인.

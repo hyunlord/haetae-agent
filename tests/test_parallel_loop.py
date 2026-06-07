@@ -301,6 +301,7 @@ def test_unit_retries_exhausted_then_escalate(tmp_path):
         "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
         executor_factory=make_ex, gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),
         max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, unit_retries=2,
+        or_alternatives=0,  # OR 대안 OFF: 이 테스트는 재시도-소진→escalate 경로만 격리 검증
     )
     assert state.status is Status.escalated
     assert len(calls) == 3  # 최초 1 + 재시도 2 = unit_retries + 1
@@ -324,6 +325,7 @@ def test_unit_retries_zero_single_attempt(tmp_path):
         "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
         executor_factory=make_ex, gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),
         max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, unit_retries=0,
+        or_alternatives=0,  # OR 대안 OFF: 첫 실패 즉시 escalate(시도 1회)만 격리 검증
     )
     assert state.status is Status.escalated
     assert len(calls) == 1  # 재시도 없음
@@ -531,4 +533,177 @@ def test_parallel_decomp_critic_weak_then_progress_rereplans(tmp_path):
     rejected = [c for c in state.decomp_critiques if c.rejected]
     assert len(rejected) == 1 and rejected[0].verdict == "weak"
     assert any(t.stage == "decomp-reject" for t in state.transitions)
+    assert_clean(tmp_path)
+
+
+# ──────────────────── OR-node 대안 + 백트래킹 (WO#41, Phase D) ────────────────────
+
+
+def _fail_then_pass_gate_factory(lock, counter, fail_first: int = 1):
+    """gate_factory: 공유 카운터로 처음 fail_first회 fail, 그 다음 pass."""
+    def make_gate(wt):
+        class G:
+            def judge(self, result, spec, unit=None):
+                with lock:
+                    counter["n"] += 1
+                    n = counter["n"]
+                v = Verdict.fail_recoverable if n <= fail_first else Verdict.pass_
+                return GateResult(verdict=v)
+        return G()
+    return make_gate
+
+
+def test_unit_or_alternative_recovers_to_done(tmp_path):
+    """유닛 gate 실패(재시도 소진) → 대안 접근 1회 → 대안 pass → done. 폐기 접근 기록."""
+    import threading
+    counter = {"n": 0}
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=_fail_then_pass_gate_factory(threading.Lock(), counter, fail_first=1),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=0, or_alternatives=1,
+    )
+    assert state.status is Status.done
+    abandoned = [a for a in state.approaches if a.scope == "unit:u1" and a.outcome == "abandoned"]
+    assert len(abandoned) == 1  # 폐기한 원본 접근 기록
+    assert any(t.stage == "or-alternative" for t in state.transitions)
+    assert_clean(tmp_path)
+
+
+def test_unit_or_alternative_exhausted_escalates(tmp_path):
+    """대안도 실패 + 소진 → escalate(시도한 접근 기록 첨부)."""
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),  # 항상 실패
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=0, or_alternatives=1,
+    )
+    assert state.status is Status.escalated
+    u1 = [a for a in state.approaches if a.scope == "unit:u1"]
+    assert [a.outcome for a in u1] == ["abandoned", "exhausted"]  # 원본 폐기 + 대안 소진
+    assert any(isinstance(e, dict) and "approaches_tried" in e for e in state.pending_escalations)
+    assert any("OR 대안" in str(e) and "소진" in str(e) for e in state.pending_escalations)
+    assert_clean(tmp_path)
+
+
+def test_unit_or_alternative_is_bounded(tmp_path):
+    """bounded: or_alternatives=2 → 정확히 원본1+대안2=3 시도(무한 아님)."""
+    import threading
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def make_ex(wt):
+        class E:
+            def run(self, order):
+                with lock:
+                    calls.append(order.unit)
+                return "ran"
+        return E()
+
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=0, or_alternatives=2,
+    )
+    assert state.status is Status.escalated
+    assert len(calls) == 3  # 원본 1 + 대안 2 — 바운드(무한 대안 생성 안 함)
+    assert_clean(tmp_path)
+
+
+def test_or_alternatives_zero_is_backward_compatible(tmp_path):
+    """--or-alternatives 0 → 기존 동작(즉시 escalate, 접근 추적 없음)."""
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=lambda wt: PassGate(Verdict.fail_recoverable),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=0, or_alternatives=0,
+    )
+    assert state.status is Status.escalated
+    assert state.approaches == []  # OR OFF → 백트래킹/접근 추적 없음(후방호환)
+    assert_clean(tmp_path)
+
+
+def test_or_alternative_keeps_bar_unchanged(tmp_path):
+    """**bar 불변 가드**: 대안 경로에서 gate가 보는 criteria/done_when이 *바뀌지 않음*."""
+    import threading
+    seen_bars: list[tuple] = []
+    lock = threading.Lock()
+
+    def make_gate(wt):
+        class G:
+            def judge(self, result, spec, unit=None):
+                with lock:
+                    seen_bars.append(
+                        (tuple(ac.id for ac in spec.acceptance_criteria), spec.done_when)
+                    )
+                return GateResult(verdict=Verdict.fail_recoverable)
+        return G()
+
+    run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(), gate_factory=make_gate,
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=0, or_alternatives=1,
+    )
+    # 원본 + 대안에서 gate가 본 기준이 동일 — 접근만 바뀌고 bar는 불변(anti-erosion).
+    assert len(seen_bars) >= 2
+    assert len(set(seen_bars)) == 1
+
+
+def test_integration_or_alternative_recovers_to_done(tmp_path):
+    """통합 gate 실패 → 다른 접근으로 cross-unit 재계획 → 통합 pass → done."""
+    counter = {"n": 0}
+
+    class Integ:
+        def judge(self, result, spec, unit=None):  # main 스레드 직렬 — lock 불필요
+            counter["n"] += 1
+            return GateResult(verdict=Verdict.fail_recoverable if counter["n"] == 1 else Verdict.pass_)
+
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=Integ(),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, or_alternatives=1,
+    )
+    assert state.status is Status.done
+    integ = [a for a in state.approaches if a.scope == "integration"]
+    assert len(integ) == 1 and integ[0].outcome == "abandoned"
+    assert any(t.stage == "or-alternative" and t.unit is None for t in state.transitions)
+    assert_clean(tmp_path)
+
+
+def test_integration_or_alternative_exhausted_escalates(tmp_path):
+    """통합 gate가 계속 실패 + 대안 소진 → escalate(통합 접근 기록 첨부)."""
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=SpyGate(Verdict.fail_recoverable),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, or_alternatives=1,
+    )
+    assert state.status is Status.escalated
+    integ = [a for a in state.approaches if a.scope == "integration"]
+    assert [a.outcome for a in integ] == ["abandoned", "exhausted"]
+    assert any("통합 gate" in str(e) and "소진" in str(e) for e in state.pending_escalations)
+    assert_clean(tmp_path)
+
+
+def test_or_alternative_is_decomp_critic_checked(tmp_path):
+    """대안 order는 분해 critic(#40)으로 검증 — 재진술(weak)이면 재생성. (대안의 '진짜 다름' 강제)"""
+    # critic 공유: spec(adequate) → 원본분해 progress → 대안분해 weak→재생성 progress.
+    critic = MockClient([_CRIT_ADEQUATE, _DC_PROGRESS, _DC_WEAK, _DC_PROGRESS])
+    import threading
+    counter = {"n": 0}
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(),
+        gate_factory=_fail_then_pass_gate_factory(threading.Lock(), counter, fail_first=1),
+        critic_client=critic, max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=0, or_alternatives=1,
+    )
+    assert state.status is Status.done
+    # 대안 생성 시 분해 critic이 재진술(weak)을 잡아 재생성한 기록(=대안의 '진짜 다름' 검증).
+    assert any(c.rejected and c.verdict == "weak" for c in state.decomp_critiques)
+    assert any(a.scope == "unit:u1" and a.outcome == "abandoned" for a in state.approaches)
     assert_clean(tmp_path)

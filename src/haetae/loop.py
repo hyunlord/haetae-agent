@@ -34,6 +34,7 @@ from haetae.scaffold import (
 from haetae.models import (
     Action,
     Activity,
+    ApproachAttempt,
     CheckReport,
     Cost,
     DecompCritique,
@@ -65,14 +66,16 @@ STAGE_REPLAN = "replan"
 STAGE_DONE = "done"
 STAGE_ESCALATE = "escalate"
 STAGE_DECOMP_REJECT = "decomp-reject"  # WO#40: 분해 critic이 무진전 work order를 reject→재replan
+STAGE_OR_ALTERNATIVE = "or-alternative"  # WO#41: gate 실패 소진 → 다른 접근으로 백트래킹·재시도
 from haetae.decomp_critic import (
     DEFAULT_DECOMP_CRITIC_PROMPT_PATH,
     build_decomp_feedback,
     critique_decomposition,
     is_weak,
 )
+from haetae.or_node import build_alternative_feedback, summarize_gate_evidence
 from haetae.replan import ReplanError, replan
-from haetae.scheduler import all_done, is_stuck, ready_units
+from haetae.scheduler import all_done, ready_units
 from haetae.skills import Skill, inject_skills, load_skills, match_skills
 from haetae.spec_change import apply_spec_change
 from haetae.spec_critic import synthesize_with_critique
@@ -319,6 +322,7 @@ def run_loop(
     replan_retries: int = 2,
     decomp_critic: bool = True,
     decomp_retries: int = 1,
+    or_alternatives: int = 1,
     prompt_dir: str | Path | None = None,
     state_path: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -607,6 +611,7 @@ def run_loop(
                 if m_critic is not None
                 else (lambda: None)
             ),
+            or_alternatives=or_alternatives,
         )
 
     # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
@@ -863,6 +868,7 @@ def _parallel_loop(
     decomp_retries: int = 1,
     run_decomp_critic: Callable[[NextOrder, str], "DecompCritique | None"] = lambda no, last: None,
     account_decomp_cost: Callable[[], None] = lambda: None,
+    or_alternatives: int = 1,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -884,6 +890,13 @@ def _parallel_loop(
     buf: list[dict] = []  # 결정적 정렬 전 이벤트 수집 버퍼
     # gen_order(main 스레드)가 유닛별 replan(orchestration) 비용을 여기 적립 → 머지 시 귀속.
     orch_cost_of: dict[str, Cost | None] = {}
+    # ── OR-node(WO#41) 봉투 ──────────────────────────────────────────────
+    # alt_count: 유닛별 시도한 대안 수(0=원본만). alt_feedback: 다음 gen_order에 줄
+    # "다른 접근" 지시(bar 불변). last_approach: 유닛별 직전 접근 요약(반복 회피).
+    alt_count: dict[str, int] = {u.unit: 0 for u in spec.decomposition}
+    alt_feedback: dict[str, str] = {}
+    last_approach: dict[str, str] = {}
+    integration_alt = 0  # 통합 gate OR 대안 시도 수(bounded by or_alternatives)
 
     def record(unit: str, goal: str | None, result: str, verdict: Verdict,
                checks: list[CheckReport], cost: Cost | None = None,
@@ -929,14 +942,15 @@ def _parallel_loop(
         # 소진 후에도 weak면 진행(데드락 금지)+기록. critic은 독립 client·스킬 미주입 원본.
         decision = None
         last_err: ReplanError | None = None
-        decomp_feedback: str | None = None
+        # OR 대안(WO#41): 이 유닛에 대기 중인 "다른 접근" 지시가 있으면 첫 replan에 seed.
+        decomp_feedback: str | None = alt_feedback.pop(unit, None)
         for _decomp_attempt in range(decomp_retries + 1):
             decision = None
             feedback: str | None = decomp_feedback
             for attempt in range(replan_retries + 1):
                 if attempt == 0:
                     emit("replan 중…" if decomp_feedback is None
-                         else f"replan(분해 재계획): {_truncate(decomp_feedback)}")
+                         else f"replan(대안/재계획): {_truncate(decomp_feedback)}")
                 else:
                     emit(f"replan 재시도 {attempt}: {_truncate(feedback or 'Decision 검증 실패')}")
                 try:
@@ -986,6 +1000,7 @@ def _parallel_loop(
                     {"reason": "next_order 본문 없음", "unit": unit})
                 return None
             no.unit = unit  # 스케줄러 권위 — 어떤 unit인지는 스케줄러가 정한다
+            last_approach[unit] = no.goal  # OR 접근 추적(다음 실패 시 폐기/대안 피드백에 사용)
             emit(f"작업 실행 중: {unit} — {_truncate(no.goal)}")
             return no
         if action == Action.stop:
@@ -1049,22 +1064,47 @@ def _parallel_loop(
                 persist()
             return
 
-        # gate 실패 → 바운드 재시도(재dispatch) 또는 escalate
-        wm.discard(unit)
+        # gate 실패 → 바운드 *재시도*(같은 접근, 재dispatch). 재시도 소진 후엔 OR 대안.
+        wm.discard(unit)  # 백트래킹: 실패 접근 worktree 정리(#21 보장 cleanup)
         if attempts_of[unit] < unit_retries:
             attempts_of[unit] += 1
             account(event_cost)  # 폐기된 시도 비용도 누적
             emit(f"unit gate 실패({verdict.value}) → 재시도: {unit} ({attempts_of[unit]})")
             _set_plan_state(state, unit, PlanState.pending)
-        else:
-            account(event_cost)
-            record(unit, order.goal, result, verdict, gr.checks,
-                   cost=event_cost, ts=now())
-            _set_plan_state(state, unit, PlanState.failed)
-            terminal = "escalated"
+            return
+        # 재시도 소진 → OR 대안(WO#41): 대안 남으면 *다른 접근*으로 갈아타고 백트래킹·재시도.
+        account(event_cost)
+        evidence = summarize_gate_evidence(gr)  # gate 실패 *증거*(bar 불변 — 기준 약화 아님)
+        if alt_count[unit] < or_alternatives:
+            # 폐기한 접근 기록 + "다른 접근" 피드백(criteria/done_when 불변) → pending 리셋.
+            state.approaches.append(ApproachAttempt(
+                scope=f"unit:{unit}", approach=last_approach.get(unit) or order.goal,
+                outcome="abandoned", evidence=evidence, index=alt_count[unit]))
+            alt_count[unit] += 1
+            alt_feedback[unit] = build_alternative_feedback(
+                last_approach.get(unit) or order.goal, evidence, scope="unit")
+            attempts_of[unit] = 0  # 새 접근엔 재시도 카운터 리셋(worktree는 이미 discard됨)
+            record_transition(STAGE_OR_ALTERNATIVE, unit)
+            emit(f"OR 대안 접근: {unit} (대안 {alt_count[unit]}/{or_alternatives}) — bar 불변")
+            _set_plan_state(state, unit, PlanState.pending)
+            persist()
+            return
+        # 대안 소진(또는 OR OFF) → escalate. OR>0이면 시도 접근 첨부, 0이면 기존 동작(후방호환).
+        record(unit, order.goal, result, verdict, gr.checks, cost=event_cost, ts=now())
+        _set_plan_state(state, unit, PlanState.failed)
+        terminal = "escalated"
+        if or_alternatives > 0:
+            state.approaches.append(ApproachAttempt(
+                scope=f"unit:{unit}", approach=last_approach.get(unit) or order.goal,
+                outcome="exhausted", evidence=evidence, index=alt_count[unit]))
+            tried = [a.model_dump(mode="json") for a in state.approaches if a.scope == f"unit:{unit}"]
+            state.pending_escalations.append(
+                {"reason": f"unit {unit} gate {unit_retries}회 실패 + OR 대안 {or_alternatives} 소진 — escalate",
+                 "unit": unit, "approaches_tried": tried})
+        else:  # OR OFF → 기존 escalate(접근 추적 없음, 후방호환)
             state.pending_escalations.append(
                 {"reason": f"unit {unit} gate {unit_retries}회 실패 — escalate", "unit": unit})
-            persist()
+        persist()
 
     # ── 실행: 모든 경로에서 cleanup_all 보장(try/finally) ─────────────────
     try:
@@ -1097,91 +1137,127 @@ def _parallel_loop(
             try_save()
             return state
 
-        in_flight: set[str] = set()
+        # dispatch 한 라운드(ThreadPoolExecutor)를 함수로 — 통합 OR 재시도 시 재호출한다.
+        # 같은 스케줄러/봉투(state.plan/attempts/alt_*)를 재사용하므로 결정성/격리 불변.
+        def run_round() -> None:
+            nonlocal terminal, total_attempts
+            in_flight: set[str] = set()
+            with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+                futures: dict[Future, tuple[str, NextOrder, Path]] = {}
 
-        with ThreadPoolExecutor(max_workers=max_parallel) as pool:
-            futures: dict[Future, tuple[str, NextOrder, Path]] = {}
+                def dispatch_ready() -> None:
+                    if terminal:
+                        return
+                    for u in ready_units(state.plan, in_flight):
+                        if terminal or len(futures) >= max_parallel:
+                            break
+                        order = gen_order(u)  # main 스레드 — 직렬·결정적
+                        if order is None:  # escalate/stop/replan-소진 → terminal 세팅됨
+                            break
+                        wt = wm.create(u)
+                        # 선제 스캐폴드: executor dispatch *전에* node_modules를 worktree에 준비.
+                        # (gitignore라 git 상속 못 함 → main에서 symlink/copy, 없으면 host-install 폴백.)
+                        if scaffold is not None and scaffold.install and install_deps:
+                            how = prepare_worktree_deps(
+                                wm.workdir, wt,
+                                ensure_deps_fn=lambda p: ensure_deps(p, runner=deps_runner),
+                            )
+                            emit(f"worktree node_modules 준비: {u} ({how})")
+                        _set_plan_state(state, u, PlanState.in_progress)
+                        in_flight.add(u)
+                        # WO#33: dispatch=build 단계 → 라이브 activity + 전이 이력(main 스레드).
+                        activity_start(u, STAGE_BUILD)
+                        record_transition(STAGE_BUILD, u)
+                        # 스킬 주입은 executor로 가는 order에만. gate는 order.unit만 읽으므로
+                        # 증강 order를 _exec_and_gate에 줘도 gate엔 스킬이 새지 않는다(분리 보존).
+                        fut = pool.submit(
+                            _exec_and_gate, executor_factory(wt), gate_factory(wt),
+                            apply_skills(order), spec, pricing)
+                        futures[fut] = (u, order, wt)
 
-            def dispatch_ready() -> None:
-                if terminal:
-                    return
-                for u in ready_units(state.plan, in_flight):
-                    if terminal or len(futures) >= max_parallel:
-                        break
-                    order = gen_order(u)  # main 스레드 — 직렬·결정적
-                    if order is None:  # escalate/stop/replan-소진 → terminal 세팅됨
-                        break
-                    wt = wm.create(u)
-                    # 선제 스캐폴드: executor dispatch *전에* node_modules를 worktree에 준비.
-                    # (gitignore라 git 상속 못 함 → main에서 symlink/copy, 없으면 host-install 폴백.)
-                    if scaffold is not None and scaffold.install and install_deps:
-                        how = prepare_worktree_deps(
-                            wm.workdir, wt,
-                            ensure_deps_fn=lambda p: ensure_deps(p, runner=deps_runner),
-                        )
-                        emit(f"worktree node_modules 준비: {u} ({how})")
-                    _set_plan_state(state, u, PlanState.in_progress)
-                    in_flight.add(u)
-                    # WO#33: dispatch=build 단계 → 라이브 activity + 전이 이력(main 스레드).
-                    activity_start(u, STAGE_BUILD)
-                    record_transition(STAGE_BUILD, u)
-                    # 스킬 주입은 executor로 가는 order에만. gate는 order.unit만 읽으므로
-                    # 증강 order를 _exec_and_gate에 줘도 gate엔 스킬이 새지 않는다(분리 보존).
-                    fut = pool.submit(
-                        _exec_and_gate, executor_factory(wt), gate_factory(wt),
-                        apply_skills(order), spec, pricing)
-                    futures[fut] = (u, order, wt)
-
-            dispatch_ready()
-            while futures and not terminal:
-                done_set, _ = wait(list(futures), return_when=FIRST_COMPLETED)
-                # 완료분을 unit-id 순으로 처리 → 머지 직렬화 + 처리 순서 결정적
-                for fut in sorted(done_set, key=lambda f: futures[f][0]):
-                    unit, order, _wt = futures.pop(fut)
-                    in_flight.discard(unit)
-                    total_attempts += 1
-                    exec_cost: Cost | None = None
-                    try:
-                        result, gr, exec_cost = fut.result()
-                    except Exception as e:  # noqa: BLE001 — executor/gate 예외=그 unit 실패
-                        result = f"(executor/gate 예외: {e})"
-                        gr = GateResult(verdict=Verdict.fail_recoverable)
-                    handle_outcome(unit, order, result, gr, exec_cost)
-                    if total_attempts >= max_iters and not terminal:
-                        terminal = "stuck"
-                if terminal:
-                    break
                 dispatch_ready()
+                while futures and not terminal:
+                    done_set, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+                    # 완료분을 unit-id 순으로 처리 → 머지 직렬화 + 처리 순서 결정적
+                    for fut in sorted(done_set, key=lambda f: futures[f][0]):
+                        unit, order, _wt = futures.pop(fut)
+                        in_flight.discard(unit)
+                        total_attempts += 1
+                        exec_cost: Cost | None = None
+                        try:
+                            result, gr, exec_cost = fut.result()
+                        except Exception as e:  # noqa: BLE001 — executor/gate 예외=그 unit 실패
+                            result = f"(executor/gate 예외: {e})"
+                            gr = GateResult(verdict=Verdict.fail_recoverable)
+                        handle_outcome(unit, order, result, gr, exec_cost)
+                        if total_attempts >= max_iters and not terminal:
+                            terminal = "stuck"
+                    if terminal:
+                        break
+                    dispatch_ready()
 
-        # ── finalize: 통합 gate + 최종 status ────────────────────────────
+        # ── 통합 OR 루프(WO#41): 라운드 완주 → 통합 gate. 실패+대안 남으면 *다른 접근*으로 재라운드. ──
+        # bar 불변: 통합 대안도 같은 criteria/done_when을 둔 채 접근만 바꾼다(같은 독립 gate가 판정).
         integration_ev: Event | None = None
+        while True:
+            run_round()
+            if terminal:  # 유닛-level done(brain stop)/escalate/stuck → 아래 매핑.
+                break
+            if all_done(state.plan):
+                # 통합 gate: 머지된 main에서 spec 체크 1회 → cross-unit 깨짐 포착(판정 로직 불변).
+                emit("통합 gate 검사 중…")
+                record_transition(STAGE_VERIFY, None)
+                igr = integration_gate.judge("(integration — 머지된 main 통합 검사)", spec)
+                emit(_summarize_gate(igr))
+                account(igr.judge_cost)  # 통합 gate judge 비용을 budget에 누적
+                integration_ev = Event(
+                    seq=0, unit=None, work_order_ref="(integration)",
+                    result="통합 gate(머지된 main)", verdict=igr.verdict, checks=igr.checks,
+                    cost=igr.judge_cost, ts=now(), stage=STAGE_VERIFY)
+                if igr.verdict in (Verdict.pass_, Verdict.done):
+                    state.status = Status.done
+                    break
+                # 통합 실패 + 대안 남음 → 영향 유닛을 다른 접근으로 백트래킹·재계획(bounded).
+                if integration_alt < or_alternatives:
+                    evidence = summarize_gate_evidence(igr)
+                    state.approaches.append(ApproachAttempt(
+                        scope="integration", approach=f"통합 접근 {integration_alt}",
+                        outcome="abandoned", evidence=evidence, index=integration_alt))
+                    integration_alt += 1
+                    fb = build_alternative_feedback(None, evidence, scope="integration")
+                    for item in state.plan:  # 백트래킹: 유닛 pending 리셋 + 다른 접근 seed
+                        alt_feedback[item.unit] = fb
+                        attempts_of[item.unit] = 0
+                        _set_plan_state(state, item.unit, PlanState.pending)
+                    record_transition(STAGE_OR_ALTERNATIVE, None)
+                    emit(f"OR 통합 대안 재계획 (대안 {integration_alt}/{or_alternatives}) — bar 불변")
+                    persist()
+                    continue  # 다른 접근으로 재라운드
+                # 통합 대안 소진(또는 OR OFF) → escalate. OR>0이면 접근 첨부, 0이면 기존 동작.
+                state.status = Status.escalated
+                if or_alternatives > 0:
+                    state.approaches.append(ApproachAttempt(
+                        scope="integration", approach=f"통합 접근 {integration_alt}",
+                        outcome="exhausted", evidence=summarize_gate_evidence(igr), index=integration_alt))
+                    tried = [a.model_dump(mode="json") for a in state.approaches if a.scope == "integration"]
+                    state.pending_escalations.append(
+                        {"reason": f"통합 gate 실패 — cross-unit breakage (OR 대안 {or_alternatives} 소진)",
+                         "verdict": igr.verdict.value, "approaches_tried": tried})
+                else:  # OR OFF → 기존 escalate(후방호환)
+                    state.pending_escalations.append(
+                        {"reason": "통합 gate 실패 — cross-unit breakage",
+                         "verdict": igr.verdict.value})
+                break
+            else:  # 라운드 완주했는데 all_done 아님 → 진전 불가(deadlock)
+                state.status = Status.stopped_stuck
+                break
+
+        # 유닛-level terminal을 최종 status로 매핑(통합 분기는 위에서 이미 status 설정).
         if terminal == "escalated":
             state.status = Status.escalated
         elif terminal == "done":  # brain이 stop으로 done_when 충족 선언
             state.status = Status.done
         elif terminal == "stuck":
-            state.status = Status.stopped_stuck
-        elif all_done(state.plan):
-            # 통합 gate: 머지된 main에서 spec 체크 1회 → cross-unit 깨짐 포착
-            emit("통합 gate 검사 중…")
-            record_transition(STAGE_VERIFY, None)
-            igr = integration_gate.judge("(integration — 머지된 main 통합 검사)", spec)
-            emit(_summarize_gate(igr))
-            account(igr.judge_cost)  # 통합 gate judge 비용을 budget에 누적
-            integration_ev = Event(
-                seq=0, unit=None, work_order_ref="(integration)",
-                result="통합 gate(머지된 main)", verdict=igr.verdict, checks=igr.checks,
-                cost=igr.judge_cost, ts=now(), stage=STAGE_VERIFY)
-            if igr.verdict in (Verdict.pass_, Verdict.done):
-                state.status = Status.done
-            else:
-                state.status = Status.escalated
-                state.pending_escalations.append(
-                    {"reason": "통합 gate 실패 — cross-unit breakage",
-                     "verdict": igr.verdict.value})
-        elif is_stuck(state.plan, in_flight):
-            state.status = Status.stopped_stuck
-        else:
             state.status = Status.stopped_stuck
 
         materialize(integration_ev)

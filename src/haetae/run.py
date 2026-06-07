@@ -33,6 +33,7 @@ def run(
     max_iters: int = 30,
     decomp_critic: bool = True,
     decomp_retries: int = 1,
+    or_alternatives: int = 1,
     state_path: str | Path | None = None,
     prompt_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -56,6 +57,7 @@ def run(
         max_iters=max_iters,
         decomp_critic=decomp_critic,
         decomp_retries=decomp_retries,
+        or_alternatives=or_alternatives,
         state_path=state_path,
         prompt_dir=prompt_dir,
         progress=progress,
@@ -159,6 +161,16 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "분해 critic이 weak(무진전) 판정 시 재계획하는 최대 횟수 (기본 1). "
             "소진 후에도 weak면 *진행*(데드락 금지)하고 critique를 state에 기록."
+        ),
+    )
+    parser.add_argument(
+        "--or-alternatives",
+        type=int,
+        default=1,
+        help=(
+            "OR-node 대안(기본 1, Phase D = LEAP AND-OR DAG). gate(유닛/통합)가 정상 재시도까지 "
+            "소진하고도 실패하면 *같은 criteria를 둔 채* 근본적으로 다른 접근으로 갈아타 백트래킹·재시도. "
+            "대안 소진 시 escalate(시도한 접근 첨부). 0이면 기존 동작(즉시 escalate, 후방호환). 병렬(>1) 경로."
         ),
     )
     parser.add_argument(
@@ -316,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         max_iters=args.max_iters,
         decomp_critic=args.decomp_critic,
         decomp_retries=args.decomp_retries,
+        or_alternatives=args.or_alternatives,
         state_path=args.state_path,
         progress=progress,
         max_parallel=args.max_parallel,
