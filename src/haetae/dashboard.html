@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>haetae · state dashboard</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --bd:#2a2f3a; --tx:#e6e9ef; --mut:#9aa3b2;
+    --pend:#6b7280; --prog:#3b82f6; --done:#22c55e; --fail:#ef4444;
+    --pass:#22c55e; --failc:#ef4444; --skip:#6b7280; --accent:#f59e0b;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--tx);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Pretendard,sans-serif; }
+  a { color:var(--prog); }
+  header { display:flex; align-items:center; gap:14px; padding:12px 18px;
+    border-bottom:1px solid var(--bd); position:sticky; top:0; background:var(--bg); z-index:5; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  .pill { padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .s-running{background:#1e3a8a;color:#bfdbfe} .s-done{background:#14532d;color:#bbf7d0}
+  .s-escalated{background:#7c2d12;color:#fed7aa} .s-stopped_budget,.s-stopped_stuck{background:#3f3f46;color:#e4e4e7}
+  .mut { color:var(--mut); }
+  .grid { display:grid; grid-template-columns: 1fr 360px; gap:14px; padding:14px 18px; align-items:start; }
+  @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--bd); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 10px; }
+  .banner { background:#7c2d12; border:1px solid #b45309; color:#fed7aa; padding:10px 14px; border-radius:8px; margin:0 18px 0; }
+  /* DAG */
+  #dagwrap { position:relative; overflow:auto; }
+  #edges { position:absolute; inset:0; pointer-events:none; z-index:0; }
+  .levels { position:relative; z-index:1; display:flex; flex-direction:column; gap:26px; padding:6px 4px; }
+  .level { display:flex; gap:16px; flex-wrap:wrap; }
+  .node { min-width:150px; max-width:230px; background:var(--panel2); border:1.5px solid var(--bd);
+    border-left-width:5px; border-radius:9px; padding:9px 11px; cursor:pointer; transition:.12s; }
+  .node:hover { border-color:var(--prog); transform:translateY(-1px); }
+  .node.sel { outline:2px solid var(--accent); }
+  .node.blocked { box-shadow:0 0 0 1.5px var(--fail) inset; }
+  .node .id { font-weight:700; font-size:13px; }
+  .node .goal { font-size:11.5px; color:var(--mut); margin-top:3px;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden; }
+  .node .st { font-size:10.5px; font-weight:700; text-transform:uppercase; margin-top:5px; letter-spacing:.05em; }
+  .b-pending{border-left-color:var(--pend)} .b-in_progress{border-left-color:var(--prog)}
+  .b-done{border-left-color:var(--done)} .b-failed{border-left-color:var(--fail)}
+  .t-pending{color:var(--pend)} .t-in_progress{color:var(--prog)} .t-done{color:var(--done)} .t-failed{color:var(--fail)}
+  .blk { font-size:11px; color:#fca5a5; margin-top:5px; }
+  /* checks */
+  .chk { border:1px solid var(--bd); border-radius:7px; padding:8px 10px; margin-bottom:8px; background:var(--panel2); }
+  .chk .row { display:flex; align-items:center; gap:8px; }
+  .badge { font-size:10px; font-weight:700; padding:1px 7px; border-radius:5px; text-transform:uppercase; }
+  .ba-pass{background:#14532d;color:#bbf7d0} .ba-fail{background:#7f1d1d;color:#fecaca} .ba-skipped{background:#3f3f46;color:#d4d4d8}
+  .ctype { font-size:11px; color:var(--mut); }
+  code,.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; }
+  .cmd { display:block; color:#cbd5e1; background:#0b0d11; padding:5px 7px; border-radius:5px; margin-top:6px; white-space:pre-wrap; word-break:break-all; }
+  details.ev { margin-top:6px; } details.ev summary { cursor:pointer; font-size:11.5px; color:var(--accent); }
+  details.ev[open] summary { margin-bottom:6px; }
+  pre.trace { background:#0b0d11; border:1px solid var(--bd); border-radius:6px; padding:8px; max-height:280px;
+    overflow:auto; font-size:11px; white-space:pre-wrap; color:#cbd5e1; margin:6px 0 0; }
+  .kv { display:flex; gap:6px; font-size:11.5px; } .kv b{color:var(--mut);font-weight:600}
+  .ev-good{color:var(--done)} .ev-bad{color:var(--fail)}
+  /* timeline */
+  .tl-row { display:flex; gap:10px; align-items:baseline; padding:5px 0; border-bottom:1px solid var(--bd); font-size:12.5px; }
+  .tl-row:last-child{border-bottom:0}
+  .seq { color:var(--mut); font-variant-numeric:tabular-nums; min-width:26px; }
+  .gap { font-size:12px; padding:7px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent); border-radius:6px; margin-bottom:8px; background:var(--panel2); }
+  .empty { color:var(--mut); font-size:12.5px; }
+  #detail .ph { color:var(--mut); font-size:13px; }
+  .small { font-size:11.5px; }
+  .err { background:#7f1d1d; color:#fecaca; padding:14px; border-radius:8px; margin:18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>haetae <span class="mut">· state dashboard</span></h1>
+  <span id="status" class="pill mut">…</span>
+  <span id="specref" class="mut small"></span>
+  <span style="flex:1"></span>
+  <span id="tick" class="mut small">read-only</span>
+</header>
+<div id="banner-slot"></div>
+<div id="root" class="grid">
+  <div id="left">
+    <div class="card"><h2>유닛 DAG</h2><div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div></div>
+    <div class="card"><h2>이벤트 타임라인</h2><div id="timeline"></div></div>
+    <div class="card" id="integration-card" style="display:none"><h2>통합 gate (unit=none)</h2><div id="integration"></div></div>
+  </div>
+  <div id="right">
+    <div class="card"><h2 id="detail-h">상세</h2><div id="detail"><div class="ph">DAG 노드를 클릭하면 work order·gate 체크·실행 증거가 여기에.</div></div></div>
+    <div class="card" id="critique-card" style="display:none"><h2>spec critique</h2><div id="critique"></div></div>
+    <div class="card" id="esc-card" style="display:none"><h2>pending escalations</h2><div id="esc"></div></div>
+  </div>
+</div>
+
+<script>
+const POLL_MS = __POLL_MS__;
+let SEL = null;       // 선택된 유닛 id
+let VIEW = null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => (s==null?"":String(s)).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state", {cache:"no-store"});
+    const v = await r.json();
+    VIEW = v; render(v);
+    $("tick").textContent = "갱신 " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("tick").textContent = "연결 끊김 — 재시도…";
+  }
+}
+
+function render(v) {
+  if (v.error) { document.body.innerHTML = '<div class="err">state 로드 실패: '+esc(v.error)+'</div>'; return; }
+  // status
+  const st = $("status"); st.textContent = v.status; st.className = "pill s-"+v.status;
+  $("specref").textContent = v.spec.spec_ref + " · v" + v.spec.spec_version + (v.spec.goal? " · "+v.spec.goal : "");
+  // banner (escalated)
+  const bs = $("banner-slot");
+  if (v.status==="escalated" || (v.pending_escalations||[]).length) {
+    const e0 = (v.pending_escalations||[])[0] || {};
+    bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
+  } else bs.innerHTML = "";
+  renderDag(v);
+  renderTimeline(v);
+  renderIntegration(v);
+  renderCritique(v);
+  renderEsc(v);
+  if (SEL) renderDetail(SEL);
+}
+
+function renderDag(v) {
+  const wrap = $("levels");
+  const blockedMap = {}; (v.blocking||[]).forEach(b => blockedMap[b.unit]=b.blocked_by);
+  wrap.innerHTML = "";
+  (v.dag.levels||[]).forEach(level => {
+    const row = document.createElement("div"); row.className="level";
+    level.forEach(uid => {
+      const n = v.dag.nodes.find(x=>x.id===uid) || {id:uid,state:"pending",goal:null,deps:[]};
+      const d = document.createElement("div");
+      d.className = "node b-"+n.state + (SEL===uid?" sel":"") + (blockedMap[uid]?" blocked":"");
+      d.dataset.id = uid;
+      const blk = blockedMap[uid] ? '<div class="blk">⛔ blocked by '+esc(blockedMap[uid].join(", "))+'</div>' : "";
+      d.innerHTML = '<div class="id">'+esc(uid)+'</div><div class="goal">'+esc(n.goal||"")+'</div>'
+        + '<div class="st t-'+n.state+'">'+esc(n.state)+'</div>'+blk;
+      d.onclick = () => { SEL=uid; renderDetail(uid); document.querySelectorAll(".node").forEach(x=>x.classList.toggle("sel", x.dataset.id===uid)); };
+      row.appendChild(d);
+    });
+    wrap.appendChild(row);
+  });
+  requestAnimationFrame(()=>drawEdges(v));
+}
+
+function drawEdges(v) {
+  const svg = $("edges"); const wrap = $("dagwrap");
+  const W = wrap.scrollWidth, H = wrap.scrollHeight;
+  svg.setAttribute("width",W); svg.setAttribute("height",H);
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  const base = wrap.getBoundingClientRect();
+  const pos = {};
+  document.querySelectorAll(".node").forEach(el=>{
+    const r = el.getBoundingClientRect();
+    pos[el.dataset.id] = {x:r.left-base.left+wrap.scrollLeft+r.width/2, top:r.top-base.top+wrap.scrollTop, bot:r.top-base.top+wrap.scrollTop+r.height};
+  });
+  let p = "";
+  (v.dag.edges||[]).forEach(e=>{
+    const a=pos[e.from], b=pos[e.to]; if(!a||!b) return;
+    const x1=a.x,y1=a.bot,x2=b.x,y2=b.top, my=(y1+y2)/2;
+    p += `<path d="M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}" fill="none" stroke="#2a2f3a" stroke-width="1.5"/>`;
+  });
+  svg.innerHTML = p;
+}
+
+function checkHtml(c) {
+  const ev = c.run_evidence;
+  let evHtml = "";
+  if (ev) {
+    const ok = ev.booted ? '<span class="ev-good">booted ✓</span>' : '<span class="ev-bad">booted ✗</span>';
+    evHtml = '<details class="ev"><summary>run 증거 ('+(ev.booted?'booted':'not booted')+', exit '+esc(ev.exit_code)+')</summary>'
+      + '<div class="kv"><b>booted</b> '+ok+' &nbsp;<b>exit</b> '+esc(ev.exit_code)+' &nbsp;<b>timeout</b> '+esc(ev.timed_out)+' &nbsp;<b>dur</b> '+esc(ev.duration_s)+'s</div>'
+      + (ev.reason? '<div class="kv"><b>reason</b> '+esc(ev.reason)+'</div>':'')
+      + (ev.trace? '<pre class="trace">'+esc(ev.trace)+'</pre>':'')
+      + (ev.stderr_tail? '<div class="kv small"><b>stderr</b></div><pre class="trace">'+esc(ev.stderr_tail)+'</pre>':'')
+      + '</details>';
+  }
+  return '<div class="chk"><div class="row"><span class="badge ba-'+esc(c.status)+'">'+esc(c.status)+'</span>'
+    + '<span class="mono">'+esc(c.ac_id)+'</span><span class="ctype">'+esc(c.check_type)+(c.exit_code!=null?' · exit '+esc(c.exit_code):'')+'</span></div>'
+    + (c.cmd? '<code class="cmd">'+esc(c.cmd)+'</code>':'')
+    + (c.detail? '<details class="ev"><summary>detail</summary><pre class="trace">'+esc(c.detail)+'</pre></details>':'')
+    + evHtml + '</div>';
+}
+
+function renderDetail(uid) {
+  const u = (VIEW.units||{})[uid];
+  $("detail-h").textContent = "상세 · " + uid;
+  if (!u) { $("detail").innerHTML = '<div class="ph">데이터 없음</div>'; return; }
+  let h = '<div class="kv"><b>state</b> <span class="t-'+u.state+'">'+esc(u.state)+'</span>';
+  if (u.verdict) h += ' &nbsp;<b>verdict</b> '+esc(u.verdict);
+  h += '</div>';
+  if (u.work_order_ref) h += '<p class="small" style="margin:8px 0"><b class="mut">work order</b><br>'+esc(u.work_order_ref)+'</p>';
+  const blk = (VIEW.blocking||[]).find(b=>b.unit===uid);
+  if (blk) h += '<div class="gap" style="border-left-color:var(--fail)">⛔ blocked by <b>'+esc(blk.blocked_by.join(", "))+'</b> (미완료 의존)</div>';
+  h += '<h2 style="margin-top:12px">gate checks ('+u.checks.length+')</h2>';
+  h += u.checks.length ? u.checks.map(checkHtml).join("") : '<div class="empty">체크 없음</div>';
+  $("detail").innerHTML = h;
+}
+
+function renderTimeline(v) {
+  $("timeline").innerHTML = (v.timeline||[]).map(t=>{
+    const vd = t.verdict||"—";
+    const cls = vd==="pass"||vd==="done"?"t-done":(vd&&vd.indexOf("fail")===0?"t-failed":"mut");
+    return '<div class="tl-row"><span class="seq">#'+t.seq+'</span><span class="mono">'+esc(t.unit||"(integration)")+'</span>'
+      + '<span class="'+cls+'">'+esc(vd)+'</span><span class="mut small">'+t.n_checks+' checks</span>'
+      + '<span class="mut small" style="flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.work_order_ref||"")+'</span></div>';
+  }).join("") || '<div class="empty">이벤트 없음</div>';
+}
+
+function renderIntegration(v) {
+  const ints = v.integration||[];
+  $("integration-card").style.display = ints.length? "block":"none";
+  $("integration").innerHTML = ints.map(it=>{
+    const fails = it.checks.filter(c=>c.status==="fail").length;
+    return '<div class="gap" style="border-left-color:'+(fails?'var(--fail)':'var(--done)')+'">'
+      + '<div class="kv"><b>seq</b> #'+it.seq+' &nbsp;<b>verdict</b> '+esc(it.verdict)+' &nbsp;<b>checks</b> '+it.checks.length+' ('+fails+' fail)</div></div>'
+      + it.checks.map(checkHtml).join("");
+  }).join("");
+}
+
+function renderCritique(v) {
+  const c = v.spec_critique;
+  $("critique-card").style.display = c? "block":"none";
+  if (!c) return;
+  let h = '<div class="kv"><b>verdict</b> <span class="'+(c.verdict==="soft"?"t-failed":"t-done")+'">'+esc(c.verdict)+'</span>'
+    + (c.resynthesized? ' &nbsp;<span class="mut small">(재합성됨)</span>':'')+'</div>';
+  if (c.note) h += '<p class="small mut" style="margin:6px 0">'+esc(c.note)+'</p>';
+  h += (c.gaps||[]).map(g=>'<div class="gap"><b>'+esc(g.area)+'</b>'
+    + (g.cheap_path? '<br><span class="mut">cheap:</span> '+esc(g.cheap_path):'')
+    + (g.strengthening? '<br><span class="mut">강화:</span> '+esc(g.strengthening):'')+'</div>').join("");
+  $("critique").innerHTML = h;
+}
+
+function renderEsc(v) {
+  const es = v.pending_escalations||[];
+  $("esc-card").style.display = es.length? "block":"none";
+  $("esc").innerHTML = es.map(e=>'<div class="gap" style="border-left-color:var(--fail)">'
+    + esc(e.question||e.reason||JSON.stringify(e))
+    + (e.why_now? '<br><span class="mut small">왜 지금: '+esc(e.why_now)+'</span>':'')+'</div>').join("");
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
