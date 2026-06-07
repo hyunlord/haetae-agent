@@ -28,6 +28,7 @@ from haetae.judge import (
     LLMJudge,
 )
 from haetae.llm import LLMClient
+from haetae.metering import combine_costs
 from haetae.models import (
     CheckReport,
     CheckType,
@@ -264,7 +265,28 @@ class CompositeGate:
                 )
             )
 
-        return GateResult(verdict=aggregate_verdict(report), checks=report)
+        # WO#34: judge/run-judge LLM 비용 노출(읽기만). judge_client이 MeteredClient면
+        # 이번 judge() 호출에서 쌓인 비용을 드레인해 반환 계약에 동봉한다. 검증 로직과
+        # 무관 — verdict/checks는 위에서 이미 확정됐다. best-effort: 드레인 실패는 흡수.
+        return GateResult(
+            verdict=aggregate_verdict(report),
+            checks=report,
+            judge_cost=self._drain_judge_cost(),
+        )
+
+    def _drain_judge_cost(self):
+        """judge_client(MeteredClient면)에 쌓인 judge/run-judge 비용을 꺼낸다(읽기전용).
+
+        메터링 미적용(drain 없음)/judge 부재면 None. 어떤 예외도 흡수(계측이 gate를
+        죽이지 않는다). 비용 *노출*만 — 검증 행동은 일절 안 건드린다.
+        """
+        try:
+            drain = getattr(self.judge_client, "drain", None)
+            if drain is None:
+                return None
+            return combine_costs(drain())
+        except Exception:  # noqa: BLE001 — best-effort 계측
+            return None
 
     # ── run 타입 라우팅: harness 실행 + (judge | booted degrade) ─────────
     def _judge_run_acs(

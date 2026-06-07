@@ -16,6 +16,7 @@ from haetae.gate import CompositeGate
 from haetae.llm import CodexClient
 from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
+from haetae.metering import MeteredClient
 from haetae.models import State
 
 # 기본 스킬 디렉토리 = 이 repo의 skills/ (src/haetae/run.py → parents[2] = repo 루트).
@@ -211,11 +212,21 @@ def main(argv: list[str] | None = None) -> int:
     pricing = _load_pricing(args.pricing)
 
     client = CodexClient(model=args.model)
+
+    # judge LLM 비용 계측(WO#34): judge client를 passthrough MeteredClient로 감싼다.
+    # complete 결과를 그대로 통과시키므로 gate 검증 *행동*은 불변 — 비용만 기록된다.
+    # gate가 호출마다 이 client를 드레인해 GateResult.judge_cost로 노출하고, 루프가
+    # event.cost/budget에 합산한다. judge_model이 없으면 codex 기본(모델 미상→usd=null).
+    def make_judge_client() -> LLMClient:
+        return MeteredClient(
+            CodexClient(model=args.judge_model), source="judge", pricing=pricing
+        )
+
     # judge는 read-only CodexClient(executor와 다른 --judge-model 가능). judge 타입
     # 기준이 없는 spec(예: palindrome)이면 CompositeGate가 judge를 아예 안 부른다.
     gate = CompositeGate(
         workdir=args.workdir,
-        judge_client=CodexClient(model=args.judge_model),
+        judge_client=make_judge_client(),
         run_timeout=args.run_timeout,
         install_deps=args.install_deps,
         install_timeout=args.install_timeout,
@@ -235,8 +246,9 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt: CodexExecutor(model=args.model, workdir=wt)
         else:
             executor_factory = lambda wt: HumanRelayExecutor()
+        # per-worktree gate도 metered judge client(유닛마다 새 인스턴스 → 스레드 안전).
         gate_factory = lambda wt: CompositeGate(
-            workdir=wt, judge_client=CodexClient(model=args.judge_model),
+            workdir=wt, judge_client=make_judge_client(),
             run_timeout=args.run_timeout,
             install_deps=args.install_deps, install_timeout=args.install_timeout)
 

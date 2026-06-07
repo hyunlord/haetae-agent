@@ -9,7 +9,7 @@ from pathlib import Path
 from haetae.llm import MockClient
 from haetae.loop import MockExecutor, MockGate, run_loop
 from haetae.metering import Usage
-from haetae.models import State, Status, Verdict
+from haetae.models import Cost, GateResult, State, Status, Verdict
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = REPO_ROOT / "prompts"
@@ -165,6 +165,88 @@ def test_non_llm_executor_no_executor_cost():
     assert ev.cost.source == "orchestration"
     assert ev.cost.note is None
     assert ev.cost.tokens == 20  # replan만
+
+
+# ──────────────────────── judge 비용 귀속 (WO#34) ────────────────────────
+
+
+class _JudgeCostGate:
+    """GateResult.judge_cost를 실어 반환하는 gate(WO#34 루프 귀속 검증용)."""
+
+    def __init__(self, verdict, judge_tokens=300):
+        self.verdict = verdict
+        self.judge_tokens = judge_tokens
+
+    def judge(self, result, spec, unit=None):
+        return GateResult(
+            verdict=self.verdict,
+            judge_cost=Cost(tokens=self.judge_tokens, input=self.judge_tokens,
+                            output=0, usd=self.judge_tokens / 1_000_000, source="judge"),
+        )
+
+
+def test_judge_cost_attributed_to_event_and_budget():
+    """gate.judge_cost가 유닛 event.cost에 합산(mixed)되고 budget.spent에 누적된다."""
+    # synth(call#1)=10/10=20, replan(call#2)=20/0=20
+    client = MockClient(
+        [SPEC_YAML, _next_order("u1")], usages=[Usage(10, 10, "m"), Usage(20, 0, "m")]
+    )
+    state = run_loop(
+        "x", client, executor=MockExecutor("a"),
+        gate=_JudgeCostGate(Verdict.done, judge_tokens=300),
+        prompt_dir=PROMPT_DIR, pricing={"m": (1.0, 1.0)},
+    )
+    ev = state.events[0]
+    assert ev.cost.source == "mixed"  # orchestration(replan) + judge
+    assert ev.cost.tokens == 20 + 300  # replan(20) + judge(300)
+    # budget = synth(20) + event(320)
+    assert state.budget.spent.tokens == 20 + 320
+
+
+def test_judge_cost_none_keeps_orchestration_only():
+    """gate가 judge_cost=None(메터링 없는 gate)이면 event는 orchestration만(무크래시)."""
+    client = MockClient(
+        [SPEC_YAML, _next_order("u1")], usages=[Usage(10, 10, "m"), Usage(20, 0, "m")]
+    )
+    state = run_loop(
+        "x", client, executor=MockExecutor("a"), gate=MockGate(Verdict.done),
+        prompt_dir=PROMPT_DIR, pricing={"m": (1.0, 1.0)},
+    )
+    ev = state.events[0]
+    assert ev.cost.source == "orchestration"
+    assert ev.cost.tokens == 20
+
+
+def test_parallel_judge_cost_attributed_in_main(tmp_path):
+    """병렬: per-worktree gate의 judge_cost가 main에서 유닛 event.cost에 합산된다."""
+
+    def make_ex(wt):
+        class E:
+            def __init__(self):
+                self.last_usage = None
+
+            def run(self, order):
+                return f"{order.unit} done"
+
+        return E()
+
+    state = run_loop(
+        "x", _BrainClient(SPEC_YAML), executor=None,
+        gate=_JudgeCostGate(Verdict.pass_, judge_tokens=300),
+        executor_factory=make_ex,
+        gate_factory=lambda wt: _JudgeCostGate(Verdict.pass_, judge_tokens=300),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR, pricing={"m": (1.0, 1.0)},
+    )
+    assert state.status is Status.done
+    unit_events = [e for e in state.events if e.unit in ("u1", "u2")]
+    assert len(unit_events) == 2
+    # 각 유닛 event = replan(orchestration 150) + judge(300) → mixed, tokens>=300
+    for e in unit_events:
+        assert e.cost is not None
+        assert e.cost.source == "mixed"
+        assert e.cost.tokens == 150 + 300
+    # 통합 gate judge 비용도 누적: budget.spent에 judge 토큰이 충분히 반영
+    assert state.budget.spent.tokens >= 2 * (150 + 300)
 
 
 # ──────────────────────────── Part B: 단계 전이 + activity ────────────────────────────

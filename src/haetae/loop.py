@@ -654,8 +654,8 @@ def run_loop(
             verdict = gr.verdict
             emit(_summarize_gate(gr))
             activity_end(no.unit)  # 완료 → 라이브 activity에서 제거
-            # 이 유닛 처리 비용 = replan(orchestration) + executor 귀속.
-            event_cost = combine_costs([replan_cost, exec_cost])
+            # 이 유닛 처리 비용 = replan(orchestration) + executor + judge(gate) 귀속.
+            event_cost = combine_costs([replan_cost, exec_cost, gr.judge_cost])
             account(event_cost)
             state.events.append(
                 Event(
@@ -906,8 +906,9 @@ def _parallel_loop(
         # WO#33: gate 통과=verify 단계 종료 → 전이 이력 + 라이브 activity 제거.
         record_transition(STAGE_VERIFY, unit)
         activity_end(unit)
-        # 이 시도 비용 = replan(orchestration) + executor. 어느 경로든 한 번은 budget 누적.
-        event_cost = combine_costs([orch_cost_of.pop(unit, None), exec_cost])
+        # 이 시도 비용 = replan(orchestration) + executor + judge(per-unit gate).
+        # judge_cost는 worker가 gate에서 받은 GateResult에 실려 main으로 돌아온다(스레드 안전).
+        event_cost = combine_costs([orch_cost_of.pop(unit, None), exec_cost, gr.judge_cost])
         emit(_summarize_gate(gr))
 
         if verdict in (Verdict.pass_, Verdict.done):
@@ -1055,11 +1056,14 @@ def _parallel_loop(
         elif all_done(state.plan):
             # 통합 gate: 머지된 main에서 spec 체크 1회 → cross-unit 깨짐 포착
             emit("통합 gate 검사 중…")
+            record_transition(STAGE_VERIFY, None)
             igr = integration_gate.judge("(integration — 머지된 main 통합 검사)", spec)
             emit(_summarize_gate(igr))
+            account(igr.judge_cost)  # 통합 gate judge 비용을 budget에 누적
             integration_ev = Event(
                 seq=0, unit=None, work_order_ref="(integration)",
-                result="통합 gate(머지된 main)", verdict=igr.verdict, checks=igr.checks)
+                result="통합 gate(머지된 main)", verdict=igr.verdict, checks=igr.checks,
+                cost=igr.judge_cost, ts=now(), stage=STAGE_VERIFY)
             if igr.verdict in (Verdict.pass_, Verdict.done):
                 state.status = Status.done
             else:

@@ -209,23 +209,13 @@ class CheckReport(BaseModel):
     run_evidence: RunEvidence | None = None
 
 
-class GateResult(BaseModel):
-    """gate.judge의 반환 계약 — verdict + 그 근거(per-check 증거).
-
-    근거는 mutable 속성에서 루프가 몰래 꺼내는 게 아니라 반환에 동봉한다.
-    미래의 judge-gate(LLM-as-judge)도 같은 계약(verdict + checks)으로 끼워진다.
-    """
-
-    verdict: Verdict
-    checks: list[CheckReport] = Field(default_factory=list)
-
-
 class Cost(BaseModel):
     """LLM 호출 비용 (WO#33 계측).
 
     tokens: 총 토큰(input+output) — 후방호환 필드(기존 schema/state가 쓰던 int).
     input/output: 토큰 분해(잡히면). usd: 가격표로 계산(모델 미상이면 None — 날조 금지).
-    source: orchestration(합성/replan/critic/scaffold) | executor(codex 서브프로세스) | mixed.
+    source: orchestration(합성/replan/critic/scaffold) | executor(codex 서브프로세스) |
+            judge(gate 내부 judge/run-judge) | mixed.
     note: 못 잡는 비용을 *정직하게* 남기는 메모(예: "executor usage 미노출").
     새 필드는 전부 optional/None 기본 → 기존 Cost(tokens=…, usd=…) 그대로 유효(무회귀).
     """
@@ -236,6 +226,23 @@ class Cost(BaseModel):
     output: int | None = None
     source: str | None = None
     note: str | None = None
+
+
+class GateResult(BaseModel):
+    """gate.judge의 반환 계약 — verdict + 그 근거(per-check 증거).
+
+    근거는 mutable 속성에서 루프가 몰래 꺼내는 게 아니라 반환에 동봉한다.
+    미래의 judge-gate(LLM-as-judge)도 같은 계약(verdict + checks)으로 끼워진다.
+
+    judge_cost(WO#34): 이 gate 호출에서 *judge/run-judge LLM*에 든 비용(계측). gate가
+    자기 judge MeteredClient에서 읽어 반환 계약에 동봉한다(근거와 동일 철학 — mutable
+    속성이 아닌 반환). 메터링 미적용/judge 부재면 None(날조 금지). 루프가 이걸 event.cost에
+    합산하고 budget.spent에 누적한다. **verdict/checks(검증 행동)와 무관 — 비용 노출뿐.**
+    """
+
+    verdict: Verdict
+    checks: list[CheckReport] = Field(default_factory=list)
+    judge_cost: Cost | None = None
 
 
 class Activity(BaseModel):
