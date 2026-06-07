@@ -11,8 +11,9 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from haetae.metering import Usage
 from haetae.models import NextOrder
-from haetae.providers.codex import CodexError, exec_codex
+from haetae.providers.codex import CodexError, exec_codex_with_usage
 
 # 사람이 결과 입력을 끝낼 때 쓰는 센티넬 라인
 SENTINEL = "---END---"
@@ -124,6 +125,8 @@ class CodexExecutor:
         self.workdir = Path(workdir)
         self.timeout = timeout
         self.sandbox = sandbox
+        # 직전 실행의 token usage(WO#33). 미노출/파싱 실패면 None(날조 금지).
+        self.last_usage: Usage | None = None
 
     # ── Executor 인터페이스 ────────────────────────────────────────────
     def run(self, order: NextOrder) -> str:
@@ -133,7 +136,7 @@ class CodexExecutor:
     # ── 테스트 seam: 실제 subprocess 실행은 공유 헬퍼로 격리 ────────────
     def _run(self, prompt: str) -> str:
         try:
-            return exec_codex(
+            text, usage = exec_codex_with_usage(
                 prompt,
                 sandbox=self.sandbox,
                 cwd=str(self.workdir),
@@ -142,3 +145,5 @@ class CodexExecutor:
             )
         except CodexError as e:
             raise CodexExecutorError(str(e)) from e
+        self.last_usage = usage  # 읽기만 — sandbox 권한 불변
+        return text

@@ -4,6 +4,7 @@ complete 레벨은 _run을 가짜로 바꿔 검증하고,
 _run 내부 에러 처리는 모듈의 subprocess.run을 가짜로 바꿔 검증한다.
 """
 
+import json
 import os
 import shutil
 from types import SimpleNamespace
@@ -115,6 +116,85 @@ def test_run_omits_model_flag_when_unset(monkeypatch):
     monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
     CodexClient()._run("prompt")
     assert "-m" not in seen["cmd"]
+
+
+# ──────────────────────── usage 캡처 (WO#33 — 읽기만, sandbox 불변) ────────────────────────
+
+_USAGE_JSONL = "\n".join(
+    [
+        json.dumps({"type": "thread.started", "thread_id": "x"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "4"}}),
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 22370,
+                    "cached_input_tokens": 3456,
+                    "output_tokens": 268,
+                    "reasoning_output_tokens": 261,
+                },
+            }
+        ),
+    ]
+)
+
+
+def test_parse_usage_reads_turn_completed():
+    """codex --json stdout의 turn.completed.usage를 파싱한다."""
+    u = codex_mod._parse_usage(_USAGE_JSONL, model="gpt-test")
+    assert u is not None
+    assert u.input_tokens == 22370
+    assert u.output_tokens == 268
+    assert u.model == "gpt-test"
+
+
+def test_parse_usage_no_usage_returns_none():
+    """usage 라인이 없으면 None(무크래시)."""
+    assert codex_mod._parse_usage("not json\n{}\n", model=None) is None
+    assert codex_mod._parse_usage("", model=None) is None
+
+
+def test_run_passes_json_flag_and_captures_usage(monkeypatch):
+    """_run이 --json을 넘기고, stdout usage를 파싱해 last_usage에 싣는다(읽기만)."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("4")
+        return SimpleNamespace(returncode=0, stdout=_USAGE_JSONL, stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    c = CodexClient(model="gpt-test")
+    assert c._run("prompt") == "4"
+    assert "--json" in seen["cmd"]
+    assert c.last_usage is not None
+    assert c.last_usage.input_tokens == 22370
+    assert c.last_usage.output_tokens == 268
+    assert c.last_usage.model == "gpt-test"
+
+
+def test_run_no_usage_sets_last_usage_none(monkeypatch):
+    """usage 미노출(stdout에 turn.completed 없음) → last_usage=None(날조 안 함)."""
+
+    def fake_run(cmd, **kwargs):
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    c = CodexClient()
+    assert c._run("prompt") == "ok"
+    assert c.last_usage is None
+
+
+def test_allowed_sandboxes_unchanged():
+    """안전 불변(WO#33 SAFETY): danger-full-access는 절대 허용 목록에 없다."""
+    assert codex_mod.ALLOWED_SANDBOXES == ("read-only", "workspace-write")
+    assert "danger-full-access" not in codex_mod.ALLOWED_SANDBOXES
 
 
 # ──────────────────────────── (선택) 실제 codex 통합 ────────────────────────────

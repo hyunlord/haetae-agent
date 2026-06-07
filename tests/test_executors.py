@@ -141,6 +141,44 @@ def test_codexexecutor_omits_model_when_unset(monkeypatch):
     assert "-m" not in seen["cmd"]
 
 
+def test_codexexecutor_captures_usage_into_last_usage(monkeypatch):
+    """WO#33: codex executor도 --json stdout usage를 읽어 last_usage에 싣는다(읽기만)."""
+    import json
+
+    usage_jsonl = json.dumps(
+        {"type": "turn.completed", "usage": {"input_tokens": 5000, "output_tokens": 700}}
+    )
+
+    def fake_run(cmd, **kwargs):
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("구현 완료")
+        return SimpleNamespace(returncode=0, stdout=usage_jsonl, stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    ex = CodexExecutor(model="gpt-test", workdir="/tmp/x")
+    assert ex._run("p") == "구현 완료"
+    assert ex.last_usage is not None
+    assert ex.last_usage.input_tokens == 5000
+    assert ex.last_usage.output_tokens == 700
+    assert ex.last_usage.model == "gpt-test"
+
+
+def test_codexexecutor_no_usage_sets_last_usage_none(monkeypatch):
+    """usage 미노출이면 last_usage=None — 날조하지 않는다."""
+
+    def fake_run(cmd, **kwargs):
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    ex = CodexExecutor(workdir="/tmp/x")
+    ex._run("p")
+    assert ex.last_usage is None
+
+
 def test_codexexecutor_raises_on_nonzero_exit(monkeypatch):
     def fake_run(cmd, **kwargs):
         return SimpleNamespace(returncode=2, stdout="", stderr="boom")

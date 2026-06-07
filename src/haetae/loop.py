@@ -8,6 +8,7 @@ Protocol + mock으로 두고 *오케스트레이션 흐름*만 증명한다.
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
@@ -17,6 +18,12 @@ from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_
 from haetae.deps import Runner as DepsRunner, ensure_deps
 from haetae.intake import SynthesisError, synthesize
 from haetae.llm import LLMClient
+from haetae.metering import (
+    MeteredClient,
+    accumulate,
+    combine_costs,
+    cost_from_usage,
+)
 from haetae.scaffold import (
     Scaffold,
     commit_scaffold,
@@ -26,7 +33,9 @@ from haetae.scaffold import (
 )
 from haetae.models import (
     Action,
+    Activity,
     CheckReport,
+    Cost,
     Event,
     GateResult,
     NextOrder,
@@ -34,10 +43,26 @@ from haetae.models import (
     PlanState,
     ProjectSpec,
     SpecCritique,
+    StageTransition,
     State,
     Status,
     Verdict,
 )
+
+
+def _utcnow_iso() -> str:
+    """현재 UTC를 ISO 8601(초 단위, Z)로. 단계/이벤트 타임스탬프 기본값."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# 단계 이름(WO#33 Part B). 전이 이력/activity/event.stage에 쓰는 canonical 문자열.
+STAGE_SYNTHESIZE = "synthesize"
+STAGE_SCAFFOLD = "scaffold"
+STAGE_BUILD = "build"
+STAGE_VERIFY = "verify"
+STAGE_REPLAN = "replan"
+STAGE_DONE = "done"
+STAGE_ESCALATE = "escalate"
 from haetae.replan import ReplanError, replan
 from haetae.scheduler import all_done, is_stuck, ready_units
 from haetae.skills import Skill, inject_skills, load_skills, match_skills
@@ -170,20 +195,44 @@ def _set_plan_state(state: State, unit: str, plan_state: PlanState) -> None:
             return
 
 
+def _executor_cost(executor: "Executor", pricing) -> Cost | None:
+    """executor의 last_usage를 읽어 executor-source Cost로 변환(읽기만, best-effort).
+
+    - usage 있음 → cost_from_usage(source=executor).
+    - usage-capable인데(last_usage 속성 보유) 값이 None → 정직하게 null+note.
+    - 비-LLM executor(속성 없음, 예: human relay/mock) → None(귀속할 비용 없음).
+    예외는 흡수(None) — 계측이 run을 죽이지 않는다.
+    """
+    try:
+        if not hasattr(executor, "last_usage"):
+            return None
+        usage = getattr(executor, "last_usage", None)
+        if usage is not None:
+            return cost_from_usage(usage, source="executor", pricing=pricing)
+        return Cost(source="executor", note="executor usage 미노출")
+    except Exception:  # noqa: BLE001 — best-effort 계측
+        return None
+
+
 def _exec_and_gate(
-    executor: "Executor", gate: "Gate", order: NextOrder, spec: ProjectSpec
-) -> tuple[str, GateResult]:
+    executor: "Executor", gate: "Gate", order: NextOrder, spec: ProjectSpec,
+    pricing=None,
+) -> tuple[str, GateResult, Cost | None]:
     """ThreadPoolExecutor 워커 — 느린 부분(executor 실행 + unit gate)만 병렬화한다.
 
     brain(work order 생성)과 worktree 생성/머지는 main 스레드에서 직렬·결정적으로
     처리하므로 여기엔 mock 시퀀스 race가 없다. 예외는 fut.result()로 전파된다.
+
+    WO#33: executor 비용은 *그 워커 전용* executor 인스턴스의 last_usage에서 읽으므로
+    스레드 안전(공유 상태 변이 없음)하다. 반환에 동봉해 main 스레드가 이벤트에 귀속한다.
 
     WO#26: per-unit gate는 order.unit으로 호출돼 *그 유닛 태그된 기준만* 검사한다
     (전체-spec 기준은 통합 gate로 연기 → 기반 유닛이 전체-시스템 기준 때문에
     escalate하던 회귀 해소). 통합 gate는 main에서 unit 없이(전체) 호출된다.
     """
     result = executor.run(order)
-    return result, gate.judge(result, spec, unit=order.unit)
+    exec_cost = _executor_cost(executor, pricing)
+    return result, gate.judge(result, spec, unit=order.unit), exec_cost
 
 
 def _save_state(state: State, state_path: str | Path) -> None:
@@ -273,8 +322,23 @@ def run_loop(
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
     skills_dir: str | Path | None = None,
+    pricing: dict | None = None,
+    clock: Callable[[], str] | None = None,
+    activity_observer: Callable[[list["Activity"]], None] | None = None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
+
+    계측(WO#33, best-effort — 계측 실패는 절대 run을 죽이지 않는다):
+      - 토큰/코스트: brain client(합성/replan/critic/scaffold)와 codex executor의
+        token usage를 캡처해 state.budget.spent에 누적하고, 그 유닛 처리에 든 비용을
+        해당 event.cost로 귀속한다(source=orchestration|executor|mixed). usd는
+        pricing(model→단가)으로 계산하되 모델 미상이면 None(날조 금지).
+      - 단계/activity: synthesize/scaffold/build/verify/replan 진입을 state.transitions에
+        타임스탬프와 함께 기록하고, 현재 in-flight 유닛을 state.activity에 라이브로 둔다
+        (dispatch→build, gate→verify, 완료→제거). activity_observer가 주어지면 변화 시
+        스냅샷을 흘려준다(대시보드/테스트용).
+      pricing/clock/activity_observer 기본값은 무해(None) → 기존 동작·테스트 불변.
+      clock: 타임스탬프 생성기(테스트 주입용). 기본 None=실제 UTC ISO.
 
     스킬 주입(WO#32, Phase B): skills_dir가 주어지면 읽기전용 패턴 문서를 로드해
       각 유닛 work order에 *executor 넘기기 직전* 매칭 주입한다(빌더 전용). judge/
@@ -318,6 +382,72 @@ def run_loop(
             _save_state(state, state_path)
         except Exception as e:  # noqa: BLE001 — 저장 실패는 run을 죽이면 안 된다
             emit(f"⚠ state 저장 실패: {state_path} ({e}) — run은 정상 완료됨")
+
+    # ── 계측 헬퍼(WO#33) — 전부 best-effort: 어떤 예외도 run을 죽이지 않는다 ──────
+    def now() -> str | None:
+        try:
+            return clock() if clock is not None else _utcnow_iso()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def account(cost: Cost | None) -> None:
+        """budget.spent에 누적(best-effort)."""
+        try:
+            accumulate(state.budget.spent, cost)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def record_transition(stage: str, unit: str | None = None) -> None:
+        try:
+            state.transitions.append(StageTransition(stage=stage, unit=unit, ts=now()))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def observe_activity() -> None:
+        if activity_observer is None:
+            return
+        try:
+            activity_observer([a.model_copy() for a in state.activity])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def activity_start(unit: str | None, stage: str) -> None:
+        try:
+            state.activity.append(Activity(unit=unit, stage=stage, started_at=now()))
+        except Exception:  # noqa: BLE001
+            pass
+        observe_activity()
+
+    def activity_set_stage(unit: str | None, stage: str) -> None:
+        try:
+            for a in state.activity:
+                if a.unit == unit:
+                    a.stage = stage
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        observe_activity()
+
+    def activity_end(unit: str | None) -> None:
+        try:
+            state.activity = [a for a in state.activity if a.unit != unit]
+        except Exception:  # noqa: BLE001
+            pass
+        observe_activity()
+
+    # brain/critic/scaffold 호출을 metering으로 감싼다(orchestration source). inner의
+    # complete 반환은 그대로 통과하므로 호출부·테스트는 불변. drain()으로 적립분을 꺼낸다.
+    m_client = MeteredClient(client, source="orchestration", pricing=pricing)
+    m_critic = (
+        MeteredClient(critic_client, source="orchestration", pricing=pricing)
+        if critic_client is not None
+        else None
+    )
+    m_scaffold = (
+        MeteredClient(scaffold_client, source="orchestration", pricing=pricing)
+        if scaffold_client is not None
+        else None
+    )
 
     syn_prompt = (
         Path(prompt_dir) / "synthesizer.md" if prompt_dir else intake.DEFAULT_PROMPT_PATH
@@ -364,20 +494,30 @@ def run_loop(
         if critic_client is not None:
             # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
             spec, critique = synthesize_with_critique(
-                order, client, critic_client,
+                order, m_client, m_critic,
                 syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
             )
         else:
-            spec = synthesize(order, client, prompt_path=syn_prompt)
+            spec = synthesize(order, m_client, prompt_path=syn_prompt)
     except SynthesisError as e:
         state = _escalated_no_spec(
             "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
         )
+        record_transition(STAGE_SYNTHESIZE)
+        # 합성 실패라도 거기까지 든 비용은 정직하게 누적(state 생성 후 — budget 존재).
+        account(combine_costs(m_client.drain()))
+        if m_critic is not None:
+            account(combine_costs(m_critic.drain()))
         emit(_final_label(state))
         try_save()
         return state
 
     state = _init_state(spec)
+    record_transition(STAGE_SYNTHESIZE)
+    # 합성/critic(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
+    account(combine_costs(m_client.drain()))
+    if m_critic is not None:
+        account(combine_costs(m_critic.drain()))
     if critique is not None:
         state.spec_critique = critique  # 감사 기록(재합성 발생 여부 포함)
         emit(_critique_label(critique))
@@ -389,7 +529,9 @@ def run_loop(
     scaffold: Scaffold | None = None
     if scaffold_client is not None:
         emit("scaffold 생성 중…")
-        scaffold = generate_scaffold(spec, scaffold_client, prompt_path=scaffold_prompt)
+        record_transition(STAGE_SCAFFOLD)
+        scaffold = generate_scaffold(spec, m_scaffold, prompt_path=scaffold_prompt)
+        account(combine_costs(m_scaffold.drain()))  # scaffold(전역 단계) 비용 누적
         emit(
             f"scaffold: {len(scaffold.files)}개 파일 (install={scaffold.install})"
             if scaffold is not None
@@ -402,7 +544,7 @@ def run_loop(
         return _parallel_loop(
             spec,
             state,
-            client,
+            m_client,
             integration_gate=gate,
             executor_factory=executor_factory or (lambda wt: executor),
             gate_factory=gate_factory or (lambda wt: gate),
@@ -418,6 +560,12 @@ def run_loop(
             install_deps=install_deps,
             deps_runner=deps_runner,
             apply_skills=apply_skills,
+            pricing=pricing,
+            now=now,
+            account=account,
+            record_transition=record_transition,
+            activity_start=activity_start,
+            activity_end=activity_end,
         )
 
     # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
@@ -440,6 +588,7 @@ def run_loop(
         iters += 1
 
         # replan: 비결정적 LLM 출력 → 검증 실패를 흡수(재시도 → 소진 시 escalate).
+        record_transition(STAGE_REPLAN)
         decision = None
         feedback: str | None = None
         last_err: ReplanError | None = None
@@ -453,14 +602,17 @@ def run_loop(
                 )
             try:
                 decision = replan(
-                    spec, state, last_result, client,
+                    spec, state, last_result, m_client,
                     prompt_path=rep_prompt, feedback=feedback,
                 )
                 break
             except ReplanError as e:
                 last_err = e
                 feedback = e.message  # raw는 빼고 검증 메시지만 다시 태운다
+        # 이 iteration의 replan(재시도 포함) orchestration 비용을 꺼낸다.
+        replan_cost = combine_costs(m_client.drain())
         if decision is None:
+            account(replan_cost)  # 실패한 replan도 비용은 정직하게 누적
             state.status = Status.escalated
             state.pending_escalations.append(
                 {
@@ -487,12 +639,24 @@ def run_loop(
                 _advance_done(state, worked_unit)
             _set_plan_state(state, no.unit, PlanState.in_progress)
             worked_unit = no.unit
+            # WO#33: dispatch=build 단계 진입 → 라이브 activity + 전이 이력.
+            activity_start(no.unit, STAGE_BUILD)
+            record_transition(STAGE_BUILD, no.unit)
             emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
+            try_save()  # 증분: in-flight activity가 대시보드 폴링에 보이도록
             result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
+            exec_cost = _executor_cost(executor, pricing)  # 읽기만(best-effort)
+            # WO#33: gate 진입=verify 단계로 갱신.
+            activity_set_stage(no.unit, STAGE_VERIFY)
+            record_transition(STAGE_VERIFY, no.unit)
             emit("gate 검사 중…")
             gr = gate.judge(result, spec)
             verdict = gr.verdict
             emit(_summarize_gate(gr))
+            activity_end(no.unit)  # 완료 → 라이브 activity에서 제거
+            # 이 유닛 처리 비용 = replan(orchestration) + executor 귀속.
+            event_cost = combine_costs([replan_cost, exec_cost])
+            account(event_cost)
             state.events.append(
                 Event(
                     seq=len(state.events) + 1,
@@ -501,6 +665,9 @@ def run_loop(
                     result=result,
                     verdict=verdict,
                     checks=gr.checks,
+                    cost=event_cost,
+                    ts=now(),
+                    stage=STAGE_BUILD,
                 )
             )
             try_save()  # 증분: 매 이벤트마다 감사 로그 보존(비치명적)
@@ -509,9 +676,13 @@ def run_loop(
                 state.status = Status.done
 
         elif action == Action.stop:
+            account(replan_cost)  # event 없는 종료 — replan 비용은 budget에만
+            record_transition(STAGE_DONE)
             state.status = Status.done
 
         elif action == Action.escalate:
+            account(replan_cost)
+            record_transition(STAGE_ESCALATE, worked_unit)
             state.status = Status.escalated
             # WO#25 Part A: brain이 작업 중이던 유닛을 포기(escalate) → 그 유닛 failed.
             if worked_unit is not None:
@@ -522,6 +693,7 @@ def run_loop(
                 )
 
         elif action == Action.replan_approach:
+            account(replan_cost)
             # executor 호출 없이 다음 루프 — 다음 replan이 계획을 다시 짠다.
             last_result = "(approach reset — 이전 접근 폐기, 재계획 요청됨)"
 
@@ -537,6 +709,7 @@ def run_loop(
                 break
             outcome = apply_spec_change(spec, state, proposal)
             if outcome.applied:
+                account(replan_cost)
                 # 감사 이벤트만 남기고 루프 계속 — 다음 replan이 갱신된 spec을 본다.
                 state.events.append(
                     Event(
@@ -544,17 +717,22 @@ def run_loop(
                         verdict=decision.verdict,
                         result=f"spec-change applied: {outcome.reason}",
                         learnings=outcome.reason,
+                        cost=replan_cost,
+                        ts=now(),
+                        stage=STAGE_REPLAN,
                     )
                 )
                 emit(f"spec 변경 적용: {proposal.target} (v{spec.version})")
                 try_save()  # 증분: spec 변경도 즉시 보존(비치명적)
                 last_result = f"(spec-change applied — {outcome.reason})"
             else:
+                account(replan_cost)
                 state.status = Status.escalated
                 state.pending_escalations.append(outcome.note)
                 emit(f"spec 변경 escalate: {_truncate(outcome.reason)}")
 
         else:  # 방어: 미지원 action
+            account(replan_cost)
             state.status = Status.escalated
             state.pending_escalations.append({"reason": f"미지원 action: {action.value}"})
 
@@ -598,6 +776,12 @@ def _parallel_loop(
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
     apply_skills: Callable[[NextOrder], NextOrder] = lambda o: o,
+    pricing: dict | None = None,
+    now: Callable[[], str | None] = lambda: None,
+    account: Callable[[Cost | None], None] = lambda c: None,
+    record_transition: Callable[[str, str | None], None] = lambda s, u=None: None,
+    activity_start: Callable[[str | None, str], None] = lambda u, s: None,
+    activity_end: Callable[[str | None], None] = lambda u: None,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -617,12 +801,16 @@ def _parallel_loop(
     total_attempts = 0
     attempts_of: dict[str, int] = {u.unit: 0 for u in spec.decomposition}
     buf: list[dict] = []  # 결정적 정렬 전 이벤트 수집 버퍼
+    # gen_order(main 스레드)가 유닛별 replan(orchestration) 비용을 여기 적립 → 머지 시 귀속.
+    orch_cost_of: dict[str, Cost | None] = {}
 
     def record(unit: str, goal: str | None, result: str, verdict: Verdict,
-               checks: list[CheckReport]) -> None:
+               checks: list[CheckReport], cost: Cost | None = None,
+               ts: str | None = None) -> None:
         buf.append({
             "unit": unit, "attempt": attempts_of.get(unit, 0), "goal": goal,
             "result": result, "verdict": verdict, "checks": list(checks),
+            "cost": cost, "ts": ts,
         })
 
     def materialize(integration_ev: Event | None = None) -> None:
@@ -632,6 +820,7 @@ def _parallel_loop(
             evs.append(Event(
                 seq=i, unit=e["unit"], work_order_ref=e["goal"],
                 result=e["result"], verdict=e["verdict"], checks=e["checks"],
+                cost=e.get("cost"), ts=e.get("ts"), stage=STAGE_BUILD,
             ))
         if integration_ev is not None:
             integration_ev.seq = len(evs) + 1
@@ -649,6 +838,7 @@ def _parallel_loop(
         escalate/stop/replan-소진은 terminal을 세팅하고 None을 반환(이 unit 미dispatch).
         """
         nonlocal terminal, last_result
+        record_transition(STAGE_REPLAN, unit)
         ctx = (
             f"스케줄러가 unit '{unit}'를 ready로 선택했다(deps 충족). "
             f"이 unit의 work order만 생성하라(action=next_order, unit={unit}).\n"
@@ -667,7 +857,10 @@ def _parallel_loop(
             except ReplanError as e:
                 last_err = e
                 feedback = e.message
+        # 이 unit replan(재시도 포함) orchestration 비용 적립(머지 시 event에 귀속).
+        orch_cost_of[unit] = combine_costs(client.drain())
         if decision is None:
+            account(orch_cost_of.pop(unit, None))  # event 없음 → budget에만
             terminal = "escalated"
             state.pending_escalations.append({
                 "reason": f"unit {unit} replan {replan_retries + 1}회 검증 실패",
@@ -679,6 +872,7 @@ def _parallel_loop(
         if action in (Action.next_order, Action.retry):
             no = decision.next_order
             if no is None:
+                account(orch_cost_of.pop(unit, None))
                 terminal = "escalated"
                 state.pending_escalations.append(
                     {"reason": "next_order 본문 없음", "unit": unit})
@@ -687,30 +881,41 @@ def _parallel_loop(
             emit(f"작업 실행 중: {unit} — {_truncate(no.goal)}")
             return no
         if action == Action.stop:
+            account(orch_cost_of.pop(unit, None))
             terminal = "done"
             return None
         if action == Action.escalate:
+            account(orch_cost_of.pop(unit, None))
             terminal = "escalated"
             if decision.escalation is not None:
                 state.pending_escalations.append(
                     decision.escalation.model_dump(by_alias=True, mode="json"))
             return None
         # parallel v1 바운드: 똑똑한 in-flight replan/spec-change 저글링은 안 한다
+        account(orch_cost_of.pop(unit, None))
         terminal = "escalated"
         state.pending_escalations.append(
             {"reason": f"parallel v1 미지원 action: {action.value}", "unit": unit})
         return None
 
-    def handle_outcome(unit: str, order: NextOrder, result: str, gr: GateResult) -> None:
+    def handle_outcome(unit: str, order: NextOrder, result: str, gr: GateResult,
+                       exec_cost: Cost | None = None) -> None:
         """unit gate 결과를 처리: 성공→머지, 충돌/실패→바운드 재dispatch 또는 escalate."""
         nonlocal terminal, last_result
         verdict = gr.verdict
+        # WO#33: gate 통과=verify 단계 종료 → 전이 이력 + 라이브 activity 제거.
+        record_transition(STAGE_VERIFY, unit)
+        activity_end(unit)
+        # 이 시도 비용 = replan(orchestration) + executor. 어느 경로든 한 번은 budget 누적.
+        event_cost = combine_costs([orch_cost_of.pop(unit, None), exec_cost])
         emit(_summarize_gate(gr))
 
         if verdict in (Verdict.pass_, Verdict.done):
             outcome = wm.merge(unit)
             if outcome == "ok":
-                record(unit, order.goal, result, verdict, gr.checks)
+                account(event_cost)
+                record(unit, order.goal, result, verdict, gr.checks,
+                       cost=event_cost, ts=now())
                 _set_plan_state(state, unit, PlanState.done)
                 wm.cleanup(unit)
                 last_result = f"unit={unit} verdict={verdict.value} merged"
@@ -720,10 +925,13 @@ def _parallel_loop(
             wm.discard(unit)
             if attempts_of[unit] < unit_retries:
                 attempts_of[unit] += 1
+                account(event_cost)  # 폐기된 시도도 비용은 정직하게 budget에 누적
                 emit(f"머지 충돌 → 직렬화 재dispatch: {unit} (재시도 {attempts_of[unit]})")
                 _set_plan_state(state, unit, PlanState.pending)
             else:
-                record(unit, order.goal, result, Verdict.fail_replan, gr.checks)
+                account(event_cost)
+                record(unit, order.goal, result, Verdict.fail_replan, gr.checks,
+                       cost=event_cost, ts=now())
                 _set_plan_state(state, unit, PlanState.failed)
                 terminal = "escalated"
                 state.pending_escalations.append(
@@ -736,10 +944,13 @@ def _parallel_loop(
         wm.discard(unit)
         if attempts_of[unit] < unit_retries:
             attempts_of[unit] += 1
+            account(event_cost)  # 폐기된 시도 비용도 누적
             emit(f"unit gate 실패({verdict.value}) → 재시도: {unit} ({attempts_of[unit]})")
             _set_plan_state(state, unit, PlanState.pending)
         else:
-            record(unit, order.goal, result, verdict, gr.checks)
+            account(event_cost)
+            record(unit, order.goal, result, verdict, gr.checks,
+                   cost=event_cost, ts=now())
             _set_plan_state(state, unit, PlanState.failed)
             terminal = "escalated"
             state.pending_escalations.append(
@@ -802,11 +1013,14 @@ def _parallel_loop(
                         emit(f"worktree node_modules 준비: {u} ({how})")
                     _set_plan_state(state, u, PlanState.in_progress)
                     in_flight.add(u)
+                    # WO#33: dispatch=build 단계 → 라이브 activity + 전이 이력(main 스레드).
+                    activity_start(u, STAGE_BUILD)
+                    record_transition(STAGE_BUILD, u)
                     # 스킬 주입은 executor로 가는 order에만. gate는 order.unit만 읽으므로
                     # 증강 order를 _exec_and_gate에 줘도 gate엔 스킬이 새지 않는다(분리 보존).
                     fut = pool.submit(
                         _exec_and_gate, executor_factory(wt), gate_factory(wt),
-                        apply_skills(order), spec)
+                        apply_skills(order), spec, pricing)
                     futures[fut] = (u, order, wt)
 
             dispatch_ready()
@@ -817,12 +1031,13 @@ def _parallel_loop(
                     unit, order, _wt = futures.pop(fut)
                     in_flight.discard(unit)
                     total_attempts += 1
+                    exec_cost: Cost | None = None
                     try:
-                        result, gr = fut.result()
+                        result, gr, exec_cost = fut.result()
                     except Exception as e:  # noqa: BLE001 — executor/gate 예외=그 unit 실패
                         result = f"(executor/gate 예외: {e})"
                         gr = GateResult(verdict=Verdict.fail_recoverable)
-                    handle_outcome(unit, order, result, gr)
+                    handle_outcome(unit, order, result, gr, exec_cost)
                     if total_attempts >= max_iters and not terminal:
                         terminal = "stuck"
                 if terminal:

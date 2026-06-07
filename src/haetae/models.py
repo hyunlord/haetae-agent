@@ -221,8 +221,45 @@ class GateResult(BaseModel):
 
 
 class Cost(BaseModel):
+    """LLM 호출 비용 (WO#33 계측).
+
+    tokens: 총 토큰(input+output) — 후방호환 필드(기존 schema/state가 쓰던 int).
+    input/output: 토큰 분해(잡히면). usd: 가격표로 계산(모델 미상이면 None — 날조 금지).
+    source: orchestration(합성/replan/critic/scaffold) | executor(codex 서브프로세스) | mixed.
+    note: 못 잡는 비용을 *정직하게* 남기는 메모(예: "executor usage 미노출").
+    새 필드는 전부 optional/None 기본 → 기존 Cost(tokens=…, usd=…) 그대로 유효(무회귀).
+    """
+
     tokens: int | None = None
     usd: float | None = None
+    input: int | None = None
+    output: int | None = None
+    source: str | None = None
+    note: str | None = None
+
+
+class Activity(BaseModel):
+    """현재 in-flight 유닛의 라이브 스냅샷 (WO#33 Part B — 대시보드 폴링용).
+
+    dispatch 시 stage=build로 추가, gate 진입 시 stage=verify로 갱신, 완료 시 제거.
+    병렬이면 동시에 여러 개. started_at은 단계 진입 타임스탬프(ISO; 못 잡으면 None).
+    """
+
+    unit: str | None = None
+    stage: str
+    started_at: str | None = None
+
+
+class StageTransition(BaseModel):
+    """단계 전이 이력 한 항목 (WO#33 Part B — 타임라인용).
+
+    각 단계 진입을 (stage, unit, ts)로 append-only 기록한다. 대시보드가
+    "합성→코딩→검증→재계획" 흐름을 시간순으로 그린다. best-effort(기록 실패 흡수).
+    """
+
+    stage: str
+    unit: str | None = None
+    ts: str | None = None
 
 
 class Event(BaseModel):
@@ -235,6 +272,7 @@ class Event(BaseModel):
     learnings: str | None = None
     cost: Cost | None = None
     ts: str | None = None
+    stage: str | None = None
 
 
 class SpecChange(BaseModel):
@@ -298,6 +336,10 @@ class State(BaseModel):
     pending_escalations: list[Any] = Field(default_factory=list)
     # synthesize 직후 적대적 critic이 남긴 비평(opt-in; critic OFF면 None).
     spec_critique: SpecCritique | None = None
+    # 현재 in-flight 유닛 라이브 스냅샷(WO#33 Part B). 완료 시 비워진다.
+    activity: list[Activity] = Field(default_factory=list)
+    # 단계 전이 이력(WO#33 Part B) — append-only 타임라인.
+    transitions: list[StageTransition] = Field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "State":

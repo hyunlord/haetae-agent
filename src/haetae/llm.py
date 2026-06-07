@@ -28,9 +28,13 @@ class MockClient:
     responses: 단일 문자열이면 매 호출 같은 값을 반환,
                리스트면 호출마다 다음 항목을 반환(소진 시 예외).
     호출 인자(system/user/opts)는 `calls`에 기록되어 검증에 쓸 수 있다.
+
+    usages(WO#33 계측 테스트용): 호출마다 노출할 token usage 리스트(선택). 주어지면
+      complete 호출 후 self.last_usage에 (호출 순서대로, 소진 시 마지막을 반복) 싣는다.
+      기본 None → last_usage는 계속 None(usage 미노출 — 기존 동작 불변).
     """
 
-    def __init__(self, responses: list[str] | str):
+    def __init__(self, responses: list[str] | str, usages: list | None = None):
         if isinstance(responses, str):
             self._responses = [responses]
             self._cycle_single = True
@@ -39,9 +43,15 @@ class MockClient:
             self._cycle_single = False
         self._index = 0
         self.calls: list[dict] = []
+        self._usages = list(usages) if usages is not None else None
+        # 직전 호출의 token usage(WO#33). usages 미주입이면 항상 None.
+        self.last_usage = None
 
     def complete(self, system: str, user: str, **opts) -> str:
         self.calls.append({"system": system, "user": user, "opts": opts})
+        if self._usages is not None:
+            idx = min(len(self.calls) - 1, len(self._usages) - 1)
+            self.last_usage = self._usages[idx]
         if self._cycle_single:
             return self._responses[0]
         if self._index >= len(self._responses):

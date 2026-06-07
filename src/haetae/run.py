@@ -41,6 +41,7 @@ def run(
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
     skills_dir: str | Path | None = None,
+    pricing: dict | None = None,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -61,7 +62,30 @@ def run(
         scaffold_client=scaffold_client,
         install_deps=install_deps,
         skills_dir=skills_dir,
+        pricing=pricing,
     )
+
+
+def _load_pricing(path: str | None) -> dict | None:
+    """가격표 JSON을 best-effort 로드: {model: [input_per_mtok, output_per_mtok]}.
+
+    경로 없음 → None(usd 미계산). 로드/형식 실패도 None(계측이 run을 막지 않는다).
+    값은 (input, output) 튜플로 정규화한다.
+    """
+    if not path:
+        return None
+    try:
+        import json
+
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        out: dict[str, tuple[float, float]] = {}
+        for model, rate in raw.items():
+            if isinstance(rate, (list, tuple)) and len(rate) == 2:
+                out[model] = (float(rate[0]), float(rate[1]))
+        return out or None
+    except Exception as e:  # noqa: BLE001 — 가격표 로드 실패는 계측만 비활성(run 진행)
+        print(f"… 가격표 로드 실패({path}): {e} — usd 미계산으로 진행", file=sys.stderr)
+        return None
 
 
 def format_summary(state: State) -> str:
@@ -174,7 +198,17 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="스킬 주입 on/off (기본 on). --no-skills로 끄면 주입 없음(기존 동작 불변).",
     )
+    parser.add_argument(
+        "--pricing",
+        default=None,
+        help=(
+            "코스트 계측용 가격표 JSON 경로 (model → [input_$/Mtok, output_$/Mtok]). "
+            "주면 usd를 계산, 없으면 모델 미상 → usd=null(토큰만 기록). best-effort 로드."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    pricing = _load_pricing(args.pricing)
 
     client = CodexClient(model=args.model)
     # judge는 read-only CodexClient(executor와 다른 --judge-model 가능). judge 타입
@@ -239,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         scaffold_client=scaffold_client,
         install_deps=args.install_deps,
         skills_dir=skills_dir,
+        pricing=pricing,
     )
     print(format_summary(state))
     return 0
