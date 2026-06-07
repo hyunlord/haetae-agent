@@ -109,7 +109,40 @@
   .empty { color:var(--mut); font-size:12.5px; }
   #detail .ph { color:var(--mut); font-size:13px; }
   .small { font-size:11.5px; }
-  .err { background:#7f1d1d; color:#fecaca; padding:14px; border-radius:8px; margin:18px; }
+  .err { background:#7f1d1d; color:#fecaca; padding:14px; border-radius:8px; margin:14px 0; }
+  /* 제어 표면: runs 목록 + 실행 폼 (WO#37) */
+  .runs-card { border-color:#2c3550; }
+  .runs-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .runs-head h2 { margin:0; }
+  .runs-head .sp { flex:1; }
+  .btn { font:inherit; font-size:12px; font-weight:600; padding:5px 11px; border-radius:7px;
+    border:1px solid var(--bd); background:var(--panel2); color:var(--tx); cursor:pointer; }
+  .btn:hover { border-color:var(--prog); }
+  .btn.primary { background:#1d4ed8; border-color:#1d4ed8; color:#fff; }
+  .btn.danger { background:#7f1d1d; border-color:#b91c1c; color:#fecaca; }
+  .btn.danger:hover { background:#991b1b; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .runs-list { display:flex; flex-direction:column; gap:6px; max-height:260px; overflow:auto; }
+  .run-row { display:flex; align-items:center; gap:10px; padding:7px 10px; border:1px solid var(--bd);
+    border-radius:8px; background:var(--panel2); cursor:pointer; }
+  .run-row:hover { border-color:var(--prog); }
+  .run-row.sel { outline:2px solid var(--accent); }
+  .run-row .rid { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; font-weight:700; }
+  .run-row .rorder { color:var(--mut); font-size:11.5px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rbadge { font-size:10px; font-weight:700; padding:1px 8px; border-radius:999px; text-transform:uppercase; letter-spacing:.04em; }
+  .r-running{background:#1e3a8a;color:#bfdbfe} .r-finished{background:#14532d;color:#bbf7d0}
+  .r-stopped{background:#3f3f46;color:#e4e4e7} .r-failed{background:#7f1d1d;color:#fecaca} .r-unknown{background:#451a03;color:#fed7aa}
+  .run-form { border:1px solid var(--bd); border-radius:8px; padding:12px; margin-bottom:12px; background:var(--panel2); }
+  .run-form textarea { width:100%; min-height:64px; resize:vertical; background:#0b0d11; color:var(--tx);
+    border:1px solid var(--bd); border-radius:7px; padding:8px; font:inherit; font-size:12.5px; }
+  .opts { display:flex; flex-wrap:wrap; gap:10px 16px; margin:10px 0; align-items:center; }
+  .opt { display:flex; align-items:center; gap:5px; font-size:12px; }
+  .opt label { color:var(--mut); }
+  .opt input[type=number], .opt input[type=text], .opt select { background:#0b0d11; color:var(--tx);
+    border:1px solid var(--bd); border-radius:6px; padding:3px 6px; font:inherit; font-size:12px; }
+  .opt input[type=number] { width:64px; } .opt input[type=text] { width:130px; }
+  .form-err { color:#fca5a5; font-size:12px; margin-top:6px; }
+  .ctl-off { color:var(--mut); font-size:12px; }
 </style>
 </head>
 <body>
@@ -122,6 +155,34 @@
   <span id="tick" class="mut small"></span>
 </header>
 <div id="banner-slot"></div>
+<div id="runs-card" class="card runs-card" style="display:none; margin:14px 18px 0;">
+  <div class="runs-head">
+    <h2>runs</h2>
+    <span id="ctl-state" class="ctl-off"></span>
+    <span class="sp"></span>
+    <button id="new-run-btn" class="btn primary" style="display:none">+ 새 run</button>
+  </div>
+  <div id="run-form" class="run-form" style="display:none">
+    <textarea id="f-order" placeholder="work order / 주문 원문 (예: '리테일 흐름 시뮬레이션을 만들어라 …')"></textarea>
+    <div class="opts">
+      <span class="opt"><label>executor</label>
+        <select id="f-executor"><option value="codex" selected>codex</option><option value="human">human</option></select></span>
+      <span class="opt"><label>max-parallel</label><input id="f-max-parallel" type="number" min="1" max="16" value="4"></span>
+      <span class="opt"><label>run-timeout</label><input id="f-run-timeout" type="number" min="1" max="3600" value="120"></span>
+      <span class="opt"><label>max-iters</label><input id="f-max-iters" type="number" min="1" max="200" value="30"></span>
+      <span class="opt"><label>unit-retries</label><input id="f-unit-retries" type="number" min="0" max="10" value="2"></span>
+      <span class="opt"><label>critic-model</label><input id="f-critic-model" type="text" placeholder="(옵션)"></span>
+      <span class="opt"><input id="f-scaffold" type="checkbox" checked><label>scaffold</label></span>
+      <span class="opt"><input id="f-skills" type="checkbox" checked><label>skills</label></span>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button id="launch-btn" class="btn primary">▶ 실행 (launch)</button>
+      <button id="cancel-form-btn" class="btn">취소</button>
+      <span id="form-err" class="form-err"></span>
+    </div>
+  </div>
+  <div id="runs-list" class="runs-list"></div>
+</div>
 <div id="root" class="grid">
   <div id="left">
     <div class="card act-card"><h2>현재 활동 (라이브)</h2><div id="activity"></div></div>
@@ -140,8 +201,11 @@
 
 <script>
 const POLL_MS = __POLL_MS__;
+const ALLOW_RUN = __ALLOW_RUN__;   // 제어 표면 활성 여부(--allow-run). off면 폼/stop 숨김.
 let SEL = null;       // 선택된 유닛 id
+let RUN = null;       // 뷰어가 타겟팅하는 run id (null = 기본 --state-path 뷰)
 let VIEW = null;
+let es = null;        // 현재 EventSource(타겟 바뀌면 재연결)
 let sseConnected = false;
 let lastMsg = 0;
 const $ = (id) => document.getElementById(id);
@@ -154,13 +218,15 @@ function setLive(state, txt){
   const el=$("live"); el.className=state; $("live-tx").textContent=txt;
 }
 
-// ── 라이브: SSE 우선, 폴링 폴백 ──
+// ── 라이브: SSE 우선, 폴링 폴백 (RUN 타겟이 있으면 ?run=<id>) ──
+const runQS = () => (RUN ? "?run="+encodeURIComponent(RUN) : "");
 function applyView(v){ VIEW=v; render(v); lastMsg=Date.now(); $("tick").textContent="갱신 "+new Date().toLocaleTimeString(); }
 
 function startSSE(){
+  if (es) { try{ es.close(); }catch(_){} es=null; }
   if (!window.EventSource) { setLive("polling","폴링(SSE 미지원)"); return; }
   try {
-    const es = new EventSource("/api/stream");
+    es = new EventSource("/api/stream"+runQS());
     es.onopen = ()=>{ sseConnected=true; setLive("live","라이브 (SSE)"); };
     es.onmessage = (e)=>{ sseConnected=true; setLive("live","라이브 (SSE)"); try{ applyView(JSON.parse(e.data)); }catch(_){} };
     es.onerror = ()=>{ sseConnected=false; setLive("reconnecting","재연결 중…"); }; // EventSource가 자동 재연결
@@ -171,7 +237,7 @@ async function pollOnce(){
   // SSE가 살아 최근 수신했으면 폴백은 쉰다(중복 방지). 끊기면 폴백이 채운다.
   if (sseConnected && (Date.now()-lastMsg) < POLL_MS*3) return;
   try {
-    const r = await fetch("/api/state", {cache:"no-store"});
+    const r = await fetch("/api/state"+runQS(), {cache:"no-store"});
     applyView(await r.json());
     if (!sseConnected) setLive("polling","폴링(폴백)");
   } catch(e) {
@@ -179,8 +245,99 @@ async function pollOnce(){
   }
 }
 
+// ── 제어 표면: runs 목록 / 실행 폼 / stop ──
+function clearViewer(){
+  ["activity","levels","transitions","timeline","integration","cost","critique","esc"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
+}
+function selectRun(id){
+  RUN = id; SEL = null; VIEW = null;
+  document.querySelectorAll(".run-row").forEach(x=>x.classList.toggle("sel", x.dataset.id===id));
+  $("ctl-state").textContent = id ? ("보는 중: "+id) : "";
+  startSSE(); pollOnce();
+}
+const RSTAT_KO = {running:"도는 중", finished:"완료", stopped:"정지됨", failed:"실패", unknown:"미상"};
+function renderRuns(payload){
+  const runs = (payload && payload.runs) || [];
+  const card = $("runs-card");
+  // 제어 ON이거나 run이 하나라도 있으면 카드 표시(클래식 단일 state 뷰는 깔끔히 숨김).
+  if (!ALLOW_RUN && runs.length===0) { card.style.display="none"; return; }
+  card.style.display = "block";
+  $("new-run-btn").style.display = ALLOW_RUN ? "inline-block" : "none";
+  $("ctl-state").textContent = ALLOW_RUN
+    ? ($("ctl-state").textContent || "제어 활성")
+    : "제어 비활성 (--allow-run으로 켜기)";
+  const list = $("runs-list");
+  list.innerHTML = runs.length ? runs.map(r=>{
+    const st = r.status||"unknown";
+    const canStop = ALLOW_RUN && st==="running";
+    return '<div class="run-row'+(RUN===r.id?" sel":"")+'" data-id="'+esc(r.id)+'">'
+      + '<span class="rid">'+esc(r.id)+'</span>'
+      + '<span class="rbadge r-'+esc(st)+'">'+esc(RSTAT_KO[st]||st)+'</span>'
+      + '<span class="rorder">'+esc(r.order||"")+'</span>'
+      + (canStop ? '<button class="btn danger stop-btn" data-id="'+esc(r.id)+'">정지</button>' : '')
+      + '</div>';
+  }).join("") : '<div class="empty">아직 run 없음'+(ALLOW_RUN?' — "+ 새 run"으로 시작':'')+'</div>';
+  list.querySelectorAll(".run-row").forEach(row=>{
+    row.onclick = (e)=>{ if (e.target.classList.contains("stop-btn")) return; selectRun(row.dataset.id); };
+  });
+  list.querySelectorAll(".stop-btn").forEach(b=>{
+    b.onclick = (e)=>{ e.stopPropagation(); stopRun(b.dataset.id, b); };
+  });
+}
+async function loadRuns(){
+  try {
+    const r = await fetch("/api/runs", {cache:"no-store"});
+    renderRuns(await r.json());
+  } catch(_) { /* runs 로드 실패는 조용히(뷰어는 계속) */ }
+}
+async function stopRun(id, btn){
+  if (btn){ btn.disabled=true; btn.textContent="정지 중…"; }
+  try {
+    await fetch("/api/run/"+encodeURIComponent(id)+"/stop", {method:"POST"});
+  } catch(_){}
+  loadRuns();
+}
+function showForm(show){
+  $("run-form").style.display = show ? "block" : "none";
+  $("new-run-btn").style.display = (ALLOW_RUN && !show) ? "inline-block" : "none";
+}
+async function launchRun(){
+  const order = $("f-order").value.trim();
+  const errEl = $("form-err"); errEl.textContent="";
+  if (!order){ errEl.textContent="order를 입력하세요."; return; }
+  const cm = $("f-critic-model").value.trim();
+  const options = {
+    executor: $("f-executor").value,
+    max_parallel: parseInt($("f-max-parallel").value,10),
+    run_timeout: parseFloat($("f-run-timeout").value),
+    max_iters: parseInt($("f-max-iters").value,10),
+    unit_retries: parseInt($("f-unit-retries").value,10),
+    scaffold: $("f-scaffold").checked,
+    skills: $("f-skills").checked,
+  };
+  if (cm) options.critic_model = cm;
+  const btn = $("launch-btn"); btn.disabled=true; btn.textContent="실행 중…";
+  try {
+    const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({order, options})});
+    const data = await r.json();
+    if (!r.ok){ errEl.textContent = (data && data.error) || ("실패 ("+r.status+")"); return; }
+    showForm(false); $("f-order").value="";
+    await loadRuns();
+    selectRun(data.run_id);   // 새 run 뷰로 자동 전환(SSE 라이브)
+  } catch(e){ errEl.textContent = "요청 실패: "+e; }
+  finally { btn.disabled=false; btn.textContent="▶ 실행 (launch)"; }
+}
+
 function render(v) {
-  if (v.error) { document.body.innerHTML = '<div class="err">state 로드 실패: '+esc(v.error)+'</div>'; return; }
+  if (v.error) {
+    // body를 통째로 갈아엎지 않는다(runs 목록/폼 유지) — 뷰어 영역에만 에러 표시.
+    $("banner-slot").innerHTML = '<div class="err">state 로드 실패: '+esc(v.error)
+      + (RUN? '' : ' — 왼쪽에서 run을 고르거나 --state-path로 띄우세요.')+'</div>';
+    $("status").textContent = "—"; $("status").className = "pill mut";
+    clearViewer();
+    return;
+  }
   const st = $("status"); st.textContent = v.status; st.className = "pill s-"+v.status;
   $("specref").textContent = v.spec.spec_ref + " · v" + v.spec.spec_version + (v.spec.goal? " · "+v.spec.goal : "");
   const bs = $("banner-slot");
@@ -392,11 +549,18 @@ function renderEsc(v) {
     + (e.why_now? '<br><span class="mut small">왜 지금: '+esc(e.why_now)+'</span>':'')+'</div>').join("");
 }
 
+// 제어 표면 이벤트 배선(폼 토글 / launch / stop은 위임으로).
+$("new-run-btn").onclick = ()=>showForm(true);
+$("cancel-form-btn").onclick = ()=>{ showForm(false); $("form-err").textContent=""; };
+$("launch-btn").onclick = launchRun;
+
 // 부팅: 즉시 1회 폴링(첫 페인트) → SSE 구독 → 폴링 폴백 인터벌(SSE 살면 자동 휴면).
 setLive("reconnecting","연결 중…");
 pollOnce();
 startSSE();
+loadRuns();
 setInterval(pollOnce, POLL_MS);
+setInterval(loadRuns, Math.max(2000, POLL_MS));   // runs 상태 배지 주기 갱신
 // 경과시간이 SSE 갱신 사이에도 흐르게 보이도록 활동 패널만 1s마다 다시 그림.
 setInterval(()=>{ if (VIEW && !VIEW.error) renderActivity(VIEW); }, 1000);
 </script>

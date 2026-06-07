@@ -20,7 +20,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import signal
+import subprocess
+import sys
+import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,7 +34,9 @@ from typing import Any
 
 from haetae.models import ProjectSpec, State
 
-# 엔진 모듈을 절대 import하지 않는다(WO#28 불변식). models만 의존.
+# 엔진 모듈을 절대 import하지 않는다(WO#28/#37 불변식). models만 의존.
+# 제어 표면(launch/stop)은 엔진을 *import해 돌리지 않고* `python -m haetae.run`을
+# 별도 서브프로세스로 spawn할 뿐 — 런처는 stdlib(subprocess/signal/os)만 쓴다.
 
 _DETAIL_CAP = 1500  # CheckReport.detail 요약 상한
 _TRACE_CAP = 2000  # run_evidence.trace/stderr 표면화 상한
@@ -377,27 +385,371 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
         return {"error": f"view build failed: {type(e).__name__}: {e}"}
 
 
+# ──────────────────── 제어 표면: 실행 레지스트리 + 서브프로세스 (WO#37) ────────────────────
+#
+# 안전 설계(위반 금지):
+#   - 엔진 격리: loop/gate/executor를 import해 직접 돌리지 않고 `python -m haetae.run`을
+#     별도 프로세스로 spawn할 뿐. 런처는 stdlib subprocess/signal/os만 쓴다.
+#   - 제어 opt-in: allow_run일 때만 launch/stop. 기본은 read-only(엔진 무변).
+#   - shell 금지: argv 리스트로 spawn(shell=True·문자열 보간 금지). order는 단일 argv 원소.
+#   - 옵션 화이트리스트: 정해진 옵션·범위만. 미지 플래그·임의 값 거부.
+#   - 경로 서버 생성: runs/<run-id>/ 아래를 서버가 만든다(사용자 입력 경로 안 받음). run-id는
+#     서버 생성(타임스탬프+슬러그), 읽을 때 패턴 검증(`../` 등 거부 → traversal 차단).
+
+_RUNS_DIR_DEFAULT = "runs"
+_STOP_GRACE_S = 5.0  # SIGINT 후 정리 대기. 초과 시 SIGTERM→SIGKILL 에스컬레이트(best-effort).
+_EXECUTOR_CHOICES = ("codex", "human")
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+_CRITIC_MODEL_RE = re.compile(r"[A-Za-z0-9._\-]+\Z")
+
+
+def valid_run_id(run_id: str | None) -> bool:
+    """run-id가 안전한 단일 경로 세그먼트인지(traversal 차단). `../`·`/`·빈값·선행점 거부."""
+    if not run_id or ".." in run_id or "/" in run_id or "\\" in run_id:
+        return False
+    return bool(_RUN_ID_RE.match(run_id))
+
+
+def _slugify(text: str, max_len: int = 24) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", (text or "").lower())
+    slug = "-".join(words)[:max_len].strip("-")
+    return slug or "run"
+
+
+def generate_run_id(order: str, *, now: datetime | None = None) -> str:
+    """타임스탬프+슬러그로 서버가 run-id 생성(결정론·사람이 읽기 쉬움)."""
+    now = now or datetime.now(timezone.utc)
+    return f"{now.strftime('%Y%m%d-%H%M%S')}-{_slugify(order)}"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """런치 옵션을 화이트리스트/범위로 검증·정규화. 미지 키·범위 밖·타입 불일치는 ValueError.
+
+    POST /api/run은 RCE 표면이므로 *정해진 옵션·범위만* 통과시킨다(임의 플래그 차단).
+    `ALLOWED_SANDBOXES`/executor sandbox는 이 레이어가 건드리지 않는다 — 같은 엔진을 spawn할 뿐.
+    """
+    raw = raw or {}
+    allowed = {
+        "executor", "max_parallel", "run_timeout", "scaffold", "skills",
+        "critic_model", "max_iters", "unit_retries",
+    }
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"unknown option(s): {', '.join(sorted(unknown))}")
+
+    def _int(name: str, default: int, lo: int, hi: int) -> int:
+        v = raw.get(name, default)
+        if isinstance(v, bool):  # bool은 int subclass — 옵션 오용 방지
+            raise ValueError(f"{name} must be an integer")
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer")
+        if not (lo <= iv <= hi):
+            raise ValueError(f"{name} out of range [{lo}, {hi}]")
+        return iv
+
+    def _bool(name: str, default: bool) -> bool:
+        v = raw.get(name, default)
+        if not isinstance(v, bool):
+            raise ValueError(f"{name} must be a boolean")
+        return v
+
+    executor = raw.get("executor", "codex")
+    if executor not in _EXECUTOR_CHOICES:
+        raise ValueError(f"executor must be one of {_EXECUTOR_CHOICES}")
+
+    rt = raw.get("run_timeout", 120.0)
+    if isinstance(rt, bool):
+        raise ValueError("run_timeout must be a number")
+    try:
+        run_timeout = float(rt)
+    except (TypeError, ValueError):
+        raise ValueError("run_timeout must be a number")
+    if not (1.0 <= run_timeout <= 3600.0):
+        raise ValueError("run_timeout out of range [1, 3600]")
+
+    critic_model = raw.get("critic_model")
+    if critic_model is not None:
+        if not isinstance(critic_model, str):
+            raise ValueError("critic_model must be a string")
+        critic_model = critic_model.strip() or None
+        if critic_model and not _CRITIC_MODEL_RE.match(critic_model):
+            raise ValueError("critic_model has invalid characters")
+
+    return {
+        "executor": executor,
+        "max_parallel": _int("max_parallel", 4, 1, 16),
+        "run_timeout": run_timeout,
+        "scaffold": _bool("scaffold", True),
+        "skills": _bool("skills", True),
+        "critic_model": critic_model,
+        "max_iters": _int("max_iters", 30, 1, 200),
+        "unit_retries": _int("unit_retries", 2, 0, 10),
+    }
+
+
+def build_run_argv(order: str, run_dir: Path, opts: dict[str, Any]) -> list[str]:
+    """서브프로세스 argv 리스트 — shell 아님, order는 단일 argv 원소, 경로는 서버 생성.
+
+    workdir/state-path를 runs/<id>/ 아래로 강제(사용자 입력 경로 안 받음 → traversal 차단).
+    """
+    argv = [
+        sys.executable, "-m", "haetae.run",
+        "--order", order,
+        "--workdir", str(run_dir / "work"),
+        "--state-path", str(run_dir / "state.yaml"),
+        "--executor", opts["executor"],
+        "--max-parallel", str(opts["max_parallel"]),
+        "--run-timeout", str(opts["run_timeout"]),
+        "--max-iters", str(opts["max_iters"]),
+        "--unit-retries", str(opts["unit_retries"]),
+    ]
+    argv.append("--scaffold" if opts["scaffold"] else "--no-scaffold")
+    argv.append("--skills" if opts["skills"] else "--no-skills")
+    if opts["critic_model"]:
+        argv += ["--critic-model", opts["critic_model"]]
+    return argv
+
+
+class RunManager:
+    """런 레지스트리 + 서브프로세스 런처/스토퍼 (엔진 격리 — subprocess만).
+
+    엔진(loop/gate/executor)을 import하지 않고 `python -m haetae.run`을 *별도 프로세스*로
+    spawn한다. 제어(launch/stop)는 allow_run일 때만; 읽기(list/state 타겟팅)는 항상.
+    상태는 라이브로 lazily 해석(popen.poll) — 백그라운드 스레드 없이도 정직.
+    """
+
+    def __init__(
+        self,
+        runs_dir: str | Path = _RUNS_DIR_DEFAULT,
+        *,
+        allow_run: bool = False,
+        stop_grace_s: float = _STOP_GRACE_S,
+    ) -> None:
+        self.runs_dir = Path(runs_dir).resolve()
+        self.allow_run = allow_run
+        self.stop_grace_s = stop_grace_s
+        self._runs: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    # ── 경로 헬퍼 ──
+    def run_dir(self, run_id: str) -> Path:
+        return self.runs_dir / run_id
+
+    def state_path_for(self, run_id: str) -> Path | None:
+        """뷰어 타겟팅: ?run=<id> → runs/<id>/state.yaml. 패턴 검증 실패는 None."""
+        if not valid_run_id(run_id):
+            return None
+        return self.run_dir(run_id) / "state.yaml"
+
+    # ── meta 영속 ──
+    @staticmethod
+    def _meta_path(run_dir: Path) -> Path:
+        return run_dir / "meta.json"
+
+    def _write_meta(self, run_dir: Path, meta: dict[str, Any]) -> None:
+        try:
+            self._meta_path(run_dir).write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass  # 영속 실패가 런을 막지 않는다
+
+    def _read_meta(self, run_dir: Path) -> dict[str, Any] | None:
+        try:
+            return json.loads(self._meta_path(run_dir).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _close_log(rec: dict[str, Any]) -> None:
+        logf = rec.get("logf")
+        if logf is not None:
+            try:
+                logf.close()
+            except OSError:
+                pass
+            rec["logf"] = None
+
+    # ── launch ──
+    def _unique_run_id(self, order: str) -> str:
+        base = generate_run_id(order)
+        run_id = base
+        n = 2
+        while self.run_dir(run_id).exists() or run_id in self._runs:
+            run_id = f"{base}-{n}"
+            n += 1
+        return run_id
+
+    def launch(self, order: str | None, options: dict[str, Any] | None = None) -> str:
+        """입력 검증 → run-id 생성 → runs/<id>/ 생성 → spawn. run-id 반환.
+
+        order는 단일 argv 원소로 전달(shell 보간 없음). 옵션은 화이트리스트 통과만.
+        """
+        if not order or not isinstance(order, str) or not order.strip():
+            raise ValueError("order must be a non-empty string")
+        opts = validate_options(options)
+        run_id = self._unique_run_id(order)
+        rdir = self.run_dir(run_id)
+        (rdir / "work").mkdir(parents=True, exist_ok=True)
+        argv = build_run_argv(order, rdir, opts)
+        # stdout/stderr → runs/<id>/run.log (장수명 핸들 — 런 동안 유지, 종료 시 close).
+        logf = open(rdir / "run.log", "wb")  # noqa: SIM115
+        try:
+            # argv 리스트 spawn(shell 아님). cwd 상속 — 경로는 모두 절대(runs_dir.resolve()).
+            popen = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT)  # noqa: S603
+        except Exception:
+            logf.close()
+            raise
+        started_at = _now_iso()
+        meta = {
+            "id": run_id, "order": order, "options": opts,
+            "started_at": started_at, "status": "running", "argv": argv,
+        }
+        self._write_meta(rdir, meta)
+        with self._lock:
+            self._runs[run_id] = {
+                "popen": popen, "pid": getattr(popen, "pid", None), "status": "running",
+                "started_at": started_at, "order": order, "options": opts,
+                "state_path": str(rdir / "state.yaml"), "logf": logf,
+            }
+        return run_id
+
+    # ── stop ──
+    def stop(self, run_id: str) -> bool:
+        """SIGINT 먼저(루프 try/finally 정리가 Ctrl-C처럼 돌 기회) → grace 후 에스컬레이트.
+
+        best-effort: hard-kill 시 worktree 잔존 가능(#21 정리는 인터럽트에 best-effort).
+        """
+        with self._lock:
+            rec = self._runs.get(run_id)
+        if rec is None:
+            return False  # 이 대시보드가 관리하지 않는(또는 재시작으로 핸들 잃은) 런
+        popen = rec["popen"]
+        try:
+            popen.send_signal(signal.SIGINT)  # ① SIGINT
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            popen.wait(timeout=self.stop_grace_s)
+        except subprocess.TimeoutExpired:
+            try:
+                popen.terminate()  # ② SIGTERM
+                popen.wait(timeout=self.stop_grace_s)
+            except subprocess.TimeoutExpired:
+                try:
+                    popen.kill()  # ③ SIGKILL
+                except OSError:
+                    pass
+            except OSError:
+                pass
+        except OSError:
+            pass
+        rec["status"] = "stopped"
+        self._close_log(rec)
+        self._persist_status(run_id, "stopped")
+        return True
+
+    # ── 상태 해석 ──
+    def _persist_status(self, run_id: str, status: str) -> None:
+        rdir = self.run_dir(run_id)
+        meta = self._read_meta(rdir)
+        if meta is not None and meta.get("status") != status:
+            meta["status"] = status
+            self._write_meta(rdir, meta)
+
+    def _live_status(self, run_id: str, rec: dict[str, Any]) -> str:
+        if rec["status"] == "stopped":
+            return "stopped"
+        try:
+            code = rec["popen"].poll()
+        except OSError:
+            return "unknown"
+        if code is None:
+            return "running"
+        terminal = "finished" if code == 0 else "failed"
+        rec["status"] = terminal
+        self._close_log(rec)
+        self._persist_status(run_id, terminal)
+        return terminal
+
+    def status_of(self, run_id: str, meta: dict[str, Any] | None = None) -> str:
+        """라이브 핸들이 있으면 poll로 해석; 없고 meta가 running이면 '미상'(정직)."""
+        with self._lock:
+            rec = self._runs.get(run_id)
+        if rec is not None:
+            return self._live_status(run_id, rec)
+        if meta is None:
+            meta = self._read_meta(self.run_dir(run_id)) or {}
+        st = meta.get("status")
+        if st in (None, "running"):
+            return "unknown"  # 핸들 잃음(대시보드 재시작 등) → 상태 미상으로 정직 표기
+        return st
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        """runs/ 디스크에서 meta.json 읽어 목록+상태. 읽기 — allow_run 불필요."""
+        out: list[dict[str, Any]] = []
+        if not self.runs_dir.exists():
+            return out
+        try:
+            entries = list(self.runs_dir.iterdir())
+        except OSError:
+            return out
+        for d in entries:
+            try:
+                if not d.is_dir() or not valid_run_id(d.name):
+                    continue
+            except OSError:
+                continue
+            meta = self._read_meta(d)
+            if meta is None:
+                continue
+            out.append({
+                "id": meta.get("id", d.name),
+                "order": meta.get("order"),
+                "options": meta.get("options"),
+                "started_at": meta.get("started_at"),
+                "status": self.status_of(d.name, meta),
+            })
+        out.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+        return out
+
+
 # ──────────────────────────── 얇은 stdlib 서버 ────────────────────────────
 
 
-def _index_html(poll_ms: int) -> bytes:
+def _index_html(poll_ms: int, allow_run: bool = False) -> bytes:
     try:
         html = INDEX_HTML_PATH.read_text(encoding="utf-8")
     except OSError:
         html = "<!doctype html><meta charset=utf-8><p>dashboard.html 없음</p>"
-    return html.replace("__POLL_MS__", str(poll_ms)).encode("utf-8")
+    return (
+        html.replace("__POLL_MS__", str(poll_ms))
+        .replace("__ALLOW_RUN__", "true" if allow_run else "false")
+        .encode("utf-8")
+    )
 
 
 def make_handler(
-    state_path: str | Path,
+    state_path: str | Path | None,
     spec_path: str | Path | None,
     poll_ms: int,
     stream_interval: float = 1.0,
+    run_manager: RunManager | None = None,
 ) -> type[BaseHTTPRequestHandler]:
-    def _view_payload() -> bytes:
-        return json.dumps(
-            load_view(state_path, spec_path), ensure_ascii=False, default=str
-        ).encode("utf-8")
+    allow_run = bool(run_manager and run_manager.allow_run)
+
+    def _view_payload(sp: str | Path | None, spec: str | Path | None) -> bytes:
+        if sp is None:
+            view: dict[str, Any] = {"error": "no state-path (use ?run=<id> or --state-path)"}
+        else:
+            view = load_view(sp, spec)
+        return json.dumps(view, ensure_ascii=False, default=str).encode("utf-8")
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def _send(self, code: int, body: bytes, ctype: str) -> None:
@@ -407,7 +759,26 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
-        def _stream(self) -> None:
+        def _send_json(self, code: int, obj: Any) -> None:
+            self._send(
+                code,
+                json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"),
+                "application/json; charset=utf-8",
+            )
+
+        def _resolve_target(self) -> tuple[str | Path | None, str | Path | None]:
+            """?run=<id> → runs/<id>/state.yaml(타겟팅, spec 보강 없음); 없으면 기본 --state-path.
+
+            run-id 패턴 검증 실패는 (None, None) → {error} view(traversal 차단).
+            """
+            query = urllib.parse.urlsplit(self.path).query
+            run = (urllib.parse.parse_qs(query).get("run") or [None])[0]
+            if run:
+                sp = run_manager.state_path_for(run) if run_manager else None
+                return (sp, None)
+            return (state_path, spec_path)
+
+        def _stream(self, sp: str | Path | None, spec: str | Path | None) -> None:
             """SSE: state.yaml mtime을 폴링해 변경 시 새 view를 push(라이브).
 
             ThreadingHTTPServer가 요청마다 (daemon) 스레드를 주므로 장수명 응답이 가능.
@@ -426,12 +797,12 @@ def make_handler(
             try:
                 while True:
                     try:
-                        sig = os.path.getmtime(state_path)
+                        sig = os.path.getmtime(sp) if sp is not None else None
                     except OSError:
                         sig = None  # 파일 부재 → load_view가 {error}를 내고 그대로 push
                     if sig != last_sig:
                         last_sig = sig
-                        self.wfile.write(b"data: " + _view_payload() + b"\n\n")
+                        self.wfile.write(b"data: " + _view_payload(sp, spec) + b"\n\n")
                         self.wfile.flush()
                         idle = 0
                     else:
@@ -444,16 +815,80 @@ def make_handler(
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return  # 클라이언트 끊김 — 조용히 종료
 
+        def _read_json_body(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                length = 0
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length)
+            obj = json.loads(raw.decode("utf-8"))
+            return obj if isinstance(obj, dict) else {}
+
         def do_GET(self) -> None:  # noqa: N802 — http.server 계약
-            path = self.path.split("?", 1)[0]
+            path = urllib.parse.urlsplit(self.path).path
             if path == "/api/state":
-                self._send(200, _view_payload(), "application/json; charset=utf-8")
+                sp, spec = self._resolve_target()
+                self._send(200, _view_payload(sp, spec), "application/json; charset=utf-8")
             elif path == "/api/stream":
-                self._stream()
+                sp, spec = self._resolve_target()
+                self._stream(sp, spec)
+            elif path == "/api/runs":
+                runs = run_manager.list_runs() if run_manager else []
+                self._send_json(200, {"runs": runs, "allow_run": allow_run})
             elif path == "/":
-                self._send(200, _index_html(poll_ms), "text/html; charset=utf-8")
+                self._send(200, _index_html(poll_ms, allow_run), "text/html; charset=utf-8")
             else:
                 self._send(404, b'{"error":"not found"}', "application/json; charset=utf-8")
+
+        def do_POST(self) -> None:  # noqa: N802 — http.server 계약
+            path = urllib.parse.urlsplit(self.path).path
+            if path == "/api/run":
+                self._handle_launch()
+            elif path.startswith("/api/run/") and path.endswith("/stop"):
+                self._handle_stop(path[len("/api/run/"):-len("/stop")])
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        def _handle_launch(self) -> None:
+            # 제어 opt-in: --allow-run 없으면 read-only 디폴트 유지(403).
+            if run_manager is None or not run_manager.allow_run:
+                self._send_json(
+                    403, {"error": "control disabled — start with --allow-run (read-only by default)"}
+                )
+                return
+            try:
+                body = self._read_json_body()
+            except (ValueError, OSError):
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            try:
+                run_id = run_manager.launch(body.get("order"), body.get("options"))
+            except ValueError as e:
+                self._send_json(400, {"error": str(e)})  # 화이트리스트/범위/빈 order 거부
+                return
+            except Exception as e:  # noqa: BLE001 — spawn 실패도 흡수(서버 안 죽음)
+                self._send_json(500, {"error": f"launch failed: {type(e).__name__}: {e}"})
+                return
+            self._send_json(200, {"run_id": run_id})
+
+        def _handle_stop(self, run_id: str) -> None:
+            if run_manager is None or not run_manager.allow_run:
+                self._send_json(403, {"error": "control disabled — start with --allow-run"})
+                return
+            if not valid_run_id(run_id):
+                self._send_json(400, {"error": "invalid run id"})
+                return
+            try:
+                ok = run_manager.stop(run_id)
+            except Exception as e:  # noqa: BLE001
+                self._send_json(500, {"error": f"stop failed: {type(e).__name__}: {e}"})
+                return
+            if not ok:
+                self._send_json(404, {"error": "run not found or not managed by this dashboard"})
+                return
+            self._send_json(200, {"run_id": run_id, "status": "stopped"})
 
         def log_message(self, *args: Any) -> None:  # 조용히(접속 로그 억제)
             return
@@ -462,20 +897,33 @@ def make_handler(
 
 
 def serve(
-    state_path: str | Path,
+    state_path: str | Path | None = None,
     *,
     spec_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     poll_interval: float = 2.0,
     stream_interval: float = 1.0,
+    allow_run: bool = False,
+    runs_dir: str | Path = _RUNS_DIR_DEFAULT,
 ) -> None:
+    run_manager = RunManager(runs_dir, allow_run=allow_run)
     handler = make_handler(
-        state_path, spec_path, int(poll_interval * 1000), stream_interval=stream_interval
+        state_path, spec_path, int(poll_interval * 1000),
+        stream_interval=stream_interval, run_manager=run_manager,
     )
     httpd = ThreadingHTTPServer((host, port), handler)  # localhost 바인드
-    print(f"haetae dashboard → http://{host}:{port}  (state: {state_path}, SSE {stream_interval}s)")
-    print("read-only · live(SSE) · Ctrl-C 종료")
+    print(
+        f"haetae dashboard → http://{host}:{port}  (SSE {stream_interval}s, runs: {run_manager.runs_dir})",
+        flush=True,
+    )
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # launch는 RCE 표면 — 공개 노출 금지(WO#37 안전 설계).
+        print("⚠ 경고: localhost가 아닌 호스트에 바인드됨. launch는 RCE 표면이다 — 공개 호스팅 금지.", flush=True)
+    if allow_run:
+        print("⚠ 제어 활성(--allow-run): 웹 폼으로 run 띄움/정지 가능. localhost 전용 유지 권장.", flush=True)
+    else:
+        print("read-only(기본) · live(SSE) — 제어 비활성. 켜려면 --allow-run. Ctrl-C 종료", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -484,9 +932,13 @@ def serve(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="haetae.dashboard", description="state.yaml read-only 웹 대시보드 (Phase A)"
+        prog="haetae.dashboard",
+        description="state.yaml 웹 대시보드 (read-only 기본; --allow-run으로 launch/stop 제어)",
     )
-    parser.add_argument("--state-path", required=True, help="State YAML 경로")
+    parser.add_argument(
+        "--state-path", default=None,
+        help="기본 뷰 State YAML 경로(레거시/외부 run). 제어 모드에선 생략 가능(?run=<id>로 타겟)",
+    )
     parser.add_argument("--spec-path", default=None, help="ProjectSpec YAML(옵션 · goal/desc 보강)")
     parser.add_argument("--host", default="127.0.0.1", help="바인드 호스트(기본 localhost)")
     parser.add_argument("--port", type=int, default=8000, help="포트(기본 8000)")
@@ -497,6 +949,17 @@ def main(argv: list[str] | None = None) -> int:
         "--stream-interval", type=float, default=1.0,
         help="SSE 서버측 state.yaml mtime 폴링 간격 초(기본 1, 라이브 갱신 주기)",
     )
+    parser.add_argument(
+        "--allow-run", action="store_true",
+        help=(
+            "제어 표면 활성: 웹 폼으로 `python -m haetae.run`을 서브프로세스로 launch/stop. "
+            "기본 off=read-only(launch/stop 403, 엔진 무변). localhost 전용 — 공개 노출 금지."
+        ),
+    )
+    parser.add_argument(
+        "--runs-dir", default=_RUNS_DIR_DEFAULT,
+        help="런 산출물 디렉토리(runs/<id>/work·state.yaml·run.log·meta.json). 기본 runs/",
+    )
     args = parser.parse_args(argv)
     serve(
         args.state_path,
@@ -505,6 +968,8 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         poll_interval=args.poll_interval,
         stream_interval=args.stream_interval,
+        allow_run=args.allow_run,
+        runs_dir=args.runs_dir,
     )
     return 0
 

@@ -7,14 +7,27 @@ from __future__ import annotations
 
 import ast
 import json
+import signal
+import sys
 import threading
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
-from haetae.dashboard import load_view, make_handler, state_to_view
+from haetae.dashboard import (
+    RunManager,
+    build_run_argv,
+    generate_run_id,
+    load_view,
+    make_handler,
+    state_to_view,
+    valid_run_id,
+    validate_options,
+)
 from haetae.models import (
     AcceptanceCriterion,
     Activity,
@@ -451,3 +464,328 @@ def test_dashboard_does_not_import_engine_modules():
 def _state_yaml() -> str:
     import yaml
     return yaml.safe_dump(_state().model_dump(mode="json", by_alias=True), allow_unicode=True)
+
+
+# ════════════════════ Phase E: 웹 제어 표면 (launch/stop/runs) WO#37 ════════════════════
+
+
+# ──────────────────── 옵션 화이트리스트 / argv / run-id ────────────────────
+
+
+def test_validate_options_defaults():
+    """빈 입력 → 폼 디폴트(executor=codex, max-parallel=4, run-timeout=120, scaffold/skills on)."""
+    o = validate_options({})
+    assert o["executor"] == "codex"
+    assert o["max_parallel"] == 4
+    assert o["run_timeout"] == 120.0
+    assert o["max_iters"] == 30
+    assert o["unit_retries"] == 2
+    assert o["scaffold"] is True and o["skills"] is True
+    assert o["critic_model"] is None
+
+
+def test_validate_options_rejects_unknown_key():
+    with pytest.raises(ValueError, match="unknown option"):
+        validate_options({"shell": "rm -rf /"})  # 미지 플래그 거부
+
+
+def test_validate_options_rejects_out_of_range_and_bad_type():
+    with pytest.raises(ValueError):
+        validate_options({"max_parallel": 999})  # 범위 밖
+    with pytest.raises(ValueError):
+        validate_options({"max_parallel": 0})
+    with pytest.raises(ValueError):
+        validate_options({"run_timeout": 99999})  # 범위 밖
+    with pytest.raises(ValueError):
+        validate_options({"executor": "bash"})  # 화이트리스트 밖
+    with pytest.raises(ValueError):
+        validate_options({"scaffold": "yes"})  # bool 아님
+
+
+def test_validate_options_rejects_bad_critic_model():
+    with pytest.raises(ValueError):
+        validate_options({"critic_model": "a; rm -rf /"})  # 셸 메타문자 거부
+    assert validate_options({"critic_model": "gpt-5-codex"})["critic_model"] == "gpt-5-codex"
+
+
+def test_build_run_argv_is_arglist_not_shell():
+    """argv 리스트(shell 아님) · order는 단일 argv 원소 · 경로는 runs/<id>/ 아래 서버 생성."""
+    opts = validate_options({"max_parallel": 2, "scaffold": False, "skills": False})
+    argv = build_run_argv("build a sim; echo hi", Path("/abs/runs/rid"), opts)
+    assert isinstance(argv, list)
+    assert argv[0] == sys.executable and "-m" in argv and "haetae.run" in argv
+    # order는 보간 없이 단일 원소로 그대로 — 셸 분리 안 됨
+    assert argv[argv.index("--order") + 1] == "build a sim; echo hi"
+    assert argv[argv.index("--workdir") + 1] == str(Path("/abs/runs/rid/work"))
+    assert argv[argv.index("--state-path") + 1] == str(Path("/abs/runs/rid/state.yaml"))
+    assert argv[argv.index("--max-parallel") + 1] == "2"
+    assert "--no-scaffold" in argv and "--no-skills" in argv
+
+
+def test_valid_run_id_rejects_traversal():
+    assert valid_run_id("20260608-120000-foo")
+    assert not valid_run_id("../etc/passwd")
+    assert not valid_run_id("a/b")
+    assert not valid_run_id("..")
+    assert not valid_run_id("")
+    assert not valid_run_id(None)
+
+
+def test_generate_run_id_pattern():
+    from datetime import datetime, timezone
+    rid = generate_run_id("Build A Retail Sim!", now=datetime(2026, 6, 8, 12, 0, 0, tzinfo=timezone.utc))
+    assert rid.startswith("20260608-120000-")
+    assert valid_run_id(rid)
+
+
+# ──────────────────── launch: 서브프로세스 (mock) ────────────────────
+
+
+def test_launch_spawns_arglist_and_creates_dir(tmp_path: Path):
+    with mock.patch("haetae.dashboard.subprocess.Popen") as mp:
+        mp.return_value.poll.return_value = None  # running
+        rm = RunManager(tmp_path / "runs", allow_run=True)
+        rid = rm.launch("build a sim", {"max_parallel": 2})
+        assert valid_run_id(rid)
+        # runs/<id>/ + work/ + meta.json 생성(서버가 만든 경로)
+        assert (rm.runs_dir / rid / "work").is_dir()
+        assert (rm.runs_dir / rid / "meta.json").exists()
+        # Popen은 argv 리스트로 호출 — shell 아님
+        args, kwargs = mp.call_args
+        argv = args[0]
+        assert isinstance(argv, list) and argv[0] == sys.executable
+        assert argv[argv.index("--order") + 1] == "build a sim"
+        assert argv[argv.index("--max-parallel") + 1] == "2"
+        assert kwargs.get("shell", False) is False
+        assert kwargs.get("stdout") is not None  # run.log로 리다이렉트
+
+
+def test_launch_applies_defaults_in_argv(tmp_path: Path):
+    with mock.patch("haetae.dashboard.subprocess.Popen") as mp:
+        mp.return_value.poll.return_value = None
+        rm = RunManager(tmp_path / "runs", allow_run=True)
+        rm.launch("x", {})
+        argv = mp.call_args[0][0]
+        assert argv[argv.index("--executor") + 1] == "codex"
+        assert argv[argv.index("--max-parallel") + 1] == "4"
+        assert "--scaffold" in argv and "--skills" in argv
+
+
+def test_launch_rejects_empty_order(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    with pytest.raises(ValueError):
+        rm.launch("   ", {})
+
+
+# ──────────────────── stop: SIGINT 먼저 ────────────────────
+
+
+def test_stop_sends_sigint_first_then_status_stopped(tmp_path: Path):
+    with mock.patch("haetae.dashboard.subprocess.Popen") as mp:
+        proc = mp.return_value
+        proc.poll.return_value = None
+        proc.wait.return_value = 0  # grace 내 종료(에스컬레이트 안 함)
+        rm = RunManager(tmp_path / "runs", allow_run=True)
+        rid = rm.launch("order", {})
+        assert rm.stop(rid) is True
+        proc.send_signal.assert_called_once_with(signal.SIGINT)  # SIGINT 먼저
+        assert rm.status_of(rid) == "stopped"
+
+
+def test_stop_unknown_run_returns_false(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    assert rm.stop("nope-not-here") is False
+
+
+# ──────────────────── runs 목록: meta + 상태 해석 ────────────────────
+
+
+def _write_run(runs_dir: Path, rid: str, status: str, order: str = "o") -> None:
+    d = runs_dir / rid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(
+        json.dumps({"id": rid, "order": order, "status": status,
+                    "started_at": "2026-06-08T12:00:00Z"}),
+        encoding="utf-8",
+    )
+
+
+def test_list_runs_reads_meta(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    _write_run(rm.runs_dir, "20260608-120000-a", "finished")
+    _write_run(rm.runs_dir, "20260608-130000-b", "failed")
+    runs = {r["id"]: r for r in rm.list_runs()}
+    assert runs["20260608-120000-a"]["status"] == "finished"
+    assert runs["20260608-130000-b"]["status"] == "failed"
+
+
+def test_list_runs_lost_handle_running_is_unknown(tmp_path: Path):
+    """핸들 없는(레지스트리 부재) running → 상태 미상으로 정직 표기."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    _write_run(rm.runs_dir, "20260608-140000-c", "running")  # 디스크엔 running이나 핸들 없음
+    runs = {r["id"]: r for r in rm.list_runs()}
+    assert runs["20260608-140000-c"]["status"] == "unknown"
+
+
+def test_list_runs_skips_bad_dir_names(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    rm.runs_dir.mkdir(parents=True, exist_ok=True)
+    (rm.runs_dir / "not-a-run").mkdir()  # meta.json 없음 → 스킵
+    assert rm.list_runs() == []
+
+
+# ──────────────────── 서버 엔드포인트 ────────────────────
+
+
+def _serve_ctl(run_manager: RunManager, state_path: Path | None = None):
+    handler = make_handler(
+        str(state_path) if state_path else None, None, 2000, run_manager=run_manager
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, port
+
+
+def _post(port: int, path: str, payload: dict | None = None) -> tuple[int, str]:
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8")
+
+
+def test_post_run_403_without_allow_run(tmp_path: Path):
+    """제어 opt-in: --allow-run 없이 POST /api/run → 403(read-only 디폴트 보존)."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _post(port, "/api/run", {"order": "x"})
+        assert code == 403
+        assert "control disabled" in json.loads(body)["error"]
+    finally:
+        httpd.shutdown()
+
+
+def test_readonly_runs_and_state_still_work(tmp_path: Path):
+    """플래그 없어도 runs 목록·state 보기(읽기)는 동작."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    _write_run(rm.runs_dir, "20260608-120000-a", "finished")
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/runs")
+        assert code == 200
+        payload = json.loads(body)
+        assert payload["allow_run"] is False
+        assert payload["runs"][0]["id"] == "20260608-120000-a"
+    finally:
+        httpd.shutdown()
+
+
+def test_post_run_launches_with_allow_run(tmp_path: Path):
+    with mock.patch("haetae.dashboard.subprocess.Popen") as mp:
+        mp.return_value.poll.return_value = None
+        rm = RunManager(tmp_path / "runs", allow_run=True)
+        httpd, port = _serve_ctl(rm)
+        try:
+            code, body = _post(port, "/api/run",
+                               {"order": "build x", "options": {"executor": "codex"}})
+            assert code == 200
+            rid = json.loads(body)["run_id"]
+            assert valid_run_id(rid)
+            assert (rm.runs_dir / rid / "work").is_dir()
+        finally:
+            httpd.shutdown()
+
+
+def test_post_run_bad_options_400(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _post(port, "/api/run", {"order": "x", "options": {"max_parallel": 999}})
+        assert code == 400
+    finally:
+        httpd.shutdown()
+
+
+def test_post_stop_endpoint(tmp_path: Path):
+    with mock.patch("haetae.dashboard.subprocess.Popen") as mp:
+        proc = mp.return_value
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+        rm = RunManager(tmp_path / "runs", allow_run=True)
+        rid = rm.launch("order", {})
+        httpd, port = _serve_ctl(rm)
+        try:
+            code, body = _post(port, f"/api/run/{rid}/stop")
+            assert code == 200 and json.loads(body)["status"] == "stopped"
+            proc.send_signal.assert_called_once_with(signal.SIGINT)
+        finally:
+            httpd.shutdown()
+
+
+def test_post_stop_403_without_allow_run(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, _ = _post(port, "/api/run/20260608-120000-x/stop")
+        assert code == 403
+    finally:
+        httpd.shutdown()
+
+
+def test_state_targets_run_by_id(tmp_path: Path):
+    """GET /api/state?run=<id> → runs/<id>/state.yaml 를 읽어 그 run의 뷰."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    rid = "20260608-120000-test"
+    d = rm.runs_dir / rid
+    d.mkdir(parents=True)
+    (d / "state.yaml").write_text(_state_yaml(), encoding="utf-8")
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, f"/api/state?run={rid}")
+        assert code == 200
+        v = json.loads(body)
+        assert v["status"] == "escalated" and len(v["dag"]["nodes"]) == 5
+    finally:
+        httpd.shutdown()
+
+
+def test_state_invalid_run_id_returns_error(tmp_path: Path):
+    """경로 안전: ?run=../ 같은 traversal 시도는 {error}(서버 안 죽음)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/state?run=..%2F..%2Fetc")
+        assert code == 200
+        assert "error" in json.loads(body)
+    finally:
+        httpd.shutdown()
+
+
+def test_index_html_shows_allow_run_flag(tmp_path: Path):
+    """--allow-run 토큰이 HTML에 치환되어 프런트가 폼 표시 여부를 안다."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/")
+        assert code == 200
+        assert "const ALLOW_RUN = true" in body
+    finally:
+        httpd.shutdown()
+
+
+def test_launcher_uses_only_subprocess_not_engine_import():
+    """런처가 엔진을 import하지 않고 subprocess로 격리하는지 — 가드 보강.
+
+    test_dashboard_does_not_import_engine_modules가 haetae import ⊆ {models}를 강제하므로
+    여기선 런처가 subprocess/signal을 쓰는지(격리 메커니즘)만 추가 확인.
+    """
+    src = DASH.read_text(encoding="utf-8")
+    assert "subprocess.Popen" in src  # 서브프로세스 spawn(엔진 직접 호출 아님)
+    assert "signal.SIGINT" in src  # stop은 SIGINT 신호로
