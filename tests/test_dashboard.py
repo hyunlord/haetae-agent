@@ -1224,3 +1224,146 @@ def test_approaches_decomp_empty_when_absent_no_crash():
     assert rows["u1"]["or_attempts"] == 0
     assert rows["u1"]["decomp_rejects"] == 0
     json.dumps(v)
+
+
+# ════════════════════ WO#46 A: 생애주기 단계(phase) 섹션 ════════════════════
+
+
+def test_phases_bucket_mapping_and_status():
+    """transitions의 stage를 생애주기 버킷으로 매핑 + 상태(done/active/skipped/pending)."""
+    v = state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")  # running
+    ph = {p["name"]: p for p in v["phases"]}
+    # _state_v2 transitions: synthesize, build(u1), verify(u1), build(u2). 현재=build.
+    assert ph["synthesize"]["status"] == "done"        # 발생했고 현재 아님
+    assert ph["scaffold"]["status"] == "skipped"       # 현재보다 앞인데 미발생(--no-scaffold류)
+    assert ph["build"]["status"] == "active"           # 현재 phase + running
+    assert ph["integration"]["status"] == "pending"    # 아직 도달 안 함
+    assert "or" not in ph                              # approaches 없음 → OR phase 미노출
+    assert ph["build"]["label"] == "빌드"
+    json.dumps(v)
+
+
+def test_phases_build_summary_counts():
+    """빌드 phase 요약 = 완료/총 유닛 수(DW의 Verify 75/75 대응)."""
+    v = state_to_view(_state_v2())
+    build = next(p for p in v["phases"] if p["name"] == "build")
+    assert build["summary"] == "완료 1/3"  # u1 done, total 3
+
+
+def test_phases_current_is_latest_transition():
+    """현재 phase = 가장 최근 버킷 있는 transition. 마지막이 verify(u1=None)이면 통합."""
+    s = State(
+        spec_ref="x", spec_version=1, status=Status.running,
+        plan=[PlanItem(unit="u1", state=PlanState.done, deps=None)],
+        transitions=[
+            StageTransition(stage="synthesize", unit=None, ts="2026-06-07T10:00:00Z"),
+            StageTransition(stage="scaffold", unit=None, ts="2026-06-07T10:00:01Z"),
+            StageTransition(stage="build", unit="u1", ts="2026-06-07T10:00:02Z"),
+            StageTransition(stage="verify", unit="u1", ts="2026-06-07T10:00:03Z"),
+            StageTransition(stage="verify", unit=None, ts="2026-06-07T10:00:04Z"),  # 통합 gate
+        ],
+    )
+    ph = {p["name"]: p for p in state_to_view(s)["phases"]}
+    assert ph["synthesize"]["status"] == "done"
+    assert ph["scaffold"]["status"] == "done"          # 실제 발생 → done(skipped 아님)
+    assert ph["build"]["status"] == "done"             # 유닛 verify는 빌드 버킷
+    assert ph["integration"]["status"] == "active"     # verify(unit=None) = 통합, 현재
+
+
+def test_phases_or_only_when_approaches():
+    """OR 대안 phase는 approaches가 있을 때만 노출(없으면 생략)."""
+    v_no = state_to_view(_state_v2())
+    assert not any(p["name"] == "or" for p in v_no["phases"])
+    v_or = state_to_view(_state_or_decomp())  # approaches 3개 보유
+    or_ph = next((p for p in v_or["phases"] if p["name"] == "or"), None)
+    assert or_ph is not None and or_ph["label"] == "OR 대안"
+    assert or_ph["summary"]  # "대안 N회" 또는 "N 시도"
+
+
+def test_phases_empty_when_no_transitions():
+    """transitions 부재(구버전/시작 전) → phases == [](무크래시)."""
+    assert state_to_view(_state())["phases"] == []
+
+
+def test_phases_done_when_not_running():
+    """run이 끝나면(running 아님) 발생한 phase는 active가 아니라 done."""
+    s = State(
+        spec_ref="x", spec_version=1, status=Status.done,
+        plan=[PlanItem(unit="u1", state=PlanState.done, deps=None)],
+        transitions=[StageTransition(stage="build", unit="u1", ts="2026-06-07T10:00:00Z")],
+    )
+    ph = {p["name"]: p for p in state_to_view(s)["phases"]}
+    assert ph["build"]["status"] == "done"  # 종료 상태 → active 아님
+
+
+# ════════════════════ WO#46 B: 유닛 라운드/게이트 드릴다운 ════════════════════
+
+
+def _state_unit_rounds() -> State:
+    """u1이 2라운드(코딩→검증 실패 → 재계획 → 코딩→검증 통과)로 시도된 state."""
+    plan = [PlanItem(unit="u1", state=PlanState.done, deps=None)]
+    events = [
+        Event(seq=1, unit="u1", verdict=Verdict.fail_recoverable, ts="2026-06-07T10:00:02Z",
+              checks=[CheckReport(ac_id="ac1", check_type=CheckType.test, status="fail", exit_code=1,
+                                  detail="1 failed")]),
+        Event(seq=2, unit="u1", verdict=Verdict.pass_, ts="2026-06-07T10:00:06Z",
+              checks=[CheckReport(ac_id="ac1", check_type=CheckType.test, status="pass", exit_code=0)]),
+    ]
+    return State(
+        spec_ref="x", spec_version=1, status=Status.running, plan=plan, events=events,
+        transitions=[
+            StageTransition(stage="build", unit="u1", ts="2026-06-07T10:00:00Z"),
+            StageTransition(stage="verify", unit="u1", ts="2026-06-07T10:00:02Z"),
+            StageTransition(stage="replan", unit="u1", ts="2026-06-07T10:00:03Z"),
+            StageTransition(stage="build", unit="u1", ts="2026-06-07T10:00:04Z"),
+            StageTransition(stage="verify", unit="u1", ts="2026-06-07T10:00:06Z"),
+        ],
+    )
+
+
+def test_unit_rounds_grouped_by_build():
+    """build마다 새 라운드(재시도 = 복수 라운드). 라운드별 stage 귀속."""
+    v = state_to_view(_state_unit_rounds())
+    rounds = v["units"]["u1"]["rounds"]
+    assert len(rounds) == 2
+    assert rounds[0]["round"] == 1 and rounds[0]["started_at"] == "2026-06-07T10:00:00Z"
+    assert [s["stage"] for s in rounds[0]["stages"]] == ["build", "verify", "replan"]
+    assert rounds[1]["round"] == 2 and rounds[1]["started_at"] == "2026-06-07T10:00:04Z"
+    assert [s["stage"] for s in rounds[1]["stages"]] == ["build", "verify"]
+
+
+def test_unit_rounds_gate_checks_attribution():
+    """각 라운드에 그 사이클의 gate 체크/verdict가 ts 창으로 귀속된다."""
+    v = state_to_view(_state_unit_rounds())
+    rounds = v["units"]["u1"]["rounds"]
+    assert rounds[0]["verdict"] == "fail_recoverable"
+    assert rounds[0]["checks"][0]["status"] == "fail" and rounds[0]["checks"][0]["ac_id"] == "ac1"
+    assert rounds[1]["verdict"] == "pass"
+    assert rounds[1]["checks"][0]["status"] == "pass"
+    json.dumps(v)
+
+
+def test_unit_rounds_legacy_events_no_transitions():
+    """transitions 없고 event만 있는 구버전 → event당 1라운드로 흡수(체크 귀속)."""
+    v = state_to_view(_state())  # transitions 없음, u1에 event 1개
+    rounds = v["units"]["u1"]["rounds"]
+    assert len(rounds) == 1
+    assert rounds[0]["checks"][0]["ac_id"] == "ac1" and rounds[0]["verdict"] == "pass"
+
+
+def test_unit_rounds_empty_when_no_data():
+    """transitions·event 둘 다 없는 유닛 → 빈 rounds(무크래시)."""
+    v = state_to_view(_state())  # u4 pending: event 없음
+    assert v["units"]["u4"]["rounds"] == []
+
+
+# ──────────────────── WO#46: HTML 섹션 스텝퍼 + 드릴다운 ────────────────────
+
+
+def test_html_has_phase_stepper_and_unit_drilldown():
+    """폼 HTML: 단계 스텝퍼(renderPhases) + 유닛 라운드/로그 드릴다운 마크업."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="phases"' in src and "renderPhases" in src      # A: 단계 섹션
+    assert "rounds" in src                                     # B: 라운드 렌더
+    assert "유닛 로그" in src or "unit-log" in src              # B: 유닛 로그 필터
+    assert 'id="unitlist"' in src                             # 빌드 섹션 안 유닛 dense 리스트 보존

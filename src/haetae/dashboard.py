@@ -160,6 +160,158 @@ def _topo_levels(nodes: list[dict[str, Any]]) -> list[list[str]]:
     return levels
 
 
+# ──────────────────── WO#46 A: 생애주기 단계(phase) 파생 ────────────────────
+#
+# transitions의 stage를 생애주기 *버킷*으로 매핑한다(엔진 새 필드 요구 없이 파생만).
+# stage 어휘(loop.py): synthesize/scaffold/build/verify/replan/done/escalate/
+#   decomp-reject/or-alternative. verify는 unit 유무로 빌드(유닛 검증) vs 통합(unit=None) 구분.
+
+_PHASE_ORDER = ("synthesize", "scaffold", "build", "integration", "or")
+_PHASE_LABELS = {
+    "synthesize": "합성",
+    "scaffold": "스캐폴드",
+    "build": "빌드",
+    "integration": "통합 검증",
+    "or": "OR 대안",
+}
+
+
+def _phase_bucket(stage: str | None, unit: str | None) -> str | None:
+    """transition (stage, unit) → 생애주기 버킷. 매핑 없는 stage(done 등)는 None."""
+    if stage == "synthesize":
+        return "synthesize"
+    if stage == "scaffold":
+        return "scaffold"
+    if stage in ("build", "replan", "decomp-reject", "escalate"):
+        return "build"
+    if stage == "verify":
+        # 유닛 검증은 빌드 사이클의 일부, unit=None은 통합 gate.
+        return "build" if unit is not None else "integration"
+    if stage == "or-alternative":
+        return "or"
+    return None  # done/미지 stage → 단계 버킷 없음
+
+
+def _derive_phases(
+    transitions: list[Any],
+    *,
+    running: bool,
+    unit_counts: dict[str, int],
+    integration_verdict: str | None,
+    or_alternatives: int,
+    n_approaches: int,
+    critique: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """transitions에서 생애주기 단계 섹션을 파생한다(best-effort, 파생만).
+
+    각 phase {name,label,status(done|active|pending|skipped),summary}. 현재 phase=최신
+    transition의 버킷. OR 단계는 approaches 있을 때만 포함. transitions 부재 → [](무크래시).
+    """
+    if not transitions:
+        return []
+    occurred: dict[str, bool] = {p: False for p in _PHASE_ORDER}
+    current: str | None = None
+    for t in transitions:
+        b = _phase_bucket(getattr(t, "stage", None), getattr(t, "unit", None))
+        if b is None:
+            continue
+        occurred[b] = True
+        current = b  # 마지막으로 버킷 있는 transition = 현재 phase
+    current_idx = _PHASE_ORDER.index(current) if current in _PHASE_ORDER else -1
+
+    def _summary(name: str) -> str | None:
+        if name == "synthesize":
+            if critique is None:
+                return None
+            v = critique.get("verdict")
+            if critique.get("resynthesized"):
+                return f"재합성됨 · {v}" if v else "재합성됨"
+            return v
+        if name == "build":
+            return f"완료 {unit_counts.get('done', 0)}/{unit_counts.get('total', 0)}"
+        if name == "integration":
+            return integration_verdict
+        if name == "or":
+            return f"대안 {or_alternatives}회" if or_alternatives else f"{n_approaches} 시도"
+        return None  # scaffold 등은 상태 배지로 충분
+
+    phases: list[dict[str, Any]] = []
+    for i, name in enumerate(_PHASE_ORDER):
+        if name == "or" and n_approaches <= 0:
+            continue  # OR 대안은 실제 시도가 있을 때만 노출(WO#46: "있을 때만")
+        if occurred[name]:
+            status = "active" if (running and name == current) else "done"
+        elif current_idx >= 0 and i < current_idx:
+            status = "skipped"  # 현재보다 앞 단계인데 발생 안 함(예: --no-scaffold)
+        else:
+            status = "pending"
+        phases.append(
+            {"name": name, "label": _PHASE_LABELS[name], "status": status, "summary": _summary(name)}
+        )
+    return phases
+
+
+def _unit_rounds(
+    uid: str, transitions: list[Any], unit_events: list[Any]
+) -> list[dict[str, Any]]:
+    """유닛의 transitions를 *라운드*(코딩→검증 1사이클)로 그룹하고 gate 체크를 귀속한다(WO#46 B).
+
+    `build` stage마다 새 라운드 시작(재시도면 복수 라운드). 각 event(gate 평가)를 ts 창으로
+    해당 라운드에 귀속(ts 없으면 순번 폴백). transitions 없고 event만 있으면(구버전) event당
+    1라운드. 전부 best-effort — 부재/누락은 빈 값으로 흡수.
+    """
+    utr = [t for t in transitions if getattr(t, "unit", None) == uid]
+    uevents = sorted(unit_events, key=lambda e: e.seq)
+    rounds: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for t in utr:
+        stage = getattr(t, "stage", None)
+        ts = getattr(t, "ts", None)
+        if stage == "build" or cur is None:
+            cur = {
+                "round": len(rounds) + 1,
+                "stages": [],
+                "started_at": ts,
+                "checks": [],
+                "verdict": None,
+                "result": None,
+                "seq": None,
+            }
+            rounds.append(cur)
+        cur["stages"].append({"stage": stage, "ts": ts})
+        if ts and (cur["started_at"] is None or ts < cur["started_at"]):
+            cur["started_at"] = ts
+
+    if rounds:
+        for idx, ev in enumerate(uevents):
+            target: dict[str, Any] | None = None
+            if ev.ts:
+                for r in rounds:  # 그 event 이전 가장 최근 build 라운드(ts 창)
+                    if r["started_at"] is not None and r["started_at"] <= ev.ts:
+                        target = r
+            if target is None:  # ts 없음/매칭 실패 → 순번 폴백(초과분은 마지막 라운드)
+                target = rounds[min(idx, len(rounds) - 1)]
+            target["checks"] = [_check_view(c) for c in ev.checks]
+            target["verdict"] = _verdict_val(ev.verdict)
+            target["result"] = ev.result
+            target["seq"] = ev.seq
+    else:
+        # transitions 부재(구버전 state)지만 event는 있을 때 — event당 1라운드로 흡수.
+        for ev in uevents:
+            rounds.append(
+                {
+                    "round": len(rounds) + 1,
+                    "stages": [],
+                    "started_at": ev.ts,
+                    "checks": [_check_view(c) for c in ev.checks],
+                    "verdict": _verdict_val(ev.verdict),
+                    "result": ev.result,
+                    "seq": ev.seq,
+                }
+            )
+    return rounds
+
+
 def state_to_view(
     state: State, spec: ProjectSpec | None = None, *, now: str | None = None
 ) -> dict[str, Any]:
@@ -187,11 +339,13 @@ def state_to_view(
 
     # 유닛별 최신 event(seq 최대) + 통합 event(unit=None) 분리.
     latest_event: dict[str, Any] = {}
+    events_by_unit: dict[str, list[Any]] = {}  # WO#46 B: 유닛별 *전체* event(라운드 드릴다운용)
     integration_events: list[Any] = []
     for ev in state.events:
         if ev.unit is None:
             integration_events.append(ev)
         else:
+            events_by_unit.setdefault(ev.unit, []).append(ev)
             prev = latest_event.get(ev.unit)
             if prev is None or ev.seq >= prev.seq:
                 latest_event[ev.unit] = ev
@@ -233,6 +387,8 @@ def state_to_view(
             blocking.append({"unit": p.unit, "blocked_by": blocked_by})
 
     # ── 유닛별 상세(최신 event) ──
+    # WO#46 B: 라운드 드릴다운용 transitions(파생만). 아래 v3 블록의 transitions_list와 동일 소스.
+    _transitions = getattr(state, "transitions", None) or []
     units: dict[str, Any] = {}
     for p in plan:
         ev = latest_event.get(p.unit)
@@ -245,6 +401,8 @@ def state_to_view(
             "result": (ev.result if ev else None),
             "checks": [_check_view(c) for c in (ev.checks if ev else [])],
             "cost": _cost_view(ev.cost) if ev else None,
+            # 라운드별(코딩→검증 사이클) gate 체크 귀속 — 한 유닛이 몇 번 어떻게 시도됐나.
+            "rounds": _unit_rounds(p.unit, _transitions, events_by_unit.get(p.unit, [])),
         }
 
     # ── 통합(unit=None) event: 통합 gate 증거 ──
@@ -468,6 +626,18 @@ def state_to_view(
         "decomp_rejects": decomp_rejects,
     }
 
+    # ── WO#46 A: 생애주기 단계(phase) 섹션 — transitions에서 파생(파생만, 새 엔진 필드 없음) ──
+    integration_verdict = integration[-1]["verdict"] if integration else None
+    phases = _derive_phases(
+        transitions_list,
+        running=running,
+        unit_counts=unit_counts,
+        integration_verdict=integration_verdict,
+        or_alternatives=or_alternatives,
+        n_approaches=len(approaches_list),
+        critique=critique,
+    )
+
     return {
         "status": state.status.value,
         "summary": summary,
@@ -491,6 +661,8 @@ def state_to_view(
         # v3.1(WO#44 C): #40/#41 산출물 표면화(부재/구버전 → 빈 리스트).
         "approaches": approaches_view,
         "decomp_critiques": decomp_critiques_view,
+        # WO#46 A: 생애주기 단계 섹션(빈/구버전 state → [] 무크래시).
+        "phases": phases,
     }
 
 

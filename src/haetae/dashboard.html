@@ -163,6 +163,36 @@
   .form-warn { color:#fbbf24; font-size:12px; margin:4px 0 0; }
   .opt .hint { color:var(--mut); font-size:10.5px; max-width:240px; line-height:1.3; }
   .opt.col { flex-direction:column; align-items:flex-start; gap:2px; }
+  /* 생애주기 단계 스텝퍼(WO#46 A) */
+  .phases { display:flex; flex-direction:column; gap:0; }
+  .phase { border-left:2px solid var(--bd); padding:8px 0 8px 14px; position:relative; }
+  .phase + .phase { margin-top:2px; }
+  .phase.active { border-left-color:var(--prog); }
+  .phase.ph-done { border-left-color:var(--done); }
+  .phase.ph-skipped { opacity:.55; }
+  .phase-h { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .phase-dot { width:9px; height:9px; border-radius:999px; background:var(--bd); margin-left:-19px;
+    border:2px solid var(--panel); box-shadow:0 0 0 1px var(--bd); }
+  .phase.active .phase-dot { background:var(--prog); box-shadow:0 0 0 3px rgba(96,165,250,.2); }
+  .phase.ph-done .phase-dot { background:var(--done); }
+  .phase-name { font-weight:700; font-size:12.5px; }
+  .phase-badge { font-size:9.5px; font-weight:700; padding:1px 6px; border-radius:5px;
+    text-transform:uppercase; letter-spacing:.04em; background:var(--bd); color:var(--mut); }
+  .phase-badge.pb-active { background:var(--prog); color:#04122b; }
+  .phase-badge.pb-done { background:var(--done); color:#04210f; }
+  .phase-badge.pb-pending { background:var(--bd); color:var(--mut); }
+  .phase-badge.pb-skipped { background:transparent; color:var(--mut); border:1px solid var(--bd); }
+  .phase-sum { font-size:11px; color:var(--mut); }
+  .phase-body { margin-top:8px; }
+  /* 유닛 라운드 드릴다운(WO#46 B) */
+  .round { border:1px solid var(--bd); border-radius:7px; padding:8px; margin-top:8px; background:var(--panel2); }
+  .round-h { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11.5px; }
+  .round-n { font-weight:700; }
+  .round-stages { display:flex; gap:4px; flex-wrap:wrap; margin:6px 0; }
+  .unit-log { background:#0b0d11; border:1px solid var(--bd); border-radius:7px; padding:8px; margin-top:6px;
+    max-height:180px; overflow:auto; }
+  .unit-log .ln { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10.5px;
+    white-space:pre-wrap; word-break:break-all; color:var(--tx); }
   .ctl-off { color:var(--mut); font-size:12px; }
   /* ── v3 (WO#42 A): DW식 밀도 라이브 유닛 리스트 ── */
   .ulist .urow { display:flex; align-items:center; gap:8px; padding:6px 9px; border:1px solid var(--bd);
@@ -238,7 +268,7 @@
 </div>
 <div id="root" class="grid">
   <div id="left">
-    <div class="card act-card"><h2>유닛 · 라이브</h2><div id="unitlist" class="ulist"></div></div>
+    <div class="card act-card"><h2>생애주기 · 단계 (phases)</h2><div id="phases" class="phases"></div></div>
     <div class="card" id="worklog-card" style="display:none"><h2>작업 로그 (라이브 tail)</h2><div id="worklog" class="worklog"></div></div>
     <div class="card"><h2>유닛 DAG (구조)</h2><div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div></div>
     <div class="card"><h2>단계 타임라인 (transitions)</h2><div id="transitions" class="flow"></div></div>
@@ -302,7 +332,7 @@ async function pollOnce(){
 
 // ── 제어 표면: runs 목록 / 실행 폼 / stop ──
 function clearViewer(){
-  ["unitlist","worklog","levels","transitions","timeline","integration","cost","critique","esc"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
+  ["phases","unitlist","worklog","levels","transitions","timeline","integration","cost","critique","esc"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
 }
 function selectRun(id){
   RUN = id; SEL = null; VIEW = null;
@@ -322,8 +352,12 @@ async function loadLog(){
     renderLog(await r.json());
   } catch(_) { /* 로그 로드 실패는 조용히(뷰어는 계속) */ }
 }
+let LOG_LINES = [];   // 마지막 tail 줄(유닛 로그 필터용, WO#46 B)
 function renderLog(d){
   const box = $("worklog");
+  LOG_LINES = (d && d.lines) || [];
+  // 선택된 유닛이 있으면 그 유닛 로그 필터도 갱신(라이브).
+  if (SEL && VIEW && !VIEW.error) renderDetail(SEL);
   if (!d || d.error) { box.innerHTML = '<div class="empty">로그 읽기 실패'+(d&&d.error?': '+esc(d.error):'')+'</div>'; return; }
   const lines = d.lines||[];
   if (!lines.length) { box.innerHTML = '<div class="empty">'+(d.missing?'로그 없음 (아직 시작 전?)':'로그 비어있음')+'</div>'; return; }
@@ -332,6 +366,14 @@ function renderLog(d){
   box.innerHTML = (d.truncated? '<div class="trunc">… 앞부분 생략 (bounded tail · '+lines.length+'줄)</div>':'')
     + lines.map(l=>'<div class="ln">'+esc(l)+'</div>').join("");
   if (atBottom) box.scrollTop = box.scrollHeight;
+}
+// 유닛 id를 언급한 로그 줄만 best-effort 필터(태그 없는 줄은 생략). 단어 경계로 오탐 줄임.
+function unitLogLines(uid){
+  if (!uid || !LOG_LINES.length) return [];
+  let re = null;
+  try { re = new RegExp("(^|[^A-Za-z0-9])"+uid.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"([^A-Za-z0-9]|$)"); }
+  catch(_) { re = null; }
+  return LOG_LINES.filter(l => re ? re.test(l) : l.includes(uid));
 }
 const RSTAT_KO = {running:"도는 중", finished:"완료", stopped:"정지됨", failed:"실패", unknown:"미상"};
 function renderRuns(payload){
@@ -484,7 +526,8 @@ function render(v) {
     bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
   } else bs.innerHTML = "";
   renderSummary(v);
-  renderUnitList(v);
+  renderPhases(v);     // 단계 섹션 먼저(빌드 섹션 안에 #unitlist 생성)
+  renderUnitList(v);   // 그 #unitlist에 유닛 dense 리스트 채움
   renderDag(v);
   renderTransitions(v);
   renderTimeline(v);
@@ -495,10 +538,37 @@ function render(v) {
   if (SEL) renderDetail(SEL);
 }
 
-const STAGE_KO = {build:"코딩", verify:"검증", synthesize:"합성", scaffold:"스캐폴드", replan:"재계획", done:"완료", escalate:"에스컬레이트"};
+const STAGE_KO = {build:"코딩", verify:"검증", synthesize:"합성", scaffold:"스캐폴드", replan:"재계획", done:"완료", escalate:"에스컬레이트", "decomp-reject":"분해 reject", "or-alternative":"OR 대안"};
 function stageBadge(stg){
   if(!stg) return "";
-  return '<span class="stage stg-'+esc(stg)+'">'+esc(STAGE_KO[stg]||stg)+'</span>';
+  // stg- 클래스는 알려진 stage만(미지 stage는 기본 build 색으로 폴백, CSS 누락 방지).
+  const known = {build:1,verify:1,synthesize:1,scaffold:1,replan:1,done:1,escalate:1};
+  const cls = known[stg] ? stg : "build";
+  return '<span class="stage stg-'+cls+'">'+esc(STAGE_KO[stg]||stg)+'</span>';
+}
+
+// ── 생애주기 단계 스텝퍼(WO#46 A) — phases를 세로 섹션으로, 빌드 섹션에 유닛 dense 리스트 ──
+const PHASE_STAT_KO = {done:"완료", active:"진행 중", pending:"대기", skipped:"건너뜀"};
+function renderPhases(v){
+  const host = $("phases"); if (!host) return;
+  const ph = v.phases || [];
+  const buildBody = '<div class="phase-body"><div id="unitlist" class="ulist"></div></div>';
+  if (!ph.length){
+    // 단계 정보 없음(시작 전/구버전) — 그래도 유닛 리스트 컨테이너는 보장(renderUnitList 대상).
+    host.innerHTML = '<div class="empty" style="margin-bottom:8px">단계 정보 없음 (시작 전)</div>' + buildBody;
+    return;
+  }
+  host.innerHTML = ph.map(p=>{
+    const body = p.name==="build" ? buildBody : "";
+    const cls = "phase ph-"+esc(p.status) + (p.status==="active"?" active":"");
+    return '<div class="'+cls+'">'
+      + '<div class="phase-h"><span class="phase-dot"></span>'
+      + '<span class="phase-name">'+esc(p.label)+'</span>'
+      + '<span class="phase-badge pb-'+esc(p.status)+'">'+esc(PHASE_STAT_KO[p.status]||p.status)+'</span>'
+      + (p.summary!=null && p.summary!==""? '<span class="phase-sum">'+esc(p.summary)+'</span>':'')
+      + '</div>' + body + '</div>';
+  }).join("");
+  if (!$("unitlist")) host.insertAdjacentHTML("beforeend", buildBody);  // 빌드 phase 없을 때 보장
 }
 
 function liveElapsed(a){
@@ -697,9 +767,53 @@ function renderDetail(uid) {
   if (u.work_order_ref) h += '<p class="small" style="margin:8px 0"><b class="mut">work order</b><br>'+esc(u.work_order_ref)+'</p>';
   const blk = (VIEW.blocking||[]).find(b=>b.unit===uid);
   if (blk) h += '<div class="gap" style="border-left-color:var(--fail)">⛔ blocked by <b>'+esc(blk.blocked_by.join(", "))+'</b> (미완료 의존)</div>';
-  h += '<h2 style="margin-top:12px">gate checks ('+u.checks.length+')</h2>';
-  h += u.checks.length ? u.checks.map(checkHtml).join("") : '<div class="empty">체크 없음</div>';
+
+  // ── B: 라운드별 드릴다운(코딩→검증 사이클마다 gate 체크 귀속) ──
+  const rounds = u.rounds || [];
+  if (rounds.length){
+    h += '<h2 style="margin-top:12px">라운드 ('+rounds.length+')</h2>';
+    h += rounds.map(r=>roundHtml(r)).join("");
+  } else {
+    // 라운드 데이터 부재(구버전) — 기존 단일 gate checks로 폴백.
+    h += '<h2 style="margin-top:12px">gate checks ('+u.checks.length+')</h2>';
+    h += u.checks.length ? u.checks.map(checkHtml).join("") : '<div class="empty">체크 없음</div>';
+  }
+
+  // ── B: 이 유닛의 OR 접근 시도 / 분해 reject 이력(전역 배열에서 필터) ──
+  const ors = (VIEW.approaches||[]).filter(a=>a.scope==="unit:"+uid);
+  if (ors.length){
+    h += '<h2 style="margin-top:12px">OR 접근 시도 ('+ors.length+')</h2>';
+    h += ors.map(a=>'<div class="kv"><b>#'+esc(a.index)+'</b> '+esc(a.approach||"")
+      + ' <span class="badge ba-'+(a.outcome==="exhausted"||a.outcome==="fail"?"fail":"skipped")+'">'+esc(a.outcome)+'</span>'
+      + (a.evidence? '<span class="mut small"> · '+esc(a.evidence)+'</span>':'')+'</div>').join("");
+  }
+  const drj = (VIEW.decomp_critiques||[]).filter(d=>d.unit===uid);
+  if (drj.length){
+    h += '<h2 style="margin-top:12px">분해 critic ('+drj.length+')</h2>';
+    h += drj.map(d=>'<div class="kv"><span class="badge ba-'+(d.rejected?"fail":"pass")+'">'+esc(d.verdict)+(d.rejected?" · reject":"")+'</span>'
+      + (d.reason? '<span class="mut small"> '+esc(d.reason)+'</span>':'')+'</div>').join("");
+  }
+
+  // ── B: 이 유닛 관련 로그 줄 필터(작업 로그 tail에서 uid 언급 줄만, best-effort) ──
+  const ulines = unitLogLines(uid);
+  h += '<h2 style="margin-top:12px">유닛 로그 ('+ulines.length+')</h2>';
+  h += ulines.length
+    ? '<div class="unit-log">'+ulines.map(l=>'<div class="ln">'+esc(l)+'</div>').join("")+'</div>'
+    : '<div class="empty">이 유닛을 언급한 로그 줄 없음 (태그 없는 줄은 생략)</div>';
+
   $("detail").innerHTML = h;
+}
+
+function roundHtml(r){
+  const vd = r.verdict ? '<span class="badge ba-'+(r.verdict==="pass"?"pass":(String(r.verdict).indexOf("fail")>=0?"fail":"skipped"))+'">'+esc(r.verdict)+'</span>' : '';
+  const stages = (r.stages||[]).map(s=>stageBadge(s.stage)).join(" ");
+  const checks = (r.checks||[]);
+  return '<div class="round"><div class="round-h"><span class="round-n">라운드 '+esc(r.round)+'</span>'
+    + (r.started_at? '<span class="mut small">'+esc(tsShort(r.started_at))+'</span>':'')
+    + vd + '</div>'
+    + (stages? '<div class="round-stages">'+stages+'</div>':'')
+    + (checks.length ? checks.map(checkHtml).join("") : '<div class="empty">이 라운드 gate 체크 없음</div>')
+    + '</div>';
 }
 
 function renderTimeline(v) {
