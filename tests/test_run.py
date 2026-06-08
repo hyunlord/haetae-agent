@@ -172,3 +172,19 @@ def test_main_max_iters_override(monkeypatch):
     captured = _capture_main_run(monkeypatch)
     main(["--order", "x", "--max-iters", "7"])
     assert captured["max_iters"] == 7
+
+
+# ──────────────────────────── graceful stop / SIGINT (WO#43) ────────────────────────────
+
+
+def test_main_keyboardinterrupt_clean_exit(monkeypatch, capsys):
+    """main()이 KeyboardInterrupt를 잡아 코드 0(=stopped, failed 아님)으로 클린 종료 +
+    raw traceback 대신 '중단됨' 한 줄."""
+    def fake_run(order, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(run_mod, "run", fake_run)
+    rc = main(["--order", "x"])
+    assert rc == 0  # 종료코드 0 → 대시보드가 "failed"로 오해하지 않게 정합
+    err = capsys.readouterr().err
+    assert "중단됨" in err

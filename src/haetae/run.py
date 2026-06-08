@@ -319,28 +319,36 @@ def main(argv: list[str] | None = None) -> int:
     def progress(msg: str) -> None:
         print(f"… {msg}", file=sys.stderr, flush=True)
 
-    state = run(
-        args.order,
-        client=client,
-        executor=executor,
-        gate=gate,
-        critic_client=critic_client,
-        max_iters=args.max_iters,
-        decomp_critic=args.decomp_critic,
-        decomp_retries=args.decomp_retries,
-        or_alternatives=args.or_alternatives,
-        state_path=args.state_path,
-        progress=progress,
-        max_parallel=args.max_parallel,
-        workdir=args.workdir,
-        executor_factory=executor_factory,
-        gate_factory=gate_factory,
-        unit_retries=args.unit_retries,
-        scaffold_client=scaffold_client,
-        install_deps=args.install_deps,
-        skills_dir=skills_dir,
-        pricing=pricing,
-    )
+    # graceful stop(WO#43): 웹 stop(#37)은 이 프로세스에 SIGINT를 보낸다. run_loop이
+    # 이미 정리·저장·클린 마무리하지만(KeyboardInterrupt를 잡아 State 반환), 그 바깥
+    # (배선/예외 흐름)에서 인터럽트가 와도 raw traceback 없이 클린 종료한다.
+    # 종료코드 0 = stopped로 해석(대시보드가 "failed"로 오해하지 않게 정합).
+    try:
+        state = run(
+            args.order,
+            client=client,
+            executor=executor,
+            gate=gate,
+            critic_client=critic_client,
+            max_iters=args.max_iters,
+            decomp_critic=args.decomp_critic,
+            decomp_retries=args.decomp_retries,
+            or_alternatives=args.or_alternatives,
+            state_path=args.state_path,
+            progress=progress,
+            max_parallel=args.max_parallel,
+            workdir=args.workdir,
+            executor_factory=executor_factory,
+            gate_factory=gate_factory,
+            unit_retries=args.unit_retries,
+            scaffold_client=scaffold_client,
+            install_deps=args.install_deps,
+            skills_dir=skills_dir,
+            pricing=pricing,
+        )
+    except KeyboardInterrupt:
+        print("중단됨 (사용자 stop/SIGINT)", file=sys.stderr, flush=True)
+        return 0
     print(format_summary(state))
     return 0
 

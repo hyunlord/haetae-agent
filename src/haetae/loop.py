@@ -257,6 +257,42 @@ def _save_state(state: State, state_path: str | Path) -> None:
     )
 
 
+# ──────────────────────────── graceful stop (WO#43) ────────────────────────────
+
+# 웹 stop(#37)이 보내는 SIGINT/Ctrl-C가 KeyboardInterrupt로 올라올 때 남기는 한 줄.
+_INTERRUPT_MSG = "중단됨 (사용자 stop/SIGINT)"
+
+
+def _finalize_interrupt(
+    state: State,
+    emit: Callable[[str], None],
+    save: Callable[[], None],
+) -> None:
+    """KeyboardInterrupt(웹 stop/SIGINT) 공통 마무리 — best-effort, **2차 크래시 금지**.
+
+    멈춤을 깔끔히 닫는다: traceback 없이 "중단됨" 한 줄 + 종료 상태 봉인 + 부분 진행 저장.
+      1) 로그 한 줄(_INTERRUPT_MSG) — 호출부가 raw traceback 대신 이걸 남긴다.
+      2) running이면 stopped(stopped_stuck)로 종료 상태 봉인 → 대시보드가 "중단됨"으로
+         보이고 "running"으로 오해하지 않는다(이미 terminal이면 그 값을 보존).
+      3) 현재 state 저장(#18) — 그때까지의 부분 진행을 감사 로그/대시보드에 남긴다.
+    정리/저장 중 추가 예외도 전부 흡수한다(인터럽트 처리가 또 다른 크래시가 되면 안 됨).
+    worktree/산출물 정리(#21 cleanup_all)는 호출부(_parallel_loop)의 finally가 보장한다.
+    """
+    try:
+        emit(_INTERRUPT_MSG)
+    except Exception:  # noqa: BLE001 — best-effort, 로그 실패가 정리를 막지 않는다
+        pass
+    try:
+        if state is not None and state.status == Status.running:
+            state.status = Status.stopped_stuck
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        save()
+    except Exception:  # noqa: BLE001 — 저장 실패가 2차 크래시가 되면 안 된다
+        pass
+
+
 # ──────────────────────────── 진행 표시 헬퍼 ────────────────────────────
 
 
@@ -526,314 +562,325 @@ def run_loop(
             no, spec, state, m_critic, last_result=last, prompt_path=decomp_critic_prompt
         )
 
-    emit("합성 중…")
-    critique: SpecCritique | None = None
+    # graceful stop(WO#43): 웹 stop(#37)이 보내는 SIGINT(KeyboardInterrupt)를 잡아
+    #   traceback 없이 정리·저장·클린 종료한다. 합성 전 인터럽트도 잡도록 placeholder
+    #   state를 먼저 둔다(정상 경로에서 _init_state/_escalated_no_spec가 덮어쓴다).
+    state = State(spec_ref="(interrupted)", spec_version=0, status=Status.running)
     try:
-        if critic_client is not None:
-            # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
-            spec, critique = synthesize_with_critique(
-                order, m_client, m_critic,
-                syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
+        emit("합성 중…")
+        critique: SpecCritique | None = None
+        try:
+            if critic_client is not None:
+                # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
+                spec, critique = synthesize_with_critique(
+                    order, m_client, m_critic,
+                    syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
+                )
+            else:
+                spec = synthesize(order, m_client, prompt_path=syn_prompt)
+        except SynthesisError as e:
+            state = _escalated_no_spec(
+                "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
             )
-        else:
-            spec = synthesize(order, m_client, prompt_path=syn_prompt)
-    except SynthesisError as e:
-        state = _escalated_no_spec(
-            "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
-        )
+            record_transition(STAGE_SYNTHESIZE)
+            # 합성 실패라도 거기까지 든 비용은 정직하게 누적(state 생성 후 — budget 존재).
+            account(combine_costs(m_client.drain()))
+            if m_critic is not None:
+                account(combine_costs(m_critic.drain()))
+            emit(_final_label(state))
+            try_save()
+            return state
+
+        state = _init_state(spec)
         record_transition(STAGE_SYNTHESIZE)
-        # 합성 실패라도 거기까지 든 비용은 정직하게 누적(state 생성 후 — budget 존재).
+        # 합성/critic(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
         account(combine_costs(m_client.drain()))
         if m_critic is not None:
             account(combine_costs(m_critic.drain()))
-        emit(_final_label(state))
-        try_save()
-        return state
+        if critique is not None:
+            state.spec_critique = critique  # 감사 기록(재합성 발생 여부 포함)
+            emit(_critique_label(critique))
+            try_save()
 
-    state = _init_state(spec)
-    record_transition(STAGE_SYNTHESIZE)
-    # 합성/critic(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
-    account(combine_costs(m_client.drain()))
-    if m_critic is not None:
-        account(combine_costs(m_critic.drain()))
-    if critique is not None:
-        state.spec_critique = critique  # 감사 기록(재합성 발생 여부 포함)
-        emit(_critique_label(critique))
-        try_save()
+        # 선제 스캐폴드(WO#27): executor *dispatch 전에* host가 진짜 스택을 깐다.
+        # scaffold_client 없으면 None → 모든 신규 경로 no-op(기존 동작 불변, critic 패턴과 동형).
+        # generate_scaffold는 best-effort라 dep 스택 불필요/실패면 None을 돌려준다.
+        scaffold: Scaffold | None = None
+        if scaffold_client is not None:
+            emit("scaffold 생성 중…")
+            record_transition(STAGE_SCAFFOLD)
+            scaffold = generate_scaffold(spec, m_scaffold, prompt_path=scaffold_prompt)
+            account(combine_costs(m_scaffold.drain()))  # scaffold(전역 단계) 비용 누적
+            emit(
+                f"scaffold: {len(scaffold.files)}개 파일 (install={scaffold.install})"
+                if scaffold is not None
+                else "scaffold: 불필요 — 스킵(no-op)"
+            )
 
-    # 선제 스캐폴드(WO#27): executor *dispatch 전에* host가 진짜 스택을 깐다.
-    # scaffold_client 없으면 None → 모든 신규 경로 no-op(기존 동작 불변, critic 패턴과 동형).
-    # generate_scaffold는 best-effort라 dep 스택 불필요/실패면 None을 돌려준다.
-    scaffold: Scaffold | None = None
-    if scaffold_client is not None:
-        emit("scaffold 생성 중…")
-        record_transition(STAGE_SCAFFOLD)
-        scaffold = generate_scaffold(spec, m_scaffold, prompt_path=scaffold_prompt)
-        account(combine_costs(m_scaffold.drain()))  # scaffold(전역 단계) 비용 누적
-        emit(
-            f"scaffold: {len(scaffold.files)}개 파일 (install={scaffold.install})"
-            if scaffold is not None
-            else "scaffold: 불필요 — 스킵(no-op)"
-        )
+        # 병렬 모드: worktree 격리 + 결정적 DAG 스케줄러로 분기.
+        # max_parallel<=1은 아래 순차 경로 그대로(현행 동작 불변 — 무회귀).
+        if max_parallel > 1:
+            return _parallel_loop(
+                spec,
+                state,
+                m_client,
+                integration_gate=gate,
+                executor_factory=executor_factory or (lambda wt: executor),
+                gate_factory=gate_factory or (lambda wt: gate),
+                wm=worktree_manager or WorktreeManager(workdir or "."),
+                max_parallel=max_parallel,
+                max_iters=max_iters,
+                replan_retries=replan_retries,
+                unit_retries=unit_retries,
+                rep_prompt=rep_prompt,
+                emit=emit,
+                try_save=try_save,
+                scaffold=scaffold,
+                install_deps=install_deps,
+                deps_runner=deps_runner,
+                apply_skills=apply_skills,
+                pricing=pricing,
+                now=now,
+                account=account,
+                record_transition=record_transition,
+                activity_start=activity_start,
+                activity_end=activity_end,
+                decomp_retries=decomp_retries,
+                run_decomp_critic=run_decomp_critic,
+                account_decomp_cost=(
+                    (lambda: account(combine_costs(m_critic.drain())))
+                    if m_critic is not None
+                    else (lambda: None)
+                ),
+                or_alternatives=or_alternatives,
+            )
 
-    # 병렬 모드: worktree 격리 + 결정적 DAG 스케줄러로 분기.
-    # max_parallel<=1은 아래 순차 경로 그대로(현행 동작 불변 — 무회귀).
-    if max_parallel > 1:
-        return _parallel_loop(
-            spec,
-            state,
-            m_client,
-            integration_gate=gate,
-            executor_factory=executor_factory or (lambda wt: executor),
-            gate_factory=gate_factory or (lambda wt: gate),
-            wm=worktree_manager or WorktreeManager(workdir or "."),
-            max_parallel=max_parallel,
-            max_iters=max_iters,
-            replan_retries=replan_retries,
-            unit_retries=unit_retries,
-            rep_prompt=rep_prompt,
-            emit=emit,
-            try_save=try_save,
-            scaffold=scaffold,
-            install_deps=install_deps,
-            deps_runner=deps_runner,
-            apply_skills=apply_skills,
-            pricing=pricing,
-            now=now,
-            account=account,
-            record_transition=record_transition,
-            activity_start=activity_start,
-            activity_end=activity_end,
-            decomp_retries=decomp_retries,
-            run_decomp_critic=run_decomp_critic,
-            account_decomp_cost=(
-                (lambda: account(combine_costs(m_critic.drain())))
-                if m_critic is not None
-                else (lambda: None)
-            ),
-            or_alternatives=or_alternatives,
-        )
+        # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
+        # scaffold=None이면 no-op → 기존 순차 경로 불변.
+        if scaffold is not None:
+            wd = Path(workdir or ".")
+            written = write_scaffold(scaffold, wd)
+            emit(f"scaffold 적용: {len(written)}개 파일 (workdir, executor 전)")
+            if scaffold.install and install_deps:
+                res = ensure_deps(wd, runner=deps_runner)
+                emit(f"scaffold host-install: {res.manager} ok={res.ok}")
 
-    # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
-    # scaffold=None이면 no-op → 기존 순차 경로 불변.
-    if scaffold is not None:
-        wd = Path(workdir or ".")
-        written = write_scaffold(scaffold, wd)
-        emit(f"scaffold 적용: {len(written)}개 파일 (workdir, executor 전)")
-        if scaffold.install and install_deps:
-            res = ensure_deps(wd, runner=deps_runner)
-            emit(f"scaffold host-install: {res.manager} ok={res.ok}")
+        last_result = "(시작 — 아직 실행 없음)"
+        # WO#25 Part A: 직전에 dispatch한 작업 유닛. brain이 다른 유닛으로 넘어가면(advance)
+        # 이 유닛을 done으로 수용하고, escalate면 이 유닛을 failed로 표시한다.
+        worked_unit: str | None = None
 
-    last_result = "(시작 — 아직 실행 없음)"
-    # WO#25 Part A: 직전에 dispatch한 작업 유닛. brain이 다른 유닛으로 넘어가면(advance)
-    # 이 유닛을 done으로 수용하고, escalate면 이 유닛을 failed로 표시한다.
-    worked_unit: str | None = None
+        iters = 0
+        while iters < max_iters and state.status == Status.running:
+            iters += 1
 
-    iters = 0
-    while iters < max_iters and state.status == Status.running:
-        iters += 1
-
-        # replan(비결정 LLM 출력 → 검증 실패 흡수) + 분해 critic(WO#40).
-        # 바깥 루프 = 분해 critic 재계획(bounded decomp_retries), 안쪽 = replan 파싱 재시도.
-        # weak 판정 → 피드백 주고 재replan; 재시도 소진 후에도 weak면 *진행*(데드락 금지)+기록.
-        record_transition(STAGE_REPLAN)
-        decision = None
-        last_err: ReplanError | None = None
-        decomp_feedback: str | None = None  # weak 판정 시 다음 replan에 얹는 피드백
-        for _decomp_attempt in range(decomp_retries + 1):
+            # replan(비결정 LLM 출력 → 검증 실패 흡수) + 분해 critic(WO#40).
+            # 바깥 루프 = 분해 critic 재계획(bounded decomp_retries), 안쪽 = replan 파싱 재시도.
+            # weak 판정 → 피드백 주고 재replan; 재시도 소진 후에도 weak면 *진행*(데드락 금지)+기록.
+            record_transition(STAGE_REPLAN)
             decision = None
-            feedback: str | None = decomp_feedback
-            for _attempt in range(replan_retries + 1):
-                if _attempt == 0:
+            last_err: ReplanError | None = None
+            decomp_feedback: str | None = None  # weak 판정 시 다음 replan에 얹는 피드백
+            for _decomp_attempt in range(decomp_retries + 1):
+                decision = None
+                feedback: str | None = decomp_feedback
+                for _attempt in range(replan_retries + 1):
+                    if _attempt == 0:
+                        emit(
+                            "replan 중…" if decomp_feedback is None
+                            else f"replan(분해 재계획): {_truncate(decomp_feedback)}"
+                        )
+                    else:
+                        emit(
+                            f"replan 재시도 {_attempt}: "
+                            f"{_truncate(feedback or 'Decision 검증 실패')}"
+                        )
+                    try:
+                        decision = replan(
+                            spec, state, last_result, m_client,
+                            prompt_path=rep_prompt, feedback=feedback,
+                        )
+                        break
+                    except ReplanError as e:
+                        last_err = e
+                        feedback = e.message  # raw는 빼고 검증 메시지만 다시 태운다
+                # 파싱 소진 / 분해 critic 비대상 action(next_order/retry 아님) → 그대로 채택.
+                if decision is None or decision.action not in (Action.next_order, Action.retry):
+                    break
+                no_candidate = decision.next_order
+                if no_candidate is None:
+                    break  # 본문 없음 → 아래 action 처리에서 방어 escalate
+                crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입 원본
+                if crit is None or not is_weak(crit):
+                    break  # progress(또는 OFF/평가불가) → 이 분해 채택
+                # weak: 재시도 남았으면 reject→재replan, 소진이면 진행(데드락 금지).
+                if _decomp_attempt < decomp_retries:
+                    crit.rejected = True
+                    state.decomp_critiques.append(crit)
+                    record_transition(STAGE_DECOMP_REJECT, no_candidate.unit)
                     emit(
-                        "replan 중…" if decomp_feedback is None
-                        else f"replan(분해 재계획): {_truncate(decomp_feedback)}"
+                        f"분해 critic: weak → reject·재계획 ({no_candidate.unit}): "
+                        f"{_truncate(crit.reason or '')}"
                     )
+                    decomp_feedback = build_decomp_feedback(crit)
+                    try_save()  # 증분: reject 판정도 즉시 감사 로그에 보존
                 else:
+                    state.decomp_critiques.append(crit)  # 소진 — rejected=False(진행함)
                     emit(
-                        f"replan 재시도 {_attempt}: "
-                        f"{_truncate(feedback or 'Decision 검증 실패')}"
+                        f"분해 critic: weak이나 재시도 소진 → 진행 ({no_candidate.unit}): "
+                        f"{_truncate(crit.reason or '')}"
                     )
-                try:
-                    decision = replan(
-                        spec, state, last_result, m_client,
-                        prompt_path=rep_prompt, feedback=feedback,
+            # 이 iteration의 replan(재계획 재시도 포함) orchestration 비용을 꺼낸다.
+            replan_cost = combine_costs(m_client.drain())
+            # 분해 critic(verifier-side) 비용도 정직하게 누적(코스트 패널에 보임).
+            if m_critic is not None:
+                account(combine_costs(m_critic.drain()))
+            if decision is None:
+                account(replan_cost)  # 실패한 replan도 비용은 정직하게 누적
+                state.status = Status.escalated
+                state.pending_escalations.append(
+                    {
+                        "reason": f"replan 출력 {replan_retries + 1}회 검증 실패",
+                        "raw_response": last_err.raw_response if last_err else None,
+                    }
+                )
+                break
+
+            action = decision.action
+
+            if action in (Action.next_order, Action.retry):
+                no = decision.next_order
+                if no is None:
+                    # 방어: next_order/retry인데 본문이 없음 → 사람 tier로 올림
+                    state.status = Status.escalated
+                    state.pending_escalations.append(
+                        {"reason": "next_order 본문 없음", "action": action.value}
                     )
                     break
-                except ReplanError as e:
-                    last_err = e
-                    feedback = e.message  # raw는 빼고 검증 메시지만 다시 태운다
-            # 파싱 소진 / 분해 critic 비대상 action(next_order/retry 아님) → 그대로 채택.
-            if decision is None or decision.action not in (Action.next_order, Action.retry):
-                break
-            no_candidate = decision.next_order
-            if no_candidate is None:
-                break  # 본문 없음 → 아래 action 처리에서 방어 escalate
-            crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입 원본
-            if crit is None or not is_weak(crit):
-                break  # progress(또는 OFF/평가불가) → 이 분해 채택
-            # weak: 재시도 남았으면 reject→재replan, 소진이면 진행(데드락 금지).
-            if _decomp_attempt < decomp_retries:
-                crit.rejected = True
-                state.decomp_critiques.append(crit)
-                record_transition(STAGE_DECOMP_REJECT, no_candidate.unit)
-                emit(
-                    f"분해 critic: weak → reject·재계획 ({no_candidate.unit}): "
-                    f"{_truncate(crit.reason or '')}"
-                )
-                decomp_feedback = build_decomp_feedback(crit)
-                try_save()  # 증분: reject 판정도 즉시 감사 로그에 보존
-            else:
-                state.decomp_critiques.append(crit)  # 소진 — rejected=False(진행함)
-                emit(
-                    f"분해 critic: weak이나 재시도 소진 → 진행 ({no_candidate.unit}): "
-                    f"{_truncate(crit.reason or '')}"
-                )
-        # 이 iteration의 replan(재계획 재시도 포함) orchestration 비용을 꺼낸다.
-        replan_cost = combine_costs(m_client.drain())
-        # 분해 critic(verifier-side) 비용도 정직하게 누적(코스트 패널에 보임).
-        if m_critic is not None:
-            account(combine_costs(m_critic.drain()))
-        if decision is None:
-            account(replan_cost)  # 실패한 replan도 비용은 정직하게 누적
-            state.status = Status.escalated
-            state.pending_escalations.append(
-                {
-                    "reason": f"replan 출력 {replan_retries + 1}회 검증 실패",
-                    "raw_response": last_err.raw_response if last_err else None,
-                }
-            )
-            break
-
-        action = decision.action
-
-        if action in (Action.next_order, Action.retry):
-            no = decision.next_order
-            if no is None:
-                # 방어: next_order/retry인데 본문이 없음 → 사람 tier로 올림
-                state.status = Status.escalated
-                state.pending_escalations.append(
-                    {"reason": "next_order 본문 없음", "action": action.value}
-                )
-                break
-            # WO#25 Part A: brain이 다른 유닛으로 넘어가면 직전 작업 유닛을 수용(done).
-            # dispatch하는 유닛은 in_progress. (gate/replan/종료 로직은 불변 — plan state만.)
-            if worked_unit is not None and worked_unit != no.unit:
-                _advance_done(state, worked_unit)
-            _set_plan_state(state, no.unit, PlanState.in_progress)
-            worked_unit = no.unit
-            # WO#33: dispatch=build 단계 진입 → 라이브 activity + 전이 이력.
-            activity_start(no.unit, STAGE_BUILD)
-            record_transition(STAGE_BUILD, no.unit)
-            emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
-            try_save()  # 증분: in-flight activity가 대시보드 폴링에 보이도록
-            result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
-            exec_cost = _executor_cost(executor, pricing)  # 읽기만(best-effort)
-            # WO#33: gate 진입=verify 단계로 갱신.
-            activity_set_stage(no.unit, STAGE_VERIFY)
-            record_transition(STAGE_VERIFY, no.unit)
-            emit("gate 검사 중…")
-            gr = gate.judge(result, spec)
-            verdict = gr.verdict
-            emit(_summarize_gate(gr))
-            activity_end(no.unit)  # 완료 → 라이브 activity에서 제거
-            # 이 유닛 처리 비용 = replan(orchestration) + executor + judge(gate) 귀속.
-            event_cost = combine_costs([replan_cost, exec_cost, gr.judge_cost])
-            account(event_cost)
-            state.events.append(
-                Event(
-                    seq=len(state.events) + 1,
-                    unit=no.unit,
-                    work_order_ref=no.goal,
-                    result=result,
-                    verdict=verdict,
-                    checks=gr.checks,
-                    cost=event_cost,
-                    ts=now(),
-                    stage=STAGE_BUILD,
-                )
-            )
-            try_save()  # 증분: 매 이벤트마다 감사 로그 보존(비치명적)
-            last_result = f"unit={no.unit} verdict={verdict.value} :: {result}"
-            if verdict == Verdict.done:
-                state.status = Status.done
-
-        elif action == Action.stop:
-            account(replan_cost)  # event 없는 종료 — replan 비용은 budget에만
-            record_transition(STAGE_DONE)
-            state.status = Status.done
-
-        elif action == Action.escalate:
-            account(replan_cost)
-            record_transition(STAGE_ESCALATE, worked_unit)
-            state.status = Status.escalated
-            # WO#25 Part A: brain이 작업 중이던 유닛을 포기(escalate) → 그 유닛 failed.
-            if worked_unit is not None:
-                _set_plan_state(state, worked_unit, PlanState.failed)
-            if decision.escalation is not None:
-                state.pending_escalations.append(
-                    decision.escalation.model_dump(by_alias=True, mode="json")
-                )
-
-        elif action == Action.replan_approach:
-            account(replan_cost)
-            # executor 호출 없이 다음 루프 — 다음 replan이 계획을 다시 짠다.
-            last_result = "(approach reset — 이전 접근 폐기, 재계획 요청됨)"
-
-        elif action == Action.propose_spec_change:
-            # governed 적용(mutability gradient): assumptions+evidence는 자율 적용,
-            # 성공 정의(goal/criteria/done_when)·anchor(order_raw)는 자율 변경 불가.
-            proposal = decision.spec_change
-            if proposal is None:
-                state.status = Status.escalated
-                state.pending_escalations.append(
-                    {"reason": "propose_spec_change인데 spec_change 본문 없음"}
-                )
-                break
-            outcome = apply_spec_change(spec, state, proposal)
-            if outcome.applied:
-                account(replan_cost)
-                # 감사 이벤트만 남기고 루프 계속 — 다음 replan이 갱신된 spec을 본다.
+                # WO#25 Part A: brain이 다른 유닛으로 넘어가면 직전 작업 유닛을 수용(done).
+                # dispatch하는 유닛은 in_progress. (gate/replan/종료 로직은 불변 — plan state만.)
+                if worked_unit is not None and worked_unit != no.unit:
+                    _advance_done(state, worked_unit)
+                _set_plan_state(state, no.unit, PlanState.in_progress)
+                worked_unit = no.unit
+                # WO#33: dispatch=build 단계 진입 → 라이브 activity + 전이 이력.
+                activity_start(no.unit, STAGE_BUILD)
+                record_transition(STAGE_BUILD, no.unit)
+                emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
+                try_save()  # 증분: in-flight activity가 대시보드 폴링에 보이도록
+                result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
+                exec_cost = _executor_cost(executor, pricing)  # 읽기만(best-effort)
+                # WO#33: gate 진입=verify 단계로 갱신.
+                activity_set_stage(no.unit, STAGE_VERIFY)
+                record_transition(STAGE_VERIFY, no.unit)
+                emit("gate 검사 중…")
+                gr = gate.judge(result, spec)
+                verdict = gr.verdict
+                emit(_summarize_gate(gr))
+                activity_end(no.unit)  # 완료 → 라이브 activity에서 제거
+                # 이 유닛 처리 비용 = replan(orchestration) + executor + judge(gate) 귀속.
+                event_cost = combine_costs([replan_cost, exec_cost, gr.judge_cost])
+                account(event_cost)
                 state.events.append(
                     Event(
                         seq=len(state.events) + 1,
-                        verdict=decision.verdict,
-                        result=f"spec-change applied: {outcome.reason}",
-                        learnings=outcome.reason,
-                        cost=replan_cost,
+                        unit=no.unit,
+                        work_order_ref=no.goal,
+                        result=result,
+                        verdict=verdict,
+                        checks=gr.checks,
+                        cost=event_cost,
                         ts=now(),
-                        stage=STAGE_REPLAN,
+                        stage=STAGE_BUILD,
                     )
                 )
-                emit(f"spec 변경 적용: {proposal.target} (v{spec.version})")
-                try_save()  # 증분: spec 변경도 즉시 보존(비치명적)
-                last_result = f"(spec-change applied — {outcome.reason})"
-            else:
+                try_save()  # 증분: 매 이벤트마다 감사 로그 보존(비치명적)
+                last_result = f"unit={no.unit} verdict={verdict.value} :: {result}"
+                if verdict == Verdict.done:
+                    state.status = Status.done
+
+            elif action == Action.stop:
+                account(replan_cost)  # event 없는 종료 — replan 비용은 budget에만
+                record_transition(STAGE_DONE)
+                state.status = Status.done
+
+            elif action == Action.escalate:
+                account(replan_cost)
+                record_transition(STAGE_ESCALATE, worked_unit)
+                state.status = Status.escalated
+                # WO#25 Part A: brain이 작업 중이던 유닛을 포기(escalate) → 그 유닛 failed.
+                if worked_unit is not None:
+                    _set_plan_state(state, worked_unit, PlanState.failed)
+                if decision.escalation is not None:
+                    state.pending_escalations.append(
+                        decision.escalation.model_dump(by_alias=True, mode="json")
+                    )
+
+            elif action == Action.replan_approach:
+                account(replan_cost)
+                # executor 호출 없이 다음 루프 — 다음 replan이 계획을 다시 짠다.
+                last_result = "(approach reset — 이전 접근 폐기, 재계획 요청됨)"
+
+            elif action == Action.propose_spec_change:
+                # governed 적용(mutability gradient): assumptions+evidence는 자율 적용,
+                # 성공 정의(goal/criteria/done_when)·anchor(order_raw)는 자율 변경 불가.
+                proposal = decision.spec_change
+                if proposal is None:
+                    state.status = Status.escalated
+                    state.pending_escalations.append(
+                        {"reason": "propose_spec_change인데 spec_change 본문 없음"}
+                    )
+                    break
+                outcome = apply_spec_change(spec, state, proposal)
+                if outcome.applied:
+                    account(replan_cost)
+                    # 감사 이벤트만 남기고 루프 계속 — 다음 replan이 갱신된 spec을 본다.
+                    state.events.append(
+                        Event(
+                            seq=len(state.events) + 1,
+                            verdict=decision.verdict,
+                            result=f"spec-change applied: {outcome.reason}",
+                            learnings=outcome.reason,
+                            cost=replan_cost,
+                            ts=now(),
+                            stage=STAGE_REPLAN,
+                        )
+                    )
+                    emit(f"spec 변경 적용: {proposal.target} (v{spec.version})")
+                    try_save()  # 증분: spec 변경도 즉시 보존(비치명적)
+                    last_result = f"(spec-change applied — {outcome.reason})"
+                else:
+                    account(replan_cost)
+                    state.status = Status.escalated
+                    state.pending_escalations.append(outcome.note)
+                    emit(f"spec 변경 escalate: {_truncate(outcome.reason)}")
+
+            else:  # 방어: 미지원 action
                 account(replan_cost)
                 state.status = Status.escalated
-                state.pending_escalations.append(outcome.note)
-                emit(f"spec 변경 escalate: {_truncate(outcome.reason)}")
+                state.pending_escalations.append({"reason": f"미지원 action: {action.value}"})
 
-        else:  # 방어: 미지원 action
-            account(replan_cost)
-            state.status = Status.escalated
-            state.pending_escalations.append({"reason": f"미지원 action: {action.value}"})
+        # WO#25 Part A: 종료가 done이면 작업된(=pending 아닌) 모든 유닛을 done으로.
+        # done = 전체 spec 통과 = 모든 작업 유닛 반영됨 → "전부 in_progress 고착" 해소.
+        if state.status == Status.done:
+            for item in state.plan:
+                if item.state != PlanState.pending:
+                    item.state = PlanState.done
 
-    # WO#25 Part A: 종료가 done이면 작업된(=pending 아닌) 모든 유닛을 done으로.
-    # done = 전체 spec 통과 = 모든 작업 유닛 반영됨 → "전부 in_progress 고착" 해소.
-    if state.status == Status.done:
-        for item in state.plan:
-            if item.state != PlanState.pending:
-                item.state = PlanState.done
+        # max_iters 도달 등으로 여전히 running이면 임시로 stopped_stuck.
+        if state.status == Status.running:
+            state.status = Status.stopped_stuck
 
-    # max_iters 도달 등으로 여전히 running이면 임시로 stopped_stuck.
-    if state.status == Status.running:
-        state.status = Status.stopped_stuck
+        emit(_final_label(state))
+        try_save()
 
-    emit(_final_label(state))
-    try_save()
-
-    return state
+        return state
+    except KeyboardInterrupt:
+        # 웹 stop/SIGINT: 순차 경로는 worktree 미사용이라 state 저장만으로 충분.
+        #   (병렬 경로의 worktree 정리는 _parallel_loop의 finally가 보장한다.)
+        #   best-effort — 정리/저장 중 추가 예외도 흡수(2차 크래시 금지).
+        _finalize_interrupt(state, emit, try_save)
+        return state
 
 
 # ──────────────────────────── 병렬 루프 (WO#21) ────────────────────────────
@@ -1263,6 +1310,12 @@ def _parallel_loop(
         materialize(integration_ev)
         emit(_final_label(state))
         try_save()
+        return state
+    except KeyboardInterrupt:
+        # 웹 stop/SIGINT(예: OR 대안 replan 중 codex.complete에서 KeyboardInterrupt):
+        #   진행분을 materialize→저장(persist)하고 클린 반환한다. worktree/산출물 정리는
+        #   아래 finally(cleanup_all)가 보장한다(#21). best-effort(2차 크래시 금지).
+        _finalize_interrupt(state, emit, persist)
         return state
     finally:
         # 타협 불가: done/escalate/예외/Ctrl-C 어떤 경로든 흔적 0.

@@ -732,3 +732,81 @@ def test_run_loop_synthesis_failure_saves_state(tmp_path):
     assert out.exists()
     reloaded = State.from_yaml(out)
     assert reloaded.status is Status.escalated
+
+
+# ──────────────────────────── graceful stop / SIGINT (WO#43) ────────────────────────────
+
+
+class _InterruptExec:
+    """첫 run에서 KeyboardInterrupt(=웹 stop/SIGINT 모사) 발생."""
+
+    def run(self, order):
+        raise KeyboardInterrupt()
+
+
+def test_sequential_interrupt_saves_state_clean_exit(tmp_path):
+    """순차 루프 도중 KeyboardInterrupt → 클린 반환(traceback 없음) + state 저장 + '중단됨' 로그."""
+    client = MockClient([SPEC_YAML, _next_order("u1")])
+    sp = tmp_path / "state.yaml"
+    msgs: list[str] = []
+    # KeyboardInterrupt가 run_loop 밖으로 새지 않고 State로 마무리되면 클린 종료.
+    state = run_loop(
+        order="x", client=client, executor=_InterruptExec(),
+        gate=MockGate(Verdict.pass_), prompt_dir=PROMPT_DIR,
+        state_path=sp, progress=msgs.append,
+    )
+    assert isinstance(state, State)
+    # 종료 상태 봉인: running 아님(stopped로 해석 → 대시보드에 "중단됨").
+    assert state.status is Status.stopped_stuck
+    assert any("중단됨" in m for m in msgs)
+    # state 저장 + 부분 진행 보존(u1 dispatch까지 반영).
+    assert sp.exists()
+    saved = State.from_yaml(sp)
+    assert saved.status is Status.stopped_stuck
+    assert saved.spec_ref == "loop-001"  # 합성된 spec 보존(부분 진행)
+
+
+def test_interrupt_during_synthesis_uses_placeholder_state(tmp_path):
+    """합성(spec 생성) 전 KeyboardInterrupt → placeholder state로 클린 마무리·저장."""
+    class KIClient:
+        def complete(self, system, user, **opts):
+            raise KeyboardInterrupt()
+
+    sp = tmp_path / "state.yaml"
+    msgs: list[str] = []
+    state = run_loop(
+        order="x", client=KIClient(), executor=MockExecutor("noop"),
+        gate=MockGate(Verdict.pass_), prompt_dir=PROMPT_DIR,
+        state_path=sp, progress=msgs.append,
+    )
+    assert isinstance(state, State)
+    assert state.status is Status.stopped_stuck
+    assert state.spec_ref == "(interrupted)"  # placeholder 사용됨
+    assert any("중단됨" in m for m in msgs)
+    assert sp.exists()
+
+
+def test_finalize_interrupt_absorbs_emit_and_save_errors():
+    """정리/저장 콜백이 예외를 던져도 흡수 — 2차 크래시 없이 상태만 봉인(best-effort)."""
+    from haetae.loop import _finalize_interrupt
+
+    st = State(spec_ref="x", spec_version=1, status=Status.running)
+
+    def bad_emit(_msg):
+        raise RuntimeError("emit 폭발")
+
+    def bad_save():
+        raise RuntimeError("save 폭발")
+
+    # 예외를 raise하지 않고 정상 반환해야 한다(2차 크래시 금지).
+    _finalize_interrupt(st, bad_emit, bad_save)
+    assert st.status is Status.stopped_stuck
+
+
+def test_no_interrupt_normal_done_unchanged():
+    """인터럽트 없을 때 정상 done 경로는 불변(graceful-stop 래핑 무회귀)."""
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u2")])
+    state = run_loop(order="x", client=client, executor=MockExecutor(["a", "b"]),
+                     gate=MockGate([Verdict.pass_, Verdict.done]), prompt_dir=PROMPT_DIR)
+    assert state.status is Status.done
+    assert len(state.events) == 2

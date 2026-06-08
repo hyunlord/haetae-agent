@@ -707,3 +707,32 @@ def test_or_alternative_is_decomp_critic_checked(tmp_path):
     assert any(c.rejected and c.verdict == "weak" for c in state.decomp_critiques)
     assert any(a.scope == "unit:u1" and a.outcome == "abandoned" for a in state.approaches)
     assert_clean(tmp_path)
+
+
+# ──────────────────────── graceful stop / SIGINT (WO#43) ────────────────────────
+
+
+def test_parallel_interrupt_cleans_worktree_and_saves(tmp_path):
+    """병렬 라운드 도중 KeyboardInterrupt(웹 stop/SIGINT) → 클린 반환 +
+    worktree 정리(cleanup_all) 보장 + state 저장 + '중단됨' 로그 (uncaught traceback 없음)."""
+    def make_ex(wt):
+        class E:
+            def run(self, order):
+                raise KeyboardInterrupt()  # OR 대안 replan 중 codex 인터럽트 모사
+        return E()
+
+    sp = tmp_path / "state.yaml"
+    msgs: list[str] = []
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        state_path=sp, progress=msgs.append,
+    )
+    # KeyboardInterrupt가 밖으로 새지 않고 State로 마무리(클린 종료).
+    assert isinstance(state, State)
+    assert state.status is Status.stopped_stuck
+    assert any("중단됨" in m for m in msgs)
+    assert sp.exists()
+    # finally(cleanup_all)가 worktree·브랜치·관리루트를 0으로 — 인터럽트에도 흔적 없음.
+    assert_clean(tmp_path)
