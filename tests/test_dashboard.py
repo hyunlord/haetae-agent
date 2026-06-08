@@ -32,11 +32,13 @@ from haetae.dashboard import (
 from haetae.models import (
     AcceptanceCriterion,
     Activity,
+    ApproachAttempt,
     Budget,
     Check,
     CheckReport,
     CheckType,
     Cost,
+    DecompCritique,
     DecompositionUnit,
     Event,
     PlanItem,
@@ -995,3 +997,149 @@ def test_log_endpoint_no_run_manager_404(tmp_path: Path):
         assert "lines" in json.loads(body)
     finally:
         httpd.shutdown()
+
+
+# ════════════════════ v3.1 대시보드 폴리시 (WO#44) ════════════════════
+
+
+# ──────────────────── A. 빈 상태 vs 실제 로드 실패 구분 ────────────────────
+
+
+def test_state_no_path_returns_empty_flag_not_error(tmp_path: Path):
+    """run 미선택 + state-path 없음 → {empty:true} 플래그(에러 아님)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    httpd, port = _serve_ctl(rm)  # state_path=None, run 미선택
+    try:
+        code, body = _get(port, "/api/state")
+        assert code == 200
+        v = json.loads(body)
+        assert v.get("empty") is True
+        assert "error" not in v
+    finally:
+        httpd.shutdown()
+
+
+def test_state_selected_run_load_failure_is_error(tmp_path: Path):
+    """선택한 run의 state.yaml 부재/손상 → {error}(빈 상태와 구분)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    rid = "20260608-120000-x"
+    (rm.runs_dir / rid).mkdir(parents=True)  # state.yaml 없음(로드 실패)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, f"/api/state?run={rid}")
+        assert code == 200
+        v = json.loads(body)
+        assert "error" in v
+        assert not v.get("empty")  # 실제 로드 실패는 빈 상태가 아님
+    finally:
+        httpd.shutdown()
+
+
+# ──────────────────── B. DW식 run 요약 헤더 ────────────────────
+
+
+def test_summary_unit_counts_and_status():
+    """요약: 유닛 상태별 카운트 + status(빈 ts → 경과/단계 None, 무크래시)."""
+    v = state_to_view(_state())
+    s = v["summary"]
+    assert s["status"] == "escalated"
+    assert s["units"] == {"total": 5, "done": 2, "in_progress": 1, "pending": 1, "failed": 1}
+    assert s["current_stage"] is None  # transitions 없음
+    assert s["active_count"] == 0
+    assert s["tokens"]["total"] is None  # budget.spent 비어있음
+    assert s["elapsed_s"] is None  # event ts 없음
+
+
+def test_summary_stage_active_tokens_elapsed_v2():
+    """요약: 현재단계(최근 transition)·활성수·총토큰(+in/out)·경과(start~now)."""
+    v = state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")
+    s = v["summary"]
+    assert s["status"] == "running"
+    assert s["current_stage"] == "build"  # 최근 transition = ("build","u2")
+    assert s["active_count"] == 2  # activity 2개
+    assert s["tokens"]["total"] == 4750
+    assert s["tokens"]["input"] == 3600 and s["tokens"]["output"] == 1150
+    # 경과 = now - 가장 이른 ts(14:00:00 synthesize)
+    assert s["elapsed_s"] == 30.0
+
+
+def test_summary_empty_state_no_crash():
+    """완전 빈 state → 카운트 0/None, 무크래시, JSON 직렬화."""
+    s = State(spec_ref="x", spec_version=1, status=Status.running)
+    v = state_to_view(s, now="2026-06-07T14:00:30Z")
+    sm = v["summary"]
+    assert sm["units"]["total"] == 0
+    assert sm["current_stage"] is None and sm["active_count"] == 0
+    assert sm["tokens"]["total"] is None
+    assert sm["elapsed_s"] is None
+    assert sm["or_alternatives"] == 0 and sm["decomp_rejects"] == 0
+    json.dumps(v)
+
+
+# ──────────────────── C. approaches/decomp 표면화 + per-unit 카운트 ────────────────────
+
+
+def _state_or_decomp() -> State:
+    """OR 접근(#41) + 분해 critic(#40) + 재dispatch(transitions)를 가진 state."""
+    plan = [
+        PlanItem(unit="u1", state=PlanState.in_progress, deps=None),
+        PlanItem(unit="u2", state=PlanState.pending, deps=["u1"]),
+    ]
+    return State(
+        spec_ref="x", spec_version=1, status=Status.running, plan=plan,
+        transitions=[
+            StageTransition(stage="build", unit="u1", ts="2026-06-07T14:00:00Z"),
+            StageTransition(stage="build", unit="u1", ts="2026-06-07T14:00:10Z"),  # 재dispatch
+            StageTransition(stage="build", unit="u2", ts="2026-06-07T14:00:20Z"),
+        ],
+        approaches=[
+            ApproachAttempt(scope="unit:u1", approach="원본", outcome="fail", index=0),
+            ApproachAttempt(scope="unit:u1", approach="대안A", outcome="abandoned", index=1),
+            ApproachAttempt(scope="integration", approach="통합 접근", outcome="fail", index=0),
+        ],
+        decomp_critiques=[
+            DecompCritique(verdict="weak", unit="u1", reason="goal 재진술", rejected=True),
+            DecompCritique(verdict="progress", unit="u2", reason="진전", rejected=False),
+        ],
+    )
+
+
+def test_unit_rows_retry_or_decomp_counts():
+    """unit_rows: 재시도(build 전이-1) · OR 시도(scope) · 분해 reject 카운트."""
+    v = state_to_view(_state_or_decomp())
+    rows = {r["unit"]: r for r in v["unit_rows"]}
+    assert rows["u1"]["retries"] == 1  # build 2회 - 1
+    assert rows["u2"]["retries"] == 0  # build 1회
+    assert rows["u1"]["or_attempts"] == 2  # unit:u1 approaches 2개
+    assert rows["u2"]["or_attempts"] == 0
+    assert rows["u1"]["decomp_rejects"] == 1  # rejected weak 1개
+    assert rows["u2"]["decomp_rejects"] == 0  # progress는 reject 아님
+
+
+def test_approaches_and_decomp_critiques_surfaced():
+    """state.approaches / decomp_critiques 를 뷰에 표면화(JSON)."""
+    v = state_to_view(_state_or_decomp())
+    assert len(v["approaches"]) == 3
+    alt = v["approaches"][1]
+    assert alt["scope"] == "unit:u1" and alt["index"] == 1 and alt["outcome"] == "abandoned"
+    assert len(v["decomp_critiques"]) == 2
+    rej = v["decomp_critiques"][0]
+    assert rej["verdict"] == "weak" and rej["unit"] == "u1" and rej["rejected"] is True
+
+
+def test_summary_or_decomp_global_aggregates():
+    """요약 전역 패널: OR 대안(index>=1) 횟수 · 분해 reject 횟수."""
+    s = state_to_view(_state_or_decomp())["summary"]
+    assert s["or_alternatives"] == 1  # index>=1 한 개(대안A)
+    assert s["decomp_rejects"] == 1
+
+
+def test_approaches_decomp_empty_when_absent_no_crash():
+    """구버전/부재 state → approaches/decomp_critiques 빈, per-unit 카운트 0(무크래시)."""
+    v = state_to_view(_state())
+    assert v["approaches"] == [] and v["decomp_critiques"] == []
+    rows = {r["unit"]: r for r in v["unit_rows"]}
+    assert rows["u1"]["retries"] == 0
+    assert rows["u1"]["or_attempts"] == 0
+    assert rows["u1"]["decomp_rejects"] == 0
+    json.dumps(v)

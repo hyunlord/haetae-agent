@@ -111,6 +111,23 @@
   #detail .ph { color:var(--mut); font-size:13px; }
   .small { font-size:11.5px; }
   .err { background:#7f1d1d; color:#fecaca; padding:14px; border-radius:8px; margin:14px 0; }
+  /* ── v3.1 (WO#44 A): 차분한 빈 상태(에러 아님) ── */
+  .empty-hint { background:var(--panel2); border:1px solid var(--bd); color:var(--mut);
+    padding:18px 18px; border-radius:10px; margin:14px 18px 0; font-size:13px; line-height:1.7; }
+  .empty-hint b { color:var(--tx); }
+  .empty-hint code { background:#0b0d11; padding:2px 6px; border-radius:5px; }
+  /* ── v3.1 (WO#44 B): DW식 한눈 요약 바 ── */
+  .summary { display:flex; flex-wrap:wrap; align-items:center; gap:7px 16px; margin:14px 18px 0;
+    padding:10px 14px; background:var(--panel); border:1px solid var(--bd); border-radius:10px; font-size:12.5px; }
+  .summary .sm-grp { display:flex; align-items:center; gap:6px; }
+  .summary .sm-k { color:var(--mut); text-transform:uppercase; font-size:10px; letter-spacing:.06em; }
+  .summary .sm-seg b { font-variant-numeric:tabular-nums; font-weight:700; }
+  .summary .sm-sep { width:1px; align-self:stretch; background:var(--bd); }
+  /* ── v3.1 (WO#44 C): 유닛 행 배지(재시도/OR 대안/분해 reject) ── */
+  .ulist .ubadge { font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; font-variant-numeric:tabular-nums; }
+  .ulist .ubadge.re { background:#1c1917; color:#fcd34d; }
+  .ulist .ubadge.or { background:#042f2e; color:#99f6e4; }
+  .ulist .ubadge.dr { background:#450a0a; color:#fecaca; }
   /* 제어 표면: runs 목록 + 실행 폼 (WO#37) */
   .runs-card { border-color:#2c3550; }
   .runs-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
@@ -182,6 +199,7 @@
   <span id="tick" class="mut small"></span>
 </header>
 <div id="banner-slot"></div>
+<div id="summary" class="summary" style="display:none"></div>
 <div id="runs-card" class="card runs-card" style="display:none; margin:14px 18px 0;">
   <div class="runs-head">
     <h2>runs</h2>
@@ -393,10 +411,25 @@ async function launchRun(){
 }
 
 function render(v) {
+  if (v && v.empty) {
+    // A(WO#44): run 미선택 + state-path 없음 — 에러 아님. 차분한 안내 + RUNS가 주인공.
+    $("banner-slot").innerHTML = '<div class="empty-hint">'
+      + '<b>표시할 run이 선택되지 않았습니다.</b><br>'
+      + '위 <b>RUNS</b> 목록에서 run을 선택'
+      + (ALLOW_RUN ? '하거나 <b>+ 새 run</b>으로 시작하세요.' : '하세요.')
+      + '<br><span class="mut small">또는 <code>--state-path</code>로 단일 state를 지정해 띄울 수 있습니다.</span>'
+      + '</div>';
+    $("summary").style.display = "none"; $("summary").innerHTML = "";
+    $("specref").textContent = "";
+    $("status").textContent = "—"; $("status").className = "pill mut";
+    clearViewer();
+    return;
+  }
   if (v.error) {
     // body를 통째로 갈아엎지 않는다(runs 목록/폼 유지) — 뷰어 영역에만 에러 표시.
     $("banner-slot").innerHTML = '<div class="err">state 로드 실패: '+esc(v.error)
       + (RUN? '' : ' — 왼쪽에서 run을 고르거나 --state-path로 띄우세요.')+'</div>';
+    $("summary").style.display = "none"; $("summary").innerHTML = "";
     $("status").textContent = "—"; $("status").className = "pill mut";
     clearViewer();
     return;
@@ -408,6 +441,7 @@ function render(v) {
     const e0 = (v.pending_escalations||[])[0] || {};
     bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
   } else bs.innerHTML = "";
+  renderSummary(v);
   renderUnitList(v);
   renderDag(v);
   renderTransitions(v);
@@ -430,6 +464,45 @@ function liveElapsed(a){
   if (a.elapsed_s==null) return null;
   return a.elapsed_s + Math.max(0, (Date.now()-lastMsg)/1000);
 }
+// DW식 한눈 요약 바(WO#44 B): 유닛 상태별 카운트 · 현재단계 · 활성 · 토큰 · 경과 · status.
+function renderSummary(v) {
+  const s = v.summary; const box = $("summary");
+  if (!s) { box.style.display="none"; box.innerHTML=""; return; }
+  box.style.display = "flex";
+  const u = s.units||{};
+  const seg = (label,val,cls)=> '<span class="sm-seg"><b'+(cls?' class="'+cls+'"':'')+'>'+num(val)+'</b> '+label+'</span>';
+  let h = '';
+  // 유닛 진척(완료/진행/대기/실패)
+  h += '<span class="sm-grp"><span class="sm-k">유닛</span>'
+     + seg("총", u.total)
+     + seg("완료", u.done, "t-done")
+     + seg("진행", u.in_progress, "t-in_progress")
+     + seg("대기", u.pending, "t-pending")
+     + (u.failed ? seg("실패", u.failed, "t-failed") : "")
+     + '</span><span class="sm-sep"></span>';
+  // 현재 단계 + 활성 에이전트 수
+  h += '<span class="sm-grp"><span class="sm-k">단계</span>'
+     + (s.current_stage ? stageBadge(s.current_stage) : '<span class="mut">—</span>')
+     + '<span class="sm-seg"><b>'+num(s.active_count)+'</b> 활성</span></span><span class="sm-sep"></span>';
+  // 총 토큰(+ in/out)
+  const tk = s.tokens||{};
+  h += '<span class="sm-grp"><span class="sm-k">토큰</span><span class="sm-seg"><b>'+num(tk.total)+'</b></span>'
+     + ((tk.input!=null||tk.output!=null) ? '<span class="mut small">in '+num(tk.input)+' · out '+num(tk.output)+'</span>' : '')
+     + '</span><span class="sm-sep"></span>';
+  // 경과
+  h += '<span class="sm-grp"><span class="sm-k">경과</span><span class="sm-seg"><b>'+dur(s.elapsed_s)+'</b></span></span>';
+  // #40/#41 흔적(있을 때만): OR 대안 · 분해 reject
+  if (s.or_alternatives || s.decomp_rejects) {
+    h += '<span class="sm-sep"></span><span class="sm-grp">'
+       + (s.or_alternatives ? '<span class="sm-seg">OR 대안 <b>'+num(s.or_alternatives)+'</b>회</span>' : '')
+       + (s.decomp_rejects ? '<span class="sm-seg">분해 reject <b>'+num(s.decomp_rejects)+'</b></span>' : '')
+       + '</span>';
+  }
+  // status(우측 정렬)
+  h += '<span style="flex:1"></span><span class="pill s-'+esc(s.status)+'">'+esc(s.status)+'</span>';
+  box.innerHTML = h;
+}
+
 // DW식 밀도 라이브 리스트: 유닛 한 줄씩(정렬=plan 순서). in-flight는 ▸커서+스핀+경과로 강조.
 function renderUnitList(v) {
   const rows = v.unit_rows||[];
@@ -445,10 +518,14 @@ function renderUnitList(v) {
       : '';
     const tok = r.tokens!=null ? '<span class="tk">'+num(r.tokens)+' tok</span>' : '';
     const el = active ? '<span class="el">'+dur(liveElapsed(r))+'</span>' : '';
+    // WO#44 C: 재시도(↻) / OR 대안(OR) / 분해 reject(⊘) 배지 — 있을 때만.
+    const badges = (r.retries ? '<span class="ubadge re" title="재dispatch 횟수">↻'+r.retries+'</span>' : '')
+      + (r.or_attempts>0 ? '<span class="ubadge or" title="OR 접근 시도">OR '+r.or_attempts+'</span>' : '')
+      + (r.decomp_rejects>0 ? '<span class="ubadge dr" title="분해 critic reject">⊘'+r.decomp_rejects+'</span>' : '');
     return '<div class="urow'+(active?' active':'')+(SEL===r.unit?' sel':'')+'" data-id="'+esc(r.unit)+'">'
       + '<span class="cur">'+(active?'▸':'')+'</span>'
       + (active?'<span class="spin"></span>':'')
-      + '<span class="u">'+esc(r.unit)+'</span>'+mid
+      + '<span class="u">'+esc(r.unit)+'</span>'+mid+badges
       + '<span class="sp"></span>'+chk+tok+el+'</div>';
   }).join("");
   $("unitlist").querySelectorAll(".urow").forEach(row=>{

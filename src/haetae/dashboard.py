@@ -339,6 +339,59 @@ def state_to_view(
         "by_unit": by_unit,
     }
 
+    # ── v3.1(WO#44): #40/#41 표면화 + per-unit 집계(retry/OR/decomp-reject) ──
+    # state.approaches(ApproachAttempt)·decomp_critiques(DecompCritique)를 뷰로 노출
+    # (지금까진 state엔 기록되나 뷰엔 안 냄). 부재/구버전 state → 빈(무크래시, getattr).
+    approaches_list = getattr(state, "approaches", None) or []
+    decomp_list = getattr(state, "decomp_critiques", None) or []
+    transitions_list = getattr(state, "transitions", None) or []
+
+    # 유닛별 재dispatch 횟수: build 단계 전이 수 - 1(첫 dispatch는 재시도 아님). 부재 0.
+    build_counts: dict[str, int] = {}
+    for t in transitions_list:
+        if t.stage == "build" and t.unit is not None:
+            build_counts[t.unit] = build_counts.get(t.unit, 0) + 1
+
+    # 유닛별 OR 접근 시도 수(scope=="unit:<id>"). approaches는 or_alternatives>0일 때만 채워짐.
+    or_attempts_by_unit: dict[str, int] = {}
+    or_alternatives = 0  # index>=1(원본 제외 '대안') 전역 합 — #41이 일한 흔적을 요약에.
+    for a in approaches_list:
+        scope = a.scope or ""
+        if scope.startswith("unit:"):
+            uid = scope[len("unit:"):]
+            or_attempts_by_unit[uid] = or_attempts_by_unit.get(uid, 0) + 1
+        if (getattr(a, "index", 0) or 0) >= 1:
+            or_alternatives += 1
+
+    # 유닛별 분해 reject 수(rejected=True) + 전역 합 — #40이 일한 흔적을 요약에.
+    decomp_reject_by_unit: dict[str, int] = {}
+    decomp_rejects = 0
+    for d in decomp_list:
+        if getattr(d, "rejected", False):
+            decomp_rejects += 1
+            if d.unit:
+                decomp_reject_by_unit[d.unit] = decomp_reject_by_unit.get(d.unit, 0) + 1
+
+    approaches_view = [
+        {
+            "scope": a.scope,
+            "approach": a.approach,
+            "outcome": a.outcome,
+            "evidence": a.evidence,
+            "index": getattr(a, "index", 0),
+        }
+        for a in approaches_list
+    ]
+    decomp_critiques_view = [
+        {
+            "verdict": d.verdict,
+            "reason": d.reason,
+            "unit": d.unit,
+            "rejected": getattr(d, "rejected", False),
+        }
+        for d in decomp_list
+    ]
+
     # ── v3(WO#42): DW식 밀도 라이브 리스트용 per-unit 행(plan 순서, 결정론) ──
     # 한 줄 = 유닛 · 단계/상태 · tokens · 경과 · 체크수(pass/fail). 전부 기존 view
     # 데이터(activity/by_unit/units/checks)에서 모은다. 부재 필드는 None/0(무크래시).
@@ -367,11 +420,54 @@ def state_to_view(
                 "checks_fail": cf,
                 "checks_total": len(ev_checks),
                 "verdict": _verdict_val(ev.verdict) if ev else None,
+                # v3.1(WO#44 C): 재시도/OR 대안/분해 reject 배지용 카운트(부재 0, 무크래시).
+                "retries": max(0, build_counts.get(uid, 0) - 1),
+                "or_attempts": or_attempts_by_unit.get(uid, 0),
+                "decomp_rejects": decomp_reject_by_unit.get(uid, 0),
             }
         )
 
+    # ── v3.1(WO#44 B): DW식 한눈 요약 바(유닛 상태별·현재단계·활성·토큰·경과·status) ──
+    # DW의 "Scope 1/1·Verify 75/75" 같은 한눈 진척에 대응. 기존 데이터 집계만(무크래시).
+    unit_counts = {"total": len(plan), "done": 0, "in_progress": 0, "pending": 0, "failed": 0}
+    for p in plan:
+        sv = p.state.value
+        if sv in unit_counts:
+            unit_counts[sv] += 1
+
+    # 경과: 가장 이른 ts(transitions+events)~현재(running)/마지막. 못 잡으면 None(날조 금지).
+    all_ts = [d for d in (_parse_ts(t.ts) for t in transitions_list) if d is not None]
+    all_ts += [d for d in (_parse_ts(ev.ts) for ev in state.events) if d is not None]
+    start_dt = min(all_ts) if all_ts else None
+    last_dt = max(all_ts) if all_ts else None
+    running = state.status.value == "running"
+    end_dt = now_dt if (running and now_dt is not None) else last_dt
+    elapsed_summary: float | None = None
+    if start_dt is not None and end_dt is not None:
+        elapsed_summary = (end_dt - start_dt).total_seconds()
+        if elapsed_summary < 0:
+            elapsed_summary = 0.0
+
+    summary = {
+        "status": state.status.value,
+        "units": unit_counts,
+        # 현재 단계 = 가장 최근 transition stage(이력 없으면 None).
+        "current_stage": transitions[-1]["stage"] if transitions else None,
+        "active_count": len(activity_list),  # 동시 in-flight(에이전트) 수
+        "tokens": {
+            "total": getattr(spent, "tokens", None),
+            "input": getattr(spent, "input", None),
+            "output": getattr(spent, "output", None),
+        },
+        "elapsed_s": elapsed_summary,
+        # #40/#41이 일한 흔적(전역): OR 대안 횟수 · 분해 reject 횟수.
+        "or_alternatives": or_alternatives,
+        "decomp_rejects": decomp_rejects,
+    }
+
     return {
         "status": state.status.value,
+        "summary": summary,
         "spec": spec_view,
         "spec_critique": critique,
         "dag": {"nodes": nodes, "edges": edges, "levels": _topo_levels(nodes)},
@@ -389,6 +485,9 @@ def state_to_view(
         "transitions": transitions,
         "cost": cost,
         "unit_rows": unit_rows,
+        # v3.1(WO#44 C): #40/#41 산출물 표면화(부재/구버전 → 빈 리스트).
+        "approaches": approaches_view,
+        "decomp_critiques": decomp_critiques_view,
     }
 
 
@@ -841,9 +940,15 @@ def make_handler(
 ) -> type[BaseHTTPRequestHandler]:
     allow_run = bool(run_manager and run_manager.allow_run)
 
-    def _view_payload(sp: str | Path | None, spec: str | Path | None) -> bytes:
-        if sp is None:
-            view: dict[str, Any] = {"error": "no state-path (use ?run=<id> or --state-path)"}
+    def _view_payload(
+        sp: str | Path | None, spec: str | Path | None, err: str | None = None
+    ) -> bytes:
+        # A(WO#44): run 미선택 + state-path 없음은 '에러'가 아니라 '빈 상태'(차분한 안내).
+        # 단 명시된 run의 패턴 검증 실패(traversal 등)나 실제 로드 실패는 {error}로 구분.
+        if err is not None:
+            view: dict[str, Any] = {"error": err}
+        elif sp is None:
+            view = {"empty": True, "reason": "no run selected"}
         else:
             view = load_view(sp, spec)
         return json.dumps(view, ensure_ascii=False, default=str).encode("utf-8")
@@ -863,19 +968,25 @@ def make_handler(
                 "application/json; charset=utf-8",
             )
 
-        def _resolve_target(self) -> tuple[str | Path | None, str | Path | None]:
+        def _resolve_target(
+            self,
+        ) -> tuple[str | Path | None, str | Path | None, str | None]:
             """?run=<id> → runs/<id>/state.yaml(타겟팅, spec 보강 없음); 없으면 기본 --state-path.
 
-            run-id 패턴 검증 실패는 (None, None) → {error} view(traversal 차단).
+            반환 (sp, spec, err). run-id 패턴 검증 실패는 err="invalid run id"(traversal 차단,
+            빈 상태 아닌 에러). run 미명시 + state-path 없음은 (None, None, None) → 빈 상태.
             """
             query = urllib.parse.urlsplit(self.path).query
             run = (urllib.parse.parse_qs(query).get("run") or [None])[0]
             if run:
                 sp = run_manager.state_path_for(run) if run_manager else None
-                return (sp, None)
-            return (state_path, spec_path)
+                err = None if sp is not None else "invalid run id"
+                return (sp, None, err)
+            return (state_path, spec_path, None)
 
-        def _stream(self, sp: str | Path | None, spec: str | Path | None) -> None:
+        def _stream(
+            self, sp: str | Path | None, spec: str | Path | None, err: str | None = None
+        ) -> None:
             """SSE: state.yaml mtime을 폴링해 변경 시 새 view를 push(라이브).
 
             ThreadingHTTPServer가 요청마다 (daemon) 스레드를 주므로 장수명 응답이 가능.
@@ -899,7 +1010,7 @@ def make_handler(
                         sig = None  # 파일 부재 → load_view가 {error}를 내고 그대로 push
                     if sig != last_sig:
                         last_sig = sig
-                        self.wfile.write(b"data: " + _view_payload(sp, spec) + b"\n\n")
+                        self.wfile.write(b"data: " + _view_payload(sp, spec, err) + b"\n\n")
                         self.wfile.flush()
                         idle = 0
                     else:
@@ -926,11 +1037,11 @@ def make_handler(
         def do_GET(self) -> None:  # noqa: N802 — http.server 계약
             path = urllib.parse.urlsplit(self.path).path
             if path == "/api/state":
-                sp, spec = self._resolve_target()
-                self._send(200, _view_payload(sp, spec), "application/json; charset=utf-8")
+                sp, spec, err = self._resolve_target()
+                self._send(200, _view_payload(sp, spec, err), "application/json; charset=utf-8")
             elif path == "/api/stream":
-                sp, spec = self._resolve_target()
-                self._stream(sp, spec)
+                sp, spec, err = self._resolve_target()
+                self._stream(sp, spec, err)
             elif path == "/api/runs":
                 runs = run_manager.list_runs() if run_manager else []
                 self._send_json(200, {"runs": runs, "allow_run": allow_run})
