@@ -1367,3 +1367,61 @@ def test_html_has_phase_stepper_and_unit_drilldown():
     assert "rounds" in src                                     # B: 라운드 렌더
     assert "유닛 로그" in src or "unit-log" in src              # B: 유닛 로그 필터
     assert 'id="unitlist"' in src                             # 빌드 섹션 안 유닛 dense 리스트 보존
+
+
+# ──────────────────── WO#47: 대시보드 정리(접이식 + 강등) ────────────────────
+
+
+def test_html_runs_collapsible_default_and_storage_key():
+    """A: RUNS 접이식 — 접힘 컨테이너·토글·헤더 선택 한 줄·localStorage 키."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="runs-body"' in src                # 접힘 대상 컨테이너(폼+리스트 래핑)
+    assert 'id="runs-toggle"' in src              # 펼치기/접기 토글
+    assert 'id="runs-headsel"' in src and "보는 중" in src   # 접힌 헤더에 선택 run 한 줄
+    assert '"haetae.runs.collapsed"' in src       # 접힘 상태 영속 키
+    # 기본 접힘: makeCollapse(...,"haetae.runs.collapsed", true, ...) — defCollapsed=true
+    assert '"haetae.runs.collapsed", true' in src
+    # "+ 새 run"은 접혀 있어도 먼저 펼친 뒤 폼을 연다(접근성).
+    assert "RUNS_COL.expand()" in src
+
+
+def test_html_dag_demoted_collapsed_with_arrow_legend():
+    """B: DAG 강등 — 기본 접힘 컨테이너 + 토글 + 화살표 의미 범례 한 줄."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="dag-body"' in src and 'id="dag-toggle"' in src
+    # 기본 접힘: dag-body가 display:none으로 시작 + defCollapsed=true
+    assert 'id="dag-body" style="display:none"' in src
+    assert '"haetae.dag.collapsed", true' in src
+    # 화살표 범례: "A→B = B가 A에 의존" 의미 명시
+    assert "dag-legend" in src
+    assert "B가 A에 의존" in src and "blocked by A" in src
+    # DAG 컨테이너(엣지/레벨)는 그대로 유지(강등이지 제거 아님).
+    assert 'id="dagwrap"' in src and 'id="levels"' in src
+
+
+def test_html_raw_transitions_hidden_debug_toggle():
+    """C: raw transitions 강등 — 기본 숨김 + 'raw transitions 보기' 토글(디버그)."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="tr-body"' in src and 'id="tr-toggle"' in src
+    assert 'id="tr-body" style="display:none"' in src        # 기본 숨김
+    assert '"haetae.transitions.hidden", true' in src        # 기본 숨김 영속
+    assert "raw transitions 보기" in src                      # 디버그 토글 라벨
+    # transitions 렌더 타깃은 유지(숨김일 뿐 제거 아님).
+    assert 'id="transitions"' in src and "renderTransitions" in src
+
+
+def test_transitions_field_preserved_for_phase_and_round_derivation():
+    """C: state_to_view의 transitions 필드는 유지 — phase 스텝퍼·유닛 라운드가 파생에 씀.
+
+    프런트는 표시만 토글(숨김)할 뿐, 뷰 필드를 제거하지 않는다(무회귀).
+    """
+    v = state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")
+    # 1) transitions 필드 자체 보존(비어있지 않음).
+    assert v["transitions"], "transitions 필드가 사라지면 phase/round 파생이 깨진다"
+    assert v["transitions"][0]["stage"] == "synthesize"
+    # 2) 그 transitions에서 파생되는 phase 스텝퍼가 살아있음.
+    assert v["phases"], "phases가 transitions에서 파생되어야 한다"
+    phase_names = {p["name"] for p in v["phases"]}
+    assert "build" in phase_names
+    # 3) 유닛 라운드(transitions 그룹)도 살아있음 — 표시 토글이 데이터 경로를 끊지 않음.
+    assert any(v["units"][u]["rounds"] for u in v["units"]), "유닛 라운드 파생 무회귀"

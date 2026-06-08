@@ -194,6 +194,17 @@
   .unit-log .ln { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10.5px;
     white-space:pre-wrap; word-break:break-all; color:var(--tx); }
   .ctl-off { color:var(--mut); font-size:12px; }
+  /* ── WO#47: 섹션 접이식 토글(공통) + 강등 라벨 ── */
+  .sectoggle { font:inherit; font-size:11px; line-height:1; padding:2px 6px; border-radius:6px;
+    border:1px solid var(--bd); background:var(--panel2); color:var(--mut); cursor:pointer; }
+  .sectoggle:hover { border-color:var(--prog); color:var(--tx); }
+  .card h2 .sectoggle { vertical-align:middle; margin-right:6px; }
+  .sec-demote { color:var(--mut); font-weight:400; text-transform:none; letter-spacing:0; font-size:10.5px; }
+  /* 화살표 의미 범례(WO#47 B) — DAG 펼침 시 한 줄 */
+  .dag-legend { font-size:11.5px; color:var(--mut); margin:0 0 10px;
+    padding:6px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent);
+    border-radius:6px; background:var(--panel2); }
+  .dag-legend b { color:var(--tx); }
   /* ── v3 (WO#42 A): DW식 밀도 라이브 유닛 리스트 ── */
   .ulist .urow { display:flex; align-items:center; gap:8px; padding:6px 9px; border:1px solid var(--bd);
     border-radius:7px; margin-bottom:6px; background:var(--panel2); cursor:pointer; font-size:12.5px; }
@@ -235,11 +246,14 @@
 <div id="summary" class="summary" style="display:none"></div>
 <div id="runs-card" class="card runs-card" style="display:none; margin:14px 18px 0;">
   <div class="runs-head">
-    <h2>runs</h2>
-    <span id="ctl-state" class="ctl-off"></span>
+    <button id="runs-toggle" class="sectoggle" title="펼치기/접기">▸</button>
+    <h2 id="runs-h" style="cursor:pointer">RUNS</h2>
+    <span id="runs-headsel" class="mut small"></span>
     <span class="sp"></span>
     <button id="new-run-btn" class="btn primary" style="display:none">+ 새 run</button>
   </div>
+  <div id="runs-body">
+  <span id="ctl-state" class="ctl-off"></span>
   <div id="run-form" class="run-form" style="display:none">
     <textarea id="f-order" placeholder="work order / 주문 원문 (예: '리테일 흐름 시뮬레이션을 만들어라 …')"></textarea>
     <div class="opts">
@@ -265,13 +279,23 @@
     </div>
   </div>
   <div id="runs-list" class="runs-list"></div>
+  </div>
 </div>
 <div id="root" class="grid">
   <div id="left">
     <div class="card act-card"><h2>생애주기 · 단계 (phases)</h2><div id="phases" class="phases"></div></div>
     <div class="card" id="worklog-card" style="display:none"><h2>작업 로그 (라이브 tail)</h2><div id="worklog" class="worklog"></div></div>
-    <div class="card"><h2>유닛 DAG (구조)</h2><div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div></div>
-    <div class="card"><h2>단계 타임라인 (transitions)</h2><div id="transitions" class="flow"></div></div>
+    <div class="card">
+      <h2><button id="dag-toggle" class="sectoggle" title="펼치기/접기">▸</button>유닛 DAG (구조) <span class="sec-demote">— 구조 참고용 (기본 접힘)</span></h2>
+      <div id="dag-body" style="display:none">
+        <div class="dag-legend">화살표 <b>A→B</b> = <b>B가 A에 의존</b> (B는 A에 blocked by A) · A 완료 후 B 진행</div>
+        <div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2><button id="tr-toggle" class="sectoggle" title="펼치기/접기">▸</button>raw transitions 보기 <span class="sec-demote">— 디버그용 (phase 스텝퍼·유닛 라운드와 중복, 기본 숨김)</span></h2>
+      <div id="tr-body" style="display:none"><div id="transitions" class="flow"></div></div>
+    </div>
     <div class="card"><h2>검증 · 이벤트 타임라인</h2><div id="timeline"></div></div>
     <div class="card" id="integration-card" style="display:none"><h2>통합 gate (verify · unit=none)</h2><div id="integration"></div></div>
   </div>
@@ -337,7 +361,8 @@ function clearViewer(){
 function selectRun(id){
   RUN = id; SEL = null; VIEW = null;
   document.querySelectorAll(".run-row").forEach(x=>x.classList.toggle("sel", x.dataset.id===id));
-  $("ctl-state").textContent = id ? ("보는 중: "+id) : "";
+  // 접힌 RUNS 헤더에 "· 보는 중: <id>" 한 줄(선택 run 항상 노출).
+  $("runs-headsel").textContent = id ? ("· 보는 중: "+id) : "";
   startSSE(); pollOnce(); loadLog();
 }
 
@@ -892,8 +917,31 @@ function renderEsc(v) {
     + (e.why_now? '<br><span class="mut small">왜 지금: '+esc(e.why_now)+'</span>':'')+'</div>').join("");
 }
 
+// ── WO#47: 섹션 접이식 컨트롤러(공통) — body 표시 토글 + ▸/▾ + localStorage 영속 ──
+function makeCollapse(toggleEl, bodyEl, key, defCollapsed, onExpand){
+  let collapsed = defCollapsed;
+  const saved = localStorage.getItem(key);
+  if (saved!=null) collapsed = saved==="1";
+  function apply(){
+    if (bodyEl) bodyEl.style.display = collapsed ? "none" : "";
+    if (toggleEl) toggleEl.textContent = collapsed ? "▸" : "▾";
+    if (!collapsed && onExpand) onExpand();
+  }
+  function set(c){ collapsed=c; try{ localStorage.setItem(key, c?"1":"0"); }catch(_){} apply(); }
+  if (toggleEl) toggleEl.onclick = ()=>set(!collapsed);
+  apply();
+  return { toggle:()=>set(!collapsed), expand:()=>set(false), isCollapsed:()=>collapsed };
+}
+// A: RUNS 기본 접힘(한 줄). B: DAG 기본 접힘(펼치면 엣지 재배치). C: raw transitions 기본 숨김.
+const RUNS_COL = makeCollapse($("runs-toggle"), $("runs-body"), "haetae.runs.collapsed", true, null);
+makeCollapse($("dag-toggle"), $("dag-body"), "haetae.dag.collapsed", true,
+  ()=>{ if (VIEW && !VIEW.error) renderDag(VIEW); });   // 숨김 중엔 0폭 → 펼칠 때 재계산
+makeCollapse($("tr-toggle"), $("tr-body"), "haetae.transitions.hidden", true, null);
+$("runs-h").onclick = ()=>RUNS_COL.toggle();
+
 // 제어 표면 이벤트 배선(폼 토글 / launch / stop은 위임으로).
-$("new-run-btn").onclick = ()=>showForm(true);
+// "+ 새 run"은 접혀 있어도 동작하도록 RUNS를 먼저 펼친 뒤 폼을 연다.
+$("new-run-btn").onclick = ()=>{ RUNS_COL.expand(); showForm(true); };
 $("cancel-form-btn").onclick = ()=>{ showForm(false); $("form-err").textContent=""; };
 $("launch-btn").onclick = launchRun;
 // provider 옵션 디스크립터(WO#45): executor 바뀌면 폼 자동 적응 · critic-model 경고 라이브.
