@@ -1280,6 +1280,9 @@ def _parallel_loop(
         # ── 통합 OR 루프(WO#41): 라운드 완주 → 통합 gate. 실패+대안 남으면 *다른 접근*으로 재라운드. ──
         # bar 불변: 통합 대안도 같은 criteria/done_when을 둔 채 접근만 바꾼다(같은 독립 gate가 판정).
         integration_ev: Event | None = None
+        # WO#52: 통합 백트래킹 체크포인트 — 첫 OR 진입 시 기록한 all-merged 깨끗 상태(ref).
+        # 통합 대안 사이/escalate 시 main을 *이 ref*로 git-reset해 오염된 대안을 폐기한다.
+        checkpoint_C: str | None = None
         while True:
             run_round()
             if terminal:  # 유닛-level done(brain stop)/escalate/stuck → 아래 매핑.
@@ -1300,6 +1303,17 @@ def _parallel_loop(
                     break
                 # 통합 실패 + 대안 남음 → 영향 유닛을 다른 접근으로 백트래킹·재계획(bounded).
                 if integration_alt < or_alternatives:
+                    # WO#52: 진짜 백트래킹 — 통합 대안 사이에 main을 *깨끗한 all-merged
+                    # 체크포인트*로 git-reset해 직전 실패 대안의 오염을 폐기한다.
+                    #  · 첫 OR 진입(integration_alt==0): 지금 main(=all-units-merged 클린)을 C로 기록.
+                    #  · 이후 대안 전(첫 대안 제외): reset_main_to(C)로 직전 대안 커밋 폐기 후 재시작.
+                    # best-effort: 기록/reset 실패 시 #41 동작(현재 main 위 재dispatch)으로 폴백.
+                    if integration_alt == 0:
+                        checkpoint_C = wm.checkpoint()
+                    elif checkpoint_C is not None and wm.reset_main_to(checkpoint_C):
+                        emit("통합 백트래킹: main을 깨끗한 all-merged 체크포인트로 reset")
+                    elif checkpoint_C is not None:
+                        emit("통합 백트래킹 reset 불가 — #41 폴백(현재 main 위 재dispatch)")
                     evidence = summarize_gate_evidence(igr)
                     state.approaches.append(ApproachAttempt(
                         scope="integration", approach=f"통합 접근 {integration_alt}",
@@ -1315,6 +1329,10 @@ def _parallel_loop(
                     persist()
                     continue  # 다른 접근으로 재라운드
                 # 통합 대안 소진(또는 OR OFF) → escalate. OR>0이면 접근 첨부, 0이면 기존 동작.
+                # WO#52: 오염된 마지막 대안을 남기지 않고 깨끗한 all-merged 체크포인트(C)로
+                # 되돌려 escalate(검사 가능한 상태를 깔끔히). best-effort(없거나 실패면 그대로).
+                if checkpoint_C is not None:
+                    wm.reset_main_to(checkpoint_C)
                 state.status = Status.escalated
                 if or_alternatives > 0:
                     state.approaches.append(ApproachAttempt(

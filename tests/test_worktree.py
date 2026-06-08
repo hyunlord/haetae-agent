@@ -163,3 +163,73 @@ def test_cleanup_all_sweeps_stray_branches(tmp_path):
     wm._created.clear()  # bookkeeping 유실(crash 흉내)
     wm.cleanup_all()
     assert_clean(tmp_path)
+
+
+# ──────────────── WO#52: 통합 백트래킹 — checkpoint + 가드된 reset ────────────────
+
+
+def _head(workdir) -> str:
+    return _git(workdir, "rev-parse", "HEAD").stdout.strip()
+
+
+def _commit_empty(workdir, msg: str) -> str:
+    _git(workdir, "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "--allow-empty", "-m", msg)
+    return _head(workdir)
+
+
+def test_checkpoint_records_and_returns_head(tmp_path):
+    """checkpoint() → 현재 main HEAD 해시 반환 + 내부 기록(이후 reset 허용 대상)."""
+    wm = WorktreeManager(tmp_path)
+    wm.ensure_repo()
+    ref = wm.checkpoint()
+    assert ref == _head(tmp_path)
+    assert ref in wm._checkpoints
+
+
+def test_reset_main_to_moves_main_to_checkpoint(tmp_path):
+    """reset_main_to(C) → main이 C로 hard-reset(이후 커밋 폐기)."""
+    wm = WorktreeManager(tmp_path)
+    wm.ensure_repo()
+    c = wm.checkpoint()              # 깨끗한 체크포인트
+    after = _commit_empty(tmp_path, "오염 대안 커밋")
+    assert _head(tmp_path) == after and after != c
+    assert wm.reset_main_to(c) is True
+    assert _head(tmp_path) == c       # C로 되돌아옴(대안 커밋 폐기)
+
+
+def test_reset_main_to_rejects_unrecorded_ref(tmp_path):
+    """가드 ①: checkpoint()로 기록 안 된 임의 ref reset 거부(HEAD~N/사용자 입력 차단)."""
+    wm = WorktreeManager(tmp_path)
+    wm.ensure_repo()
+    c0 = _head(tmp_path)
+    after = _commit_empty(tmp_path, "advance")
+    # c0는 실재하는 커밋이지만 *기록되지 않았다* → 거부.
+    assert wm.reset_main_to(c0) is False
+    assert wm.reset_main_to(None) is False
+    assert wm.reset_main_to("deadbeefdeadbeef") is False
+    assert _head(tmp_path) == after   # 어떤 경우도 HEAD 불변(reset 안 일어남)
+
+
+def test_reset_main_to_guards_non_owned_workdir(tmp_path):
+    """가드 ②: workdir이 자기-소유 토플레벨 아니면(부모/사용자 실 repo) reset 거부."""
+    # 부모 repo + 그 안의 하위 디렉토리(자기 repo 아님)를 workdir로.
+    parent = tmp_path / "user_repo"
+    parent.mkdir()
+    _git(parent, "init")
+    first = _commit_empty(parent, "user commit 1")
+    second = _commit_empty(parent, "user commit 2")
+    sub = parent / "runs" / "work"
+    sub.mkdir(parents=True)
+    wm = WorktreeManager(sub)  # ensure_repo 호출 안 함 → sub은 자기 repo 아님(toplevel=parent)
+    wm._checkpoints.add(first)  # 가드 ①은 통과시키되, 가드 ②(소유)가 막아야 함
+    assert wm.reset_main_to(first) is False  # 부모/사용자 repo 보호 — 거부
+    assert _head(parent) == second           # 사용자 repo HEAD 절대 안 건드림
+
+
+def test_reset_main_to_best_effort_no_raise_on_bad_ref(tmp_path):
+    """best-effort: 기록됐지만 실재 안 하는 ref여도 raise 없이 False(호출부 폴백)."""
+    wm = WorktreeManager(tmp_path)
+    wm.ensure_repo()
+    wm._checkpoints.add("0" * 40)  # 기록됐으나 git에 없는 해시
+    assert wm.reset_main_to("0" * 40) is False  # 크래시 없이 False

@@ -825,3 +825,118 @@ def test_parallel_interrupt_cleans_worktree_and_saves(tmp_path):
     assert sp.exists()
     # finally(cleanup_all)가 worktree·브랜치·관리루트를 0으로 — 인터럽트에도 흔적 없음.
     assert_clean(tmp_path)
+
+
+# ──────────── 통합 벽 ②: 통합 OR main-reset 백트래킹 (WO#52) ────────────
+
+
+class _SpyWM(WorktreeManager):
+    """checkpoint()/reset_main_to() 호출을 기록하는 spy. reset_ok=False면 reset 실패 시뮬."""
+
+    def __init__(self, workdir, reset_ok: bool = True):
+        super().__init__(workdir)
+        self.checkpoint_refs: list = []
+        self.reset_calls: list = []
+        self._reset_ok = reset_ok
+
+    def checkpoint(self):
+        ref = super().checkpoint()
+        self.checkpoint_refs.append(ref)
+        return ref
+
+    def reset_main_to(self, ref):
+        self.reset_calls.append(ref)
+        if not self._reset_ok:
+            return False  # 실패 시뮬(가드 통과 전에 거부) → 호출부 #41 폴백 검증용
+        return super().reset_main_to(ref)
+
+
+def _head(workdir) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_integration_backtracking_resets_main_between_alternatives(tmp_path):
+    """통합 대안 ≥2: 첫 진입 시 C 기록 → 대안2 전 + escalate에서 main을 C로 reset.
+
+    오염된 대안 커밋을 폐기하고 *깨끗한 all-merged 체크포인트*에서 다음 대안을 시작한다.
+    """
+    wm = _SpyWM(tmp_path)
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=SpyGate(Verdict.fail_recoverable),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        or_alternatives=2, worktree_manager=wm,
+    )
+    assert state.status is Status.escalated
+    # C는 정확히 1회 기록(첫 OR 진입), 비어있지 않음.
+    assert len(wm.checkpoint_refs) == 1 and wm.checkpoint_refs[0]
+    C = wm.checkpoint_refs[0]
+    # reset은 대안2 직전 + escalate에서 = 2회, 전부 기록된 C로만.
+    assert wm.reset_calls == [C, C]
+    # 최종 main은 깨끗한 all-merged 체크포인트(C) — 오염된 마지막 대안 안 남김.
+    assert _head(tmp_path) == C
+    assert_clean(tmp_path)
+
+
+def test_integration_backtracking_best_effort_fallback_on_reset_failure(tmp_path):
+    """reset 실패(best-effort) → #41 동작(현재 main 위 재dispatch)으로 폴백, 크래시 없음."""
+    wm = _SpyWM(tmp_path, reset_ok=False)
+    seen: list[str] = []
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=SpyGate(Verdict.fail_recoverable),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        or_alternatives=2, worktree_manager=wm, progress=seen.append,
+    )
+    # reset이 시도됐으나 실패 → #41 폴백 경로(현재 main 위 재dispatch)로 진행.
+    assert wm.reset_calls and all(r == wm.checkpoint_refs[0] for r in wm.reset_calls)
+    assert any("#41 폴백" in s for s in seen), seen
+    # 폴백이어도 정상 종료(escalate) + 흔적 0(크래시 없음).
+    assert state.status is Status.escalated
+    assert_clean(tmp_path)
+
+
+def test_integration_backtracking_recovers_keeps_winning_alternative(tmp_path):
+    """대안이 통과하면 그 승리 대안의 머지 상태가 main에 남는다(되감기는 실패 대안만)."""
+    counter = {"n": 0}
+
+    class Integ:
+        def judge(self, result, spec, unit=None):
+            counter["n"] += 1
+            return GateResult(verdict=Verdict.fail_recoverable if counter["n"] == 1 else Verdict.pass_)
+
+    wm = _SpyWM(tmp_path)
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=Integ(),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        or_alternatives=2, worktree_manager=wm,
+    )
+    assert state.status is Status.done
+    # 첫 대안(=alt-1)이 통과 → C 기록은 1회(첫 진입), 대안 사이 reset 없음(곧장 통과).
+    assert len(wm.checkpoint_refs) == 1
+    assert wm.reset_calls == []  # alt-1이 바로 통과 → 되감기 불필요
+    assert_clean(tmp_path)
+
+
+def test_integration_backtracking_noop_when_or_off(tmp_path):
+    """OR OFF(or_alternatives=0): checkpoint/reset 전혀 안 함(후방호환 — 기존 escalate)."""
+    wm = _SpyWM(tmp_path)
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=SpyGate(Verdict.fail_recoverable),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        or_alternatives=0, worktree_manager=wm,
+    )
+    assert state.status is Status.escalated
+    assert wm.checkpoint_refs == [] and wm.reset_calls == []  # 백트래킹 미개입
+    assert_clean(tmp_path)
+
+
+def test_integration_backtracking_allowed_sandboxes_unchanged(tmp_path):
+    """통합 백트래킹은 sandbox 권한과 무관 — ALLOWED_SANDBOXES 불변(가드)."""
+    import haetae.providers.codex as codex_mod
+    assert codex_mod.ALLOWED_SANDBOXES == ("read-only", "workspace-write")
+    assert "danger-full-access" not in codex_mod.ALLOWED_SANDBOXES

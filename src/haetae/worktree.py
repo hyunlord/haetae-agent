@@ -44,6 +44,9 @@ class WorktreeManager:
         # 마지막 merge 충돌의 *겹친 파일* 목록(통합 적응 피드백용, WO#48).
         # merge는 main 스레드에서 직렬 실행되므로 인스턴스 보관이 안전(동시성 없음).
         self.last_conflict_files: list[str] = []
+        # WO#52: 통합 백트래킹 — checkpoint()가 기록한 all-merged ref 집합. reset_main_to는
+        # *이 집합의 ref로만* reset한다(임의 ref/HEAD~N reset 차단 — 안전 가드).
+        self._checkpoints: set[str] = set()
 
     # ── git 실행 격리 (유일한 subprocess 지점) ────────────────────────────
     def _git(
@@ -144,6 +147,44 @@ class WorktreeManager:
     def cleanup(self, unit_id: str) -> None:
         """unit worktree+브랜치+디렉토리 제거. 머지 성공 후에도 호출(멱등)."""
         self._remove(unit_id)
+
+    # ── 통합 백트래킹: 체크포인트 + 가드된 main reset (WO#52) ────────────────
+    def checkpoint(self) -> str | None:
+        """현재 main(통합 브랜치) HEAD 커밋 해시를 기록·반환(읽기 전용).
+
+        통합 OR 백트래킹용: all-units-merged 깨끗 상태를 ref로 못박아, 대안 사이에
+        reset_main_to(ref)로 *그 상태로만* 되감을 수 있게 한다(기록된 ref만 reset 허용).
+        실패 → None(best-effort, 호출부가 #41 동작으로 폴백).
+        """
+        proc = self._git("rev-parse", "HEAD", check=False)
+        ref = proc.stdout.strip()
+        if proc.returncode != 0 or not ref:
+            return None
+        self._checkpoints.add(ref)
+        return ref
+
+    def reset_main_to(self, ref: str | None) -> bool:
+        """run workdir 빌드 repo의 main을 *기록된 체크포인트* ref로 `git reset --hard`.
+
+        안전 가드(둘 다 통과해야 reset 실행):
+          ① ref가 checkpoint()로 *기록된* 것 — 임의 ref·HEAD~N·사용자 입력 ref 거부.
+          ② workdir이 *자기 자신을 토플레벨로 하는* git repo — ensure_repo가 판 haetae
+             빌드 repo만 해당. 부모/사용자 실 repo(toplevel≠workdir)는 거부 → 실 repo 보호.
+        best-effort: 어떤 실패도 False 반환(raise 안 함) → 호출부가 #41 동작(현재 main 위
+        재dispatch)으로 폴백. **haetae가 만든 throwaway 빌드 repo만, 기록된 ref로만** reset.
+        """
+        if not ref or ref not in self._checkpoints:
+            return False  # 가드 ①: 기록 안 된 ref reset 거부(임의 ref/HEAD~N 차단)
+        top = self._git("rev-parse", "--show-toplevel", check=False)
+        if top.returncode != 0:
+            return False
+        try:
+            is_own = Path(top.stdout.strip()).resolve() == self.workdir.resolve()
+        except OSError:
+            return False
+        if not is_own:
+            return False  # 가드 ②: 자기-소유 빌드 repo가 아니면 거부(사용자 실 repo 보호)
+        return self._git("reset", "--hard", ref, check=False).returncode == 0
 
     def _remove(self, unit_id: str) -> None:
         """removal 프리미티브 — 멱등. worktree remove + branch -D + rmtree."""
