@@ -99,6 +99,22 @@ def test_conflicting_merge_returns_conflict_and_keeps_main_clean(tmp_path):
     wm.cleanup_all()
 
 
+def test_merge_captures_conflict_files_for_integration_feedback(tmp_path):
+    """WO#48: 충돌 시 겹친 파일을 last_conflict_files에 캡처(통합 피드백용). ok면 비운다."""
+    wm = WorktreeManager(tmp_path)
+    wm.ensure_repo()
+    p1 = wm.create("u1")
+    p2 = wm.create("u2")
+    (p1 / "shared.txt").write_text("u1\n")
+    (p2 / "shared.txt").write_text("u2\n")
+    assert wm.merge("u1") == "ok"
+    assert wm.last_conflict_files == []  # 깨끗한 머지는 빈 목록
+    assert wm.merge("u2") == "conflict"
+    # 겹친(충돌) 파일을 abort 전에 캡처
+    assert "shared.txt" in wm.last_conflict_files
+    wm.cleanup_all()
+
+
 def test_conflict_resolved_by_redispatch_on_updated_main(tmp_path):
     # 충돌 → discard → 갱신된 main에서 재create → 재머지 ok (직렬화 해소).
     wm = WorktreeManager(tmp_path)

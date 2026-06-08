@@ -709,6 +709,95 @@ def test_or_alternative_is_decomp_critic_checked(tmp_path):
     assert_clean(tmp_path)
 
 
+# ──────────── 통합 벽 ①: 머지 충돌 → 통합 적응 재빌드 (WO#48) ────────────
+
+
+def test_merge_conflict_rebuild_injects_integration_feedback_and_resolves(tmp_path):
+    """머지 충돌 → 충돌 유닛을 *최신 main 위에서 통합 적응 재빌드* → 해소 → done.
+
+    - 재빌드 worktree는 최신 main(머지된 형제 반영)에서 재분기(wm.create) → 기존 존중·확장.
+    - 작업지시서에 **통합 피드백**이 주입된다(기존 replan feedback 채널 재사용).
+    - 같은 *독립* 통합 gate(SpyGate)가 머지된 main을 1회 판정(판정 경로 무변경).
+    """
+    def make_ex(wt):
+        class E:
+            def run(self, order):
+                shared = Path(wt) / "shared.txt"
+                if shared.exists():
+                    # 재빌드: 최신 main 재분기로 형제 내용이 이미 있다 → 존중·확장(충돌 안 남).
+                    txt = shared.read_text()
+                    if order.unit not in txt:
+                        shared.write_text(txt + f"{order.unit}\n")
+                else:
+                    shared.write_text(f"{order.unit}\n")  # 첫 시도: 형제와 같은 파일 → 충돌 유발
+                return f"{order.unit} wrote"
+        return E()
+
+    # 통합 gate가 판정 시 받은 spec을 캡처 → criteria/done_when 불변(anti-erosion) 가드.
+    class SpecCapGate:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.specs: list = []
+
+        def judge(self, result, spec, unit=None):
+            self.calls.append(result)
+            self.specs.append(spec)
+            return GateResult(verdict=Verdict.pass_)
+
+    brain = BrainClient(SPEC_TWO_INDEP)
+    integ_gate = SpecCapGate()             # 독립 통합 gate(판정 경로 + 기준 불변 확인)
+    seen: list[str] = []
+    state = run_loop(
+        "x", brain, executor=None, gate=integ_gate,
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=1, progress=seen.append,
+    )
+    # 1) 충돌이 실제로 났고 → 통합 적응 재빌드 경로를 탔다.
+    assert any("통합 적응 재빌드" in s for s in seen), seen
+    assert any("최신 main 재분기" in s for s in seen), seen
+    # 2) 재빌드 작업지시서(replan)에 통합 피드백이 주입됐다(feedback 채널 재사용).
+    assert any("[통합 적응 재빌드" in c["user"] for c in brain.calls), \
+        "통합 피드백이 replan 프롬프트에 주입돼야 한다"
+    # 3) 적응으로 충돌 해소 → 두 유닛 done → 통합 진행 → done.
+    assert state.status is Status.done
+    assert {p.unit: p.state.value for p in state.plan} == {"u1": "done", "u2": "done"}
+    # 4) 통합 gate는 같은 독립 gate가 머지된 main을 1회 판정(판정 로직 무변경).
+    assert len(integ_gate.calls) == 1
+    # 5) criteria/done_when 불변 — 통합 적응이 기준을 건드리지 않았다(anti-erosion).
+    #    독립 통합 gate가 *판정에 쓴 그 spec*의 기준이 원본과 동일함을 확인.
+    judged_spec = integ_gate.specs[0]
+    assert [ac.id for ac in judged_spec.acceptance_criteria] == ["ac1"]
+    assert judged_spec.done_when == "ac1"
+    assert_clean(tmp_path)
+
+
+def test_persistent_merge_conflict_bounded_then_escalates_with_history(tmp_path):
+    """계속 충돌 → 무한 재빌드 없이 상한(unit_retries) 후 escalate + *시도 이력* 첨부."""
+
+    class AlwaysConflict(WorktreeManager):
+        def merge(self, unit_id):
+            return "conflict"  # 통합 적응으로도 해소 불가 시뮬(상한 검증)
+
+    wm = AlwaysConflict(tmp_path)
+    state = run_loop(
+        "x", BrainClient(SPEC_SINGLE), executor=None, gate=PassGate(),
+        executor_factory=lambda wt: PassExec(), gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=2, worktree_manager=wm,
+    )
+    assert state.status is Status.escalated
+    esc = [e for e in state.pending_escalations if e.get("unit") == "u1"]
+    assert esc, state.pending_escalations
+    e0 = esc[0]
+    # 정직한 escalation: 통합 적응 재빌드를 시도했음을 명시 + 시도 이력 첨부.
+    assert "통합 적응 재빌드" in e0["reason"]
+    hist = e0.get("integration_adaptations")
+    assert isinstance(hist, list) and len(hist) == 2  # bounded by unit_retries=2 (무한 아님)
+    assert [h["attempt"] for h in hist] == [1, 2]
+    assert_clean(tmp_path)
+
+
 # ──────────────────────── graceful stop / SIGINT (WO#43) ────────────────────────
 
 

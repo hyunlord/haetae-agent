@@ -27,6 +27,41 @@ _ALTERNATIVE_DIRECTIVE = (
 )
 
 
+# 통합 적응 재빌드 지시(IP, WO#48). 머지 충돌 시 replan feedback으로 태운다.
+# stale 베이스에서 같은 변경을 재생성하지 말고 *현재 머지된 main* 위에 통합되게 적응시킨다.
+# **criteria 약화 금지** — 통합되게 *적응*할 뿐, 기준 재정의가 아니다(anti-erosion).
+_INTEGRATION_DIRECTIVE = (
+    "직전 결과가 통합(main) 머지에서 **충돌**했다 — 병렬 형제 유닛이 같은 파일을 건드렸다.\n"
+    "워크트리는 이미 **최신 main**(머지된 형제 반영)에서 다시 분기됐다. 그 위에서:\n"
+    "- **처음부터 다시 만들지 마라.** 현재 통합 상태를 *읽고*, 그 위에 깔끔히 통합되게 변경을 적응하라.\n"
+    "- 겹치는 파일은 **기존 내용을 존중·확장**한다(덮어쓰기·재작성 금지). 너의 책임 부분만 통합한다.\n"
+    "- 같은 충돌을 재생성하지 마라 — 형제의 기여를 보존하면서 네 기여를 합쳐라.\n"
+    "- **acceptance_criteria / done_when은 절대 바꾸지 마라**(같은 독립 gate가 판정한다). "
+    "기준을 낮추거나 재정의하지 마라 — *통합되게 적응*할 뿐이다."
+)
+
+
+def build_integration_feedback(
+    unit: str,
+    conflict_files: list[str] | None,
+    merged_siblings: list[str] | None,
+) -> str:
+    """머지 충돌 → 통합 적응 재빌드 피드백(replan feedback으로 주입, WO#48).
+
+    unit: 충돌한 유닛. conflict_files: 겹친(충돌) 파일 목록. merged_siblings: 이미
+    main에 머지된 형제 유닛들. bar 불변 directive 포함 — 기준 약화 금지, *통합 적응*만.
+    """
+    lines = [f"[통합 적응 재빌드 — 유닛 {unit}]"]
+    if merged_siblings:
+        lines.append(
+            "- main에 이미 머지된 형제: " + ", ".join(str(s) for s in merged_siblings)
+        )
+    if conflict_files:
+        lines.append("- 충돌(겹친) 파일: " + ", ".join(str(f) for f in conflict_files))
+    lines.append(_INTEGRATION_DIRECTIVE)
+    return "\n".join(lines)
+
+
 def summarize_gate_evidence(gr: Any, *, cap: int = 400) -> str | None:
     """GateResult의 *실패* 증거를 한 줄로 요약(대안 생성 피드백용, 읽기만).
 

@@ -73,7 +73,11 @@ from haetae.decomp_critic import (
     critique_decomposition,
     is_weak,
 )
-from haetae.or_node import build_alternative_feedback, summarize_gate_evidence
+from haetae.or_node import (
+    build_alternative_feedback,
+    build_integration_feedback,
+    summarize_gate_evidence,
+)
 from haetae.replan import ReplanError, replan
 from haetae.scheduler import all_done, ready_units
 from haetae.skills import Skill, inject_skills, load_skills, match_skills
@@ -944,6 +948,9 @@ def _parallel_loop(
     alt_feedback: dict[str, str] = {}
     last_approach: dict[str, str] = {}
     integration_alt = 0  # 통합 gate OR 대안 시도 수(bounded by or_alternatives)
+    # WO#48: 유닛별 머지 충돌 → *통합 적응 재빌드* 시도 이력(정직한 escalation 첨부용).
+    # 각 항목 {attempt, conflict_files, merged_siblings} — 재빌드 경로가 무엇을 시도했는지.
+    integ_adapt: dict[str, list[dict]] = {}
 
     def record(unit: str, goal: str | None, result: str, verdict: Verdict,
                checks: list[CheckReport], cost: Cost | None = None,
@@ -1092,12 +1099,31 @@ def _parallel_loop(
                 last_result = f"unit={unit} verdict={verdict.value} merged"
                 persist()
                 return
-            # 머지 충돌 → 직렬화 재dispatch(갱신된 main 위), 소진 시 escalate
+            # 머지 충돌 → *통합 적응 재빌드*(WO#48): 충돌 유닛을 갱신된(머지된) main 위에서
+            # 재분기(wm.create가 이미 main 기준 분기)하고, 작업지시서에 **통합 피드백**을 주입해
+            # stale 재생성이 아니라 현재 통합 상태에 *적응*하게 한다 → 같은 충돌 재발 방지.
+            # 충돌 파일(겹친 파일)은 abort 전에 wm가 캡처해둔다.
+            conflict_files = list(getattr(wm, "last_conflict_files", []) or [])
+            merged_siblings = [
+                p.unit for p in state.plan
+                if p.state == PlanState.done and p.unit != unit
+            ]
             wm.discard(unit)
             if attempts_of[unit] < unit_retries:
                 attempts_of[unit] += 1
                 account(event_cost)  # 폐기된 시도도 비용은 정직하게 budget에 누적
-                emit(f"머지 충돌 → 직렬화 재dispatch: {unit} (재시도 {attempts_of[unit]})")
+                # 통합 피드백을 기존 feedback 채널(alt_feedback)로 주입 — replan 프롬프트 무변경.
+                # gen_order가 다음 dispatch에서 pop해 replan feedback으로 태운다(#41과 동일 채널).
+                alt_feedback[unit] = build_integration_feedback(
+                    unit, conflict_files, merged_siblings)
+                integ_adapt.setdefault(unit, []).append({
+                    "attempt": attempts_of[unit],
+                    "conflict_files": conflict_files,
+                    "merged_siblings": merged_siblings,
+                })
+                emit(f"머지 충돌 → 통합 적응 재빌드(최신 main 재분기 + 통합 피드백): "
+                     f"{unit} (재시도 {attempts_of[unit]})"
+                     + (f" · 충돌 파일 {', '.join(conflict_files)}" if conflict_files else ""))
                 _set_plan_state(state, unit, PlanState.pending)
             else:
                 account(event_cost)
@@ -1105,9 +1131,11 @@ def _parallel_loop(
                        cost=event_cost, ts=now())
                 _set_plan_state(state, unit, PlanState.failed)
                 terminal = "escalated"
+                # 정직: 시도한 통합 적응 이력(재빌드 라운드별 충돌 파일/형제)을 첨부.
                 state.pending_escalations.append(
-                    {"reason": f"unit {unit} 머지 충돌 {unit_retries}회 후 미해소 — escalate",
-                     "unit": unit})
+                    {"reason": f"unit {unit} 머지 충돌 {unit_retries}회 통합 적응 재빌드 후 미해소 — escalate",
+                     "unit": unit,
+                     "integration_adaptations": integ_adapt.get(unit, [])})
                 persist()
             return
 

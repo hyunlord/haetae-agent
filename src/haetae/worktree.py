@@ -41,6 +41,9 @@ class WorktreeManager:
         self.root = self.workdir / ROOT_NAME
         self.main_branch = "main"
         self._created: set[str] = set()
+        # 마지막 merge 충돌의 *겹친 파일* 목록(통합 적응 피드백용, WO#48).
+        # merge는 main 스레드에서 직렬 실행되므로 인스턴스 보관이 안전(동시성 없음).
+        self.last_conflict_files: list[str] = []
 
     # ── git 실행 격리 (유일한 subprocess 지점) ────────────────────────────
     def _git(
@@ -121,9 +124,17 @@ class WorktreeManager:
             *_GIT_IDENT, "merge", "--no-ff", "-m", f"merge {branch}", branch, check=False
         )
         if proc.returncode != 0:
-            # 충돌(또는 머지 거부) → main 원복 후 충돌 신호
+            # 충돌(또는 머지 거부) → 겹친 파일을 *abort 전에* 캡처(통합 적응 피드백용),
+            # 그다음 main 원복 후 충돌 신호. (충돌 파일을 못 잡아도 best-effort — 빈 목록.)
+            diff = self._git(
+                "diff", "--name-only", "--diff-filter=U", check=False
+            )
+            self.last_conflict_files = [
+                ln.strip() for ln in diff.stdout.splitlines() if ln.strip()
+            ]
             self._git("merge", "--abort", check=False)
             return "conflict"
+        self.last_conflict_files = []
         return "ok"
 
     def discard(self, unit_id: str) -> None:

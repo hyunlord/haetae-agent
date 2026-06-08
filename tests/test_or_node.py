@@ -5,7 +5,11 @@
 
 import haetae.providers.codex as codex_mod
 from haetae.models import CheckReport, CheckType, GateResult, RunEvidence, Verdict
-from haetae.or_node import build_alternative_feedback, summarize_gate_evidence
+from haetae.or_node import (
+    build_alternative_feedback,
+    build_integration_feedback,
+    summarize_gate_evidence,
+)
 
 
 # ──────────────────────────── summarize_gate_evidence ────────────────────────────
@@ -70,6 +74,37 @@ def test_alternative_feedback_integration_scope():
     fb = build_alternative_feedback(None, "통합 깨짐", scope="integration")
     assert "통합" in fb
     assert "acceptance_criteria" in fb and "바꾸지" in fb  # bar 불변은 통합에서도
+
+
+# ──────────────────────── build_integration_feedback (WO#48) ────────────────────────
+
+
+def test_integration_feedback_is_bar_invariant_and_adapts():
+    """**bar 불변 가드**: 통합 적응 재빌드 지시도 criteria/done_when을 *바꾸지 말라*고 못박는다.
+
+    핵심은 *통합 적응*(stale 재생성 금지, 기존 존중·확장)이지 기준 재정의가 아니다.
+    """
+    fb = build_integration_feedback(
+        "u5", ["src/App.tsx", "src/index.ts"], ["u1", "u3"])
+    # 통합 적응 directive: 처음부터 다시 만들지 말고 현재 통합 상태 위에 적응.
+    assert "통합 적응 재빌드" in fb
+    assert "처음부터 다시 만들지" in fb and "적응" in fb
+    assert "기존 내용을 존중" in fb  # 겹치는 파일 존중·확장
+    # bar 불변(anti-erosion) 못박음 — criteria/done_when 변경 금지.
+    assert "acceptance_criteria" in fb and "바꾸지" in fb
+    assert "낮추" in fb or "재정의" in fb
+    # 통합 컨텍스트(머지된 형제 + 충돌 파일)를 구체적으로 주입(적응 효과↑).
+    assert "u1" in fb and "u3" in fb
+    assert "src/App.tsx" in fb and "src/index.ts" in fb
+    # 충돌 유닛 명시
+    assert "u5" in fb
+
+
+def test_integration_feedback_handles_missing_context():
+    """충돌 파일/형제를 못 잡아도(best-effort) directive는 유지 — 무크래시."""
+    fb = build_integration_feedback("u5", None, None)
+    assert "통합 적응 재빌드" in fb
+    assert "acceptance_criteria" in fb and "바꾸지" in fb  # bar 불변은 항상
 
 
 # ──────────────────────────── 안전 불변 가드 ────────────────────────────
