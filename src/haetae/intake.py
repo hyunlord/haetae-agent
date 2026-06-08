@@ -156,3 +156,130 @@ def synthesize(
     # 재합성→호출부 synthesize_with_critique가 원본 fallback).
     assert last_err is not None
     raise last_err
+
+
+# ──────────────────── WO#51: 통합 유닛 deps 추론 넛지 ────────────────────
+#
+# 머지 충돌 근본 차단: 통합 성격 유닛(대시보드·진입점·e2e·트레이스 — 다른 유닛 산출물을
+# import/wire)이 *자기가 엮는 유닛들에 의존(deps)* 하면 DAG가 자연히 그 유닛을 맨 뒤,
+# 의존 머지 후 빌드한다 → 같은 파일 동시 수정으로 인한 충돌이 애초에 안 난다.
+# 스케줄러는 deps를 이미 존중하므로 *deps만 정확*해지면 별도 스케줄러 변경 없이 직렬화된다.
+#
+# 설계:
+#   - 휴리스틱은 **보수적** — desc 키워드로 통합 유닛을 탐지하고, 그 유닛이 비통합 빌더
+#     유닛 다수(≥2)를 deps에서 빠뜨릴 때만 넛지(애매하면 안 함 → 과직렬화·오탐 회피).
+#   - 넛지는 **새 LLM critic이 아니라** 기존 #31 재합성-피드백 채널 재사용(synthesize feedback).
+#   - **bounded**: 정확히 1회 재합성. 실패/여전히 과소면 *진행*(데드락 금지).
+#   - **criteria/done_when 불변**: 재합성에서 *deps만* 채택(splice). criteria·done_when·goal 등
+#     protected 필드는 원본 유지 — governance(plan은 mutable, 기준은 protected) 그대로.
+
+# 통합(다른 유닛 산출물을 엮는) 성격 유닛을 알리는 보수적 키워드 집합. 영어는 소문자 매칭,
+# 한국어는 부분일치. 애매한 단어는 넣지 않는다(오탐→과직렬화). 탐지만 보수적이면,
+# 실제 어느 유닛을 엮는지는 재합성 LLM이 판단한다(우린 deps만 채택).
+_INTEGRATION_KEYWORDS = (
+    "dashboard", "대시보드",
+    "integration", "integrate", "통합",
+    "entrypoint", "entry point", "entry-point", "진입점",
+    "e2e", "end-to-end", "end to end",
+    "sim:trace", "trace 진입점", "헤드리스 트레이스", "트레이스 진입점",
+    "wire", "wiring", "연결", "엮",
+    "실제 엔진", "import",
+)
+
+
+def _is_integration_unit(desc: str | None) -> bool:
+    """desc 키워드로 통합 성격 유닛인지 보수적으로 판정(영어 소문자·한국어 부분일치)."""
+    low = (desc or "").lower()
+    return any(k in low for k in _INTEGRATION_KEYWORDS)
+
+
+def _integration_dep_gaps(spec: ProjectSpec) -> dict[str, list[str]]:
+    """통합 유닛별로 *빠뜨린 비통합 빌더 유닛* 목록을 반환(과소 의존 탐지, 보수적).
+
+    빌더(비통합) 유닛이 2개 미만이면 엮을 게 없어 {}. 통합 유닛이 없어도 {}. 통합 유닛이
+    비통합 빌더를 **2개 이상** 빠뜨릴 때만 gap으로 잡는다(단일 누락은 의도일 수 있음 →
+    오탐 회피). 비통합 유닛끼리는 절대 의존을 만들지 않는다(병렬성 보존 = 과직렬화 금지).
+    """
+    units = spec.decomposition
+    if len(units) < 2:
+        return {}
+    integ = {u.unit for u in units if _is_integration_unit(u.desc)}
+    if not integ:
+        return {}
+    gaps: dict[str, list[str]] = {}
+    for u in units:
+        if u.unit not in integ:
+            continue  # 비통합 빌더엔 넛지 안 함(과직렬화 금지)
+        deps = set(u.deps or [])
+        # 후보 = 이 통합 유닛이 엮을 법한 *비통합 빌더* 유닛(자기 자신·다른 통합 유닛 제외).
+        builders = [o.unit for o in units if o.unit != u.unit and o.unit not in integ]
+        missing = [b for b in builders if b not in deps]
+        if len(missing) >= 2:  # 보수적 임계 — 다수를 빠뜨릴 때만
+            gaps[u.unit] = missing
+    return gaps
+
+
+def integration_dep_feedback(spec: ProjectSpec) -> str | None:
+    """과소 의존 통합 유닛이 있으면 #31 재합성 채널에 줄 넛지 피드백 텍스트, 없으면 None."""
+    gaps = _integration_dep_gaps(spec)
+    if not gaps:
+        return None
+    lines = [
+        "통합 유닛의 의존(deps)이 과소 지정됨 — 통합 유닛은 *자기가 엮는 유닛들에 의존*하게 하라.",
+        "통합 성격 유닛(대시보드·진입점·e2e·트레이스 등)은 다른 유닛의 산출물을 import/연결한다.",
+        "그 유닛이 엮는 빌더 유닛들을 deps에 추가해 *마지막에, 의존이 머지된 뒤* 빌드되게 하라 "
+        "— 그래야 같은 파일을 동시에 건드려 머지 충돌나지 않는다.",
+        "단 *자기가 실제로 엮는 유닛*에만 의존을 더하라(전부 직렬화 금지 — 비통합 유닛 병렬성 보존).",
+        "criteria/done_when/goal은 그대로 두고 decomposition의 deps만 고쳐라.",
+    ]
+    for unit, missing in gaps.items():
+        lines.append(
+            f"- 통합 유닛 [{unit}]: 현재 deps가 빌더 유닛 {missing}을(를) 빠뜨림 — 엮는 것들을 deps에 추가."
+        )
+    return "\n".join(lines)
+
+
+def _adopt_deps_only(original: ProjectSpec, restructured: ProjectSpec) -> ProjectSpec:
+    """재합성 결과에서 **deps만** 채택 — protected 필드(criteria/done_when/goal 등)는 원본 유지.
+
+    governance: plan(분해/deps)은 mutable, 기준은 protected. 통합 deps 교정이 criteria를
+    바꾸지 못하게 못박는다. unit 집합이 다르면(재합성이 분해 구조를 갈아엎음) deps만 떼올 수
+    없으므로 보수적으로 원본 그대로(데드락/구조 변형 금지).
+    """
+    orig_units = {u.unit for u in original.decomposition}
+    new_deps = {u.unit: list(u.deps or []) for u in restructured.decomposition}
+    if orig_units != set(new_deps):
+        return original  # 분해 구조가 바뀜 → deps-only splice 불가, 보수적으로 원본
+    merged = original.model_copy(deep=True)
+    for u in merged.decomposition:
+        u.deps = new_deps.get(u.unit, u.deps)
+    return merged
+
+
+def nudge_integration_deps(
+    order: str,
+    spec: ProjectSpec,
+    client: LLMClient,
+    *,
+    context: str | None = None,
+    prompt_path: str | Path = DEFAULT_PROMPT_PATH,
+    synth_retries: int = DEFAULT_SYNTH_RETRIES,
+) -> ProjectSpec:
+    """통합 유닛 deps가 과소면 #31 채널로 *바운드 1회* 재합성해 deps만 교정한 spec 반환.
+
+    deps가 충분하면 no-op으로 원본 그대로(기존 동작·비용 불변). 넛지가 필요해도:
+      - 정확히 1회 재합성(bounded, 무한·데드락 금지).
+      - 재합성 실패(SynthesisError/클라이언트 예외)는 흡수 → 원본 진행(advisory).
+      - 성공해도 *deps만* 채택(criteria/done_when 불변 가드).
+    """
+    feedback = integration_dep_feedback(spec)
+    if feedback is None:
+        return spec  # 통합 의존 충분 — no-op(추가 LLM 호출 없음)
+    try:
+        restructured = synthesize(
+            order, client, context=context, prompt_path=prompt_path,
+            feedback=feedback, synth_retries=synth_retries,
+        )
+    except Exception:  # noqa: BLE001 — 넛지는 advisory: 어떤 실패도 run을 막지 않는다(원본 진행)
+        return spec
+    return _adopt_deps_only(spec, restructured)

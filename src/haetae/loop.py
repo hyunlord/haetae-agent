@@ -16,7 +16,7 @@ import yaml
 
 from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_critic as critic_mod
 from haetae.deps import Runner as DepsRunner, ensure_deps
-from haetae.intake import SynthesisError, synthesize
+from haetae.intake import SynthesisError, nudge_integration_deps, synthesize
 from haetae.llm import LLMClient
 from haetae.metering import (
     MeteredClient,
@@ -595,9 +595,15 @@ def run_loop(
             try_save()
             return state
 
+        # WO#51: 통합 유닛 deps 추론 넛지 — 통합 성격 유닛(대시보드·진입점·e2e·트레이스)이
+        # 자기가 엮는 빌더 유닛에 의존하도록 deps를 교정한다. 과소 지정 시에만 #31 재합성
+        # 피드백 채널로 *바운드 1회* 보정 → DAG 말단 직렬화 → 통합 시점 머지 충돌 근본 차단.
+        # deps만 바꾸고 criteria/done_when 불변. best-effort(실패→원본 진행). 비용은 아래 drain.
+        spec = nudge_integration_deps(order, spec, m_client, prompt_path=syn_prompt)
+
         state = _init_state(spec)
         record_transition(STAGE_SYNTHESIZE)
-        # 합성/critic(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
+        # 합성/critic/통합-deps 넛지(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
         account(combine_costs(m_client.drain()))
         if m_critic is not None:
             account(combine_costs(m_critic.drain()))
