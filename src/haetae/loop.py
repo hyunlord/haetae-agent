@@ -15,6 +15,7 @@ from typing import Callable, Protocol, runtime_checkable
 import yaml
 
 from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_critic as critic_mod
+from haetae.capability import PocRunner, governed_capability_preflight
 from haetae.deps import Runner as DepsRunner, ensure_deps
 from haetae.intake import SynthesisError, nudge_integration_deps, synthesize
 from haetae.llm import LLMClient
@@ -379,6 +380,10 @@ def run_loop(
     pricing: dict | None = None,
     clock: Callable[[], str] | None = None,
     activity_observer: Callable[[list["Activity"]], None] | None = None,
+    capabilities_on: bool = False,
+    capability_registry_path: str | Path | None = None,
+    capability_allowlist: list[str] | None = None,
+    capability_poc_runner: PocRunner | None = None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -611,6 +616,32 @@ def run_loop(
             state.spec_critique = critique  # 감사 기록(재합성 발생 여부 포함)
             emit(_critique_label(critique))
             try_save()
+
+        # ── 능력 획득 거버넌스(WO#53 F.1, opt-in) — dispatch 전 pre-flight ──
+        # 플래그 OFF(기본)면 *완전 no-op*(기존 동작 불변). ON이고 spec이 능력을 요청하면:
+        #   발견(큐레이션 후보) → POC(증거) → 승인(allowlist)된 건 provenance 기록 후 진행,
+        #   미승인은 *escalate*(후보+증거+provenance, 사람 검토 대기 → 승인 후 재실행 시 채택).
+        # **자동 채택 없음**·executor sandbox 무변경·큐레이션 소스만·best-effort(절대 raise 안 함).
+        if capabilities_on:
+            requests = list(spec.capability_requests or [])
+            state.capability_requests = requests
+            if requests:
+                outcome = governed_capability_preflight(
+                    requests,
+                    registry_dir=capability_registry_path,
+                    allowlist=capability_allowlist,
+                    approved_at=now() or "",
+                    poc_runner=capability_poc_runner,
+                )
+                # 승인되어 채택된 능력의 provenance를 감사 기록(미승인은 없음 — 자동 채택 X).
+                state.capability_provenance.extend(outcome.provenance)
+                if outcome.escalation is not None:
+                    # 미승인 능력 → run 멈춤(사람 승인 대기). 기존 escalate→사람→재run 경로 재사용.
+                    state.pending_escalations.append(outcome.escalation)
+                    state.status = Status.escalated
+                    emit(_final_label(state))
+                    try_save()
+                    return state
 
         # 선제 스캐폴드(WO#27): executor *dispatch 전에* host가 진짜 스택을 깐다.
         # scaffold_client 없으면 None → 모든 신규 경로 no-op(기존 동작 불변, critic 패턴과 동형).

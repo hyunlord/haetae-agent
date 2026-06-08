@@ -130,6 +130,66 @@ class DecompositionUnit(BaseModel):
     deps: list[str] = Field(default_factory=list)
 
 
+# ──────────────────── 능력 획득 거버넌스 (WO#53 Phase F.1) ────────────────────
+#
+# 빌드가 *없는 능력*(라이브러리/툴)을 필요로 할 때, **거버넌스 하에** 발견·검증·채택한다:
+#   요청(gap) → 큐레이션 레지스트리 발견(후보) → POC(증거) → 사람 승인(escalate) → 채택(+provenance)
+# 안전 불변: 자동 채택 절대 없음(신뢰 결정은 사람), executor sandbox 무변경, 큐레이션 소스만,
+# opt-in(플래그 OFF면 no-op). 아래는 그 *데이터 구조*(엔진-free, 직렬화 가능).
+
+
+class CapabilityRequest(BaseModel):
+    """능력 요청(gap) — 빌드가 필요로 하는 능력. spec/state에 기록된다.
+
+    capability: 필요한 능력 키워드(예: "pathfinding"). unit: 어느 유닛이 필요로 하나(옵션).
+    reason: 왜 필요한가(옵션). 합성기가 선언하거나(opt-in) 향후 executor가 요청.
+    """
+
+    capability: str
+    unit: str | None = None
+    reason: str | None = None
+
+
+class CapabilityCandidate(BaseModel):
+    """발견된 후보 — 큐레이션 레지스트리 엔트리에서 파생(무엇을·어디서·라이선스)."""
+
+    capability: str
+    identifier: str            # 패키지/툴 식별자(예: "pathfinding")
+    ecosystem: str             # npm | pip | tool
+    source: str                # 큐레이션 출처(예: "curated:npm/pathfinding")
+    license: str
+    install: list[str] = Field(default_factory=list)  # host-side 설치 명령(채택 실행=F.1b)
+
+
+class CapabilityPOC(BaseModel):
+    """POC 증거 — 후보가 작동하나/무엇을 import/무엇이 더 필요한지.
+
+    ok: True(작동)/False(실패)/None(미실행 — 메타데이터만, 라이브 스모크는 주입 runner 필요).
+    best-effort: POC 실패는 흡수되어 ok=False로 기록(루프 안 죽임).
+    """
+
+    identifier: str
+    ok: bool | None = None
+    imports: list[str] = Field(default_factory=list)
+    needs: list[str] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class CapabilityProvenance(BaseModel):
+    """채택 provenance — 무엇을·어디서·라이선스·누가·언제 승인. 채택 시 state에 기록.
+
+    승인(allowlist)된 후보에만 생성된다 = 거버넌스 감사 기록. 미승인은 provenance 없음.
+    """
+
+    capability: str
+    identifier: str
+    source: str
+    license: str
+    approved_by: str
+    approved_at: str
+    poc_ok: bool | None = None
+
+
 # ──────────────────────────── ProjectSpec ────────────────────────────
 
 
@@ -150,6 +210,9 @@ class ProjectSpec(BaseModel):
     done_when: str
     decomposition: list[DecompositionUnit] = Field(default_factory=list)
     open_questions: list[Any] = Field(default_factory=list)
+    # 능력 획득(WO#53 F.1, opt-in): 빌드가 필요로 하는 *없는 능력*(라이브러리/툴) 요청.
+    # 합성기가 선언할 수 있으나 선택 — 기본 빈 리스트(기존 spec 무영향). 능력 플래그 OFF면 무시.
+    capability_requests: list[CapabilityRequest] = Field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ProjectSpec":
@@ -402,6 +465,10 @@ class State(BaseModel):
     activity: list[Activity] = Field(default_factory=list)
     # 단계 전이 이력(WO#33 Part B) — append-only 타임라인.
     transitions: list[StageTransition] = Field(default_factory=list)
+    # 능력 획득 거버넌스(WO#53 F.1) — append-only 감사. 능력 플래그 OFF면 둘 다 빈 리스트.
+    #   requests: 이번 run이 선언한 능력 gap. provenance: *승인되어 채택된* 능력(무엇·출처·라이선스·승인).
+    capability_requests: list[CapabilityRequest] = Field(default_factory=list)
+    capability_provenance: list[CapabilityProvenance] = Field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "State":

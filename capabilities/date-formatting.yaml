@@ -1,0 +1,10 @@
+# 큐레이션 능력 엔트리(F.1) — in-repo 검증됨. 보수적 시드(널리 쓰이는 MIT 라이브러리).
+capability: date-formatting
+keywords: ["date formatting", "date-fns", "날짜 포맷", "날짜 형식", "시간 포맷", "datetime format"]
+identifier: date-fns
+ecosystem: npm
+source: "curated:npm/date-fns"
+license: MIT
+install: ["npm", "install", "date-fns"]
+imports: ["date-fns"]
+note: "모듈식 날짜 유틸리티(불변·트리셰이커블). 포맷/파싱/연산."

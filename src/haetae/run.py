@@ -21,6 +21,8 @@ from haetae.models import State
 
 # 기본 스킬 디렉토리 = 이 repo의 skills/ (src/haetae/run.py → parents[2] = repo 루트).
 _DEFAULT_SKILLS_DIR = str(Path(__file__).resolve().parents[2] / "skills")
+# 큐레이션 능력 레지스트리(WO#53 F.1) = 이 repo의 capabilities/. opt-in(--capabilities)일 때만 사용.
+_DEFAULT_CAPABILITIES_DIR = str(Path(__file__).resolve().parents[2] / "capabilities")
 
 
 def run(
@@ -46,6 +48,9 @@ def run(
     install_deps: bool = True,
     skills_dir: str | Path | None = None,
     pricing: dict | None = None,
+    capabilities_on: bool = False,
+    capability_registry_path: str | Path | None = None,
+    capability_allowlist: list[str] | None = None,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -54,6 +59,9 @@ def run(
         executor,
         gate,
         critic_client=critic_client,
+        capabilities_on=capabilities_on,
+        capability_registry_path=capability_registry_path,
+        capability_allowlist=capability_allowlist,
         max_iters=max_iters,
         decomp_critic=decomp_critic,
         decomp_retries=decomp_retries,
@@ -252,6 +260,29 @@ def main(argv: list[str] | None = None) -> int:
             "주면 usd를 계산, 없으면 모델 미상 → usd=null(토큰만 기록). best-effort 로드."
         ),
     )
+    # ── 능력 획득 거버넌스(WO#53 F.1) — opt-in. 기본 OFF면 완전 no-op(기존 동작 불변) ──
+    parser.add_argument(
+        "--capabilities",
+        action="store_true",
+        default=False,
+        help=(
+            "능력 획득 거버넌스 ON(기본 OFF). spec이 요청한 *없는 능력*을 큐레이션 레지스트리에서 "
+            "발견→POC→사람 승인(escalate)→채택(provenance). **자동 채택 없음**·executor sandbox 불변."
+        ),
+    )
+    parser.add_argument(
+        "--capability-registry",
+        default=_DEFAULT_CAPABILITIES_DIR,
+        help="큐레이션 능력 레지스트리 디렉토리(capabilities/*.yaml). --capabilities일 때만 사용.",
+    )
+    parser.add_argument(
+        "--capability-allowlist",
+        default="",
+        help=(
+            "사람이 *out-of-band로 승인*한 능력 식별자(쉼표 구분). 승인된 것만 채택(provenance) — "
+            "미승인은 escalate(검토 후 여기 추가하고 재실행). 비면 전부 미승인(자동 채택 없음)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     pricing = _load_pricing(args.pricing)
@@ -345,6 +376,13 @@ def main(argv: list[str] | None = None) -> int:
             install_deps=args.install_deps,
             skills_dir=skills_dir,
             pricing=pricing,
+            capabilities_on=args.capabilities,
+            # opt-in: --capabilities일 때만 레지스트리/allowlist를 넘긴다(OFF면 no-op).
+            capability_registry_path=(args.capability_registry if args.capabilities else None),
+            capability_allowlist=(
+                [s.strip() for s in args.capability_allowlist.split(",") if s.strip()]
+                if args.capabilities else None
+            ),
         )
     except KeyboardInterrupt:
         print("중단됨 (사용자 stop/SIGINT)", file=sys.stderr, flush=True)

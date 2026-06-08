@@ -179,6 +179,13 @@ e2e 테스트·`sim:trace` 트레이스 진입점·"실제 엔진을 import"하�
 `constraints`·기존 규약·스택은 `project_context`에 있는 것만 쓴다.
 없으면 비워두거나 assumption으로 처리한다.
 
+### 7. 없는 능력은 요청으로 (capability_requests — 선택)
+빌드가 *context에 없는 외부 능력*(특정 라이브러리/툴 — 예: 경로탐색·물리엔진)을 진짜로
+필요로 하면, **있는 척 가정하지 말고** `capability_requests`에 선언하라(있을 때만, 보수적):
+`capability_requests: [{ capability: "pathfinding", unit: u1, reason: "유닛 이동 경로탐색" }]`.
+거버넌스가 켜져 있으면 director가 큐레이션 레지스트리에서 후보를 찾아 *사람 승인 후* 채택한다.
+필요 없으면 비워둔다(기본 빈 리스트). 이 필드는 검증 기준이 아니다 — 능력 *요청*일 뿐이다.
+
 ---
 
 ## 주문이 모호할 때 (중요)

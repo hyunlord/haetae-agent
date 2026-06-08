@@ -1,0 +1,10 @@
+# 큐레이션 능력 엔트리(F.1) — in-repo 검증됨. 임의 인터넷 검색 아님(보수적 시드).
+capability: pathfinding
+keywords: ["pathfinding", "path-finding", "a-star", "a*", "길찾기", "경로탐색", "navmesh"]
+identifier: pathfinding
+ecosystem: npm
+source: "curated:npm/pathfinding"
+license: MIT
+install: ["npm", "install", "pathfinding"]
+imports: ["pathfinding"]
+note: "그리드 기반 A*/Dijkstra 경로탐색 라이브러리(브라우저/Node). 게임/시뮬 이동 AI."
