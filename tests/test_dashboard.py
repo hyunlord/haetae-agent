@@ -1425,3 +1425,75 @@ def test_transitions_field_preserved_for_phase_and_round_derivation():
     assert "build" in phase_names
     # 3) 유닛 라운드(transitions 그룹)도 살아있음 — 표시 토글이 데이터 경로를 끊지 않음.
     assert any(v["units"][u]["rounds"] for u in v["units"]), "유닛 라운드 파생 무회귀"
+
+
+# ════════════════════ WO#49: 앱 셸 레이아웃(사이드바 + 모달 + 메인 위계) ════════════════════
+
+
+def test_html_app_shell_sidebar():
+    """A: 좌측 사이드바 — #app/#sidebar 셸, 접기 토글·영속 키, RUNS 리스트·새 run 버튼이 사이드바 안."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="app"' in src and 'id="sidebar"' in src          # 앱 셸(사이드바+메인)
+    assert 'id="sidebar-toggle"' in src                         # « 접기 토글
+    assert 'id="sidebar-open"' in src                           # 접혔을 때 ☰ 열기 버튼
+    assert '"haetae.sidebar.collapsed"' in src                  # 접힘 상태 localStorage 영속
+    assert "side-collapsed" in src and "setSidebar" in src      # 접힘 클래스/제어 함수
+    # RUNS 리스트 + "+ 새 run"이 사이드바(<aside>) 안에 있어야(메인 위에 가로로 안 쌓음).
+    aside = src[src.index("<aside id=\"sidebar\">"):src.index("</aside>")]
+    assert 'id="runs-list"' in aside
+    assert 'id="new-run-btn"' in aside
+    assert 'id="runs-toggle"' in aside and 'id="runs-body"' in aside  # RUNS 접이식은 사이드바 안
+
+
+def test_html_new_run_is_modal():
+    """B: 새 run 폼 = 모달/오버레이 — 인라인으로 공간 먹지 않음. 폼 필드(#45)는 모달 안."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="modal-overlay"' in src and 'id="modal"' in src
+    # 폼(run-form·order·provider-opts·critic-warn)이 모달 컨테이너 안에 위치.
+    modal = src[src.index('id="modal-overlay"'):src.index("</script>")]
+    # run-form과 핵심 필드가 모달 블록 안(오버레이 시작 이후)에 등장.
+    assert 'id="run-form"' in modal
+    assert 'id="f-order"' in modal and 'id="provider-opts"' in modal and 'id="critic-warn"' in modal
+    # 모달 열기/닫기 배선: 새 run → showForm(true), overlay/✕/Esc로 닫힘.
+    assert "showForm(true)" in src and "showForm(false)" in src
+    assert 'classList.toggle("show"' in src                     # 오버레이 표시 토글
+    assert 'id="modal-x"' in src                                # 닫기(✕) 버튼
+
+
+def test_html_main_hierarchy_order():
+    """C: 메인 위계 — 요약 → 스텝퍼(빌드에 유닛 리스트 중첩) → 로그 → DAG → raw transitions 순서.
+
+    위계는 *순서*가 핵심이므로 HTML 등장 인덱스로 검증(요약이 스텝퍼보다, 스텝퍼가 DAG보다 위).
+    """
+    src = HTML.read_text(encoding="utf-8")
+    i_sum = src.index('id="summary"')
+    i_ph = src.index('id="phases"')
+    i_wl = src.index('id="worklog-card"')
+    i_dag = src.index('id="dag-body"')
+    i_tr = src.index('id="tr-body"')
+    assert i_sum < i_ph < i_wl < i_dag < i_tr, "요약→스텝퍼→로그→DAG→transitions 위계 순서"
+    # 빌드 섹션 안 유닛 리스트 중첩은 renderPhases가 phase-body에 #unitlist를 만든다.
+    assert 'id="unitlist"' in src and "phase-body" in src
+    # 코스트 + 상세는 메인 우측 레일(별도 카드).
+    assert 'id="cost-card"' in src and 'id="detail"' in src
+    assert "main-cols" in src and "main-right" in src and "main-left" in src
+
+
+def test_html_empty_state_in_main_not_error():
+    """D: 빈 상태 — 메인에 차분한 안내(에러 박스 아님). #main-empty + empty-hint 스타일."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="main-empty"' in src
+    assert "empty-hint" in src
+    # 빈 상태 문구는 render(v.empty) 분기에서 메인에 그려진다(빨강 .err 아님).
+    assert "표시할 run이 선택되지 않았습니다" in src
+    # render는 empty와 error를 구분해 처리(empty 분기가 main-empty를 켠다).
+    assert "v.empty" in src and "v.error" in src
+
+
+def test_html_responsive_single_column():
+    """D: 반응형 — 좁은 화면(≤900px) 사이드바 오버레이 + 단일 컬럼."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "@media (max-width:900px)" in src                    # 좁은 화면 분기
+    assert "grid-template-columns:1fr" in src                   # 메인 단일 컬럼
+    # 좁아지면 사이드바 자동 접힘(리사이즈 핸들러).
+    assert "innerWidth <= 900" in src or "innerWidth<=900" in src

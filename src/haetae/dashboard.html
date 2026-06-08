@@ -6,50 +6,171 @@
 <title>haetae · live dashboard</title>
 <style>
   :root {
-    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --bd:#2a2f3a; --tx:#e6e9ef; --mut:#9aa3b2;
+    --bg:#0e1014; --bg2:#0b0d11; --panel:#171a21; --panel2:#1e222b; --bd:#2a2f3a; --bd2:#222632;
+    --tx:#e6e9ef; --mut:#9aa3b2; --mut2:#6b7280;
     --pend:#6b7280; --prog:#3b82f6; --done:#22c55e; --fail:#ef4444;
     --pass:#22c55e; --failc:#ef4444; --skip:#6b7280; --accent:#f59e0b;
     --build:#3b82f6; --verify:#a855f7; --synth:#14b8a6; --replan:#f59e0b; --judge:#a855f7; --exec:#22c55e; --orch:#3b82f6;
-    --side:420px;  /* 우측 상세 컬럼 폭(드래그 리사이즈, localStorage 저장) — WO#42 D */
+    --sidebar:280px;     /* 좌측 사이드바 폭(접이식, localStorage 영속) — WO#49 */
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Pretendard,"Helvetica Neue",sans-serif;
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--tx);
-    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Pretendard,sans-serif; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--tx); font:14px/1.5 var(--sans);
+    /* 차분한 깊이감: 메인에 은은한 방사형 글로우(단색 배경 회피, frontend-design) */
+    background-image:radial-gradient(1100px 520px at 78% -8%, rgba(59,130,246,.06), transparent 70%); }
   a { color:var(--prog); }
-  header { display:flex; align-items:center; gap:14px; padding:12px 18px;
-    border-bottom:1px solid var(--bd); position:sticky; top:0; background:var(--bg); z-index:5; }
-  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
-  .pill { padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+
+  /* ───────────────────────── 앱 셸 (사이드바 + 메인) ───────────────────────── */
+  #app { display:flex; height:100vh; overflow:hidden; }
+
+  /* ── 좌측 사이드바 (접이식) ── */
+  #sidebar { width:var(--sidebar); flex:none; display:flex; flex-direction:column; min-height:0;
+    background:linear-gradient(180deg,#13161d,#101218); border-right:1px solid var(--bd);
+    transition:width .18s ease, transform .18s ease; overflow:hidden; }
+  #app.side-collapsed #sidebar { width:0; border-right-color:transparent; }
+  .side-top { display:flex; align-items:center; gap:8px; padding:14px 16px 10px; }
+  .side-top h1 { font:700 16px/1 var(--mono); margin:0; letter-spacing:.18em; text-transform:lowercase;
+    color:var(--tx); }
+  .side-top h1::before { content:"◵ "; color:var(--accent); font-size:14px; letter-spacing:0; }
+  .side-top .sp { flex:1; }
+  #sidebar-toggle { font:inherit; font-size:15px; line-height:1; width:26px; height:26px; border-radius:7px;
+    border:1px solid var(--bd); background:var(--panel2); color:var(--mut); cursor:pointer; }
+  #sidebar-toggle:hover { border-color:var(--prog); color:var(--tx); }
+  .side-new { padding:0 16px 12px; }
+  .side-new .btn { width:100%; justify-content:center; }
+  .runs-section { display:flex; flex-direction:column; min-height:0; flex:1;
+    border-top:1px solid var(--bd2); }
+  .runs-head { display:flex; align-items:center; gap:8px; padding:11px 16px 8px; }
+  .runs-head h2 { margin:0; font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:var(--mut);
+    cursor:pointer; font-weight:700; }
+  .runs-head #runs-headsel { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #ctl-state { display:block; padding:0 16px 6px; }
+  .runs-list { display:flex; flex-direction:column; gap:5px; padding:0 12px 14px; overflow:auto; min-height:0; }
+  .run-row { display:flex; align-items:center; gap:7px; padding:8px 10px; border:1px solid var(--bd2);
+    border-radius:9px; background:var(--panel2); cursor:pointer; transition:.12s; flex-wrap:wrap; }
+  .run-row:hover { border-color:#3a4663; background:#1f2532; }
+  .run-row.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .run-row .rid { font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:.01em; }
+  .run-row .rorder { color:var(--mut); font-size:11px; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rbadge { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px; text-transform:uppercase; letter-spacing:.05em; }
+  .r-running{background:#1e3a8a;color:#bfdbfe} .r-finished{background:#14532d;color:#bbf7d0}
+  .r-stopped{background:#3f3f46;color:#e4e4e7} .r-failed{background:#7f1d1d;color:#fecaca} .r-unknown{background:#451a03;color:#fed7aa}
+  .run-row .stop-btn { margin-left:auto; }
+
+  /* 사이드바 열기(접혔을 때 떠 있는 버튼) */
+  #sidebar-open { display:none; position:fixed; top:12px; left:12px; z-index:40;
+    width:34px; height:34px; border-radius:9px; border:1px solid var(--bd); background:var(--panel);
+    color:var(--tx); cursor:pointer; font-size:15px; box-shadow:0 4px 14px rgba(0,0,0,.4); }
+  #app.side-collapsed #sidebar-open { display:block; }
+  #sidebar-open:hover { border-color:var(--prog); }
+
+  /* ── 메인 영역 ── */
+  #main { flex:1; min-width:0; overflow:auto; position:relative; }
+  #topbar { display:flex; align-items:center; gap:12px; padding:13px 22px; position:sticky; top:0; z-index:6;
+    background:rgba(14,16,20,.86); backdrop-filter:blur(8px); border-bottom:1px solid var(--bd); }
+  #app.side-collapsed #topbar { padding-left:58px; }
+  #topbar .runttl { font-family:var(--mono); font-size:12.5px; color:var(--mut); max-width:46vw;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #topbar .grow { flex:1; }
+  .pill { padding:2px 11px; border-radius:999px; font-size:12px; font-weight:600; letter-spacing:.02em; }
   .s-running{background:#1e3a8a;color:#bfdbfe} .s-done{background:#14532d;color:#bbf7d0}
   .s-escalated{background:#7c2d12;color:#fed7aa} .s-stopped_budget,.s-stopped_stuck{background:#3f3f46;color:#e4e4e7}
-  .mut { color:var(--mut); }
-  /* live indicator */
+  .mut { color:var(--mut); } .small { font-size:11.5px; }
   #live { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; }
   #live .dot { width:8px; height:8px; border-radius:50%; background:var(--mut); }
-  #live.live .dot { background:var(--done); box-shadow:0 0 6px var(--done); animation:pulse 1.6s infinite; }
+  #live.live .dot { background:var(--done); box-shadow:0 0 7px var(--done); animation:pulse 1.6s infinite; }
   #live.polling .dot { background:var(--accent); }
   #live.reconnecting .dot { background:var(--accent); animation:blink 1s infinite; }
   #live.offline .dot { background:var(--fail); }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
-  .grid { display:grid; grid-template-columns: minmax(0,1fr) 8px var(--side); gap:14px; padding:14px 18px; align-items:start; }
-  @media (max-width:900px){ .grid{ grid-template-columns:1fr; } #resizer{ display:none; } }
-  .card { background:var(--panel); border:1px solid var(--bd); border-radius:10px; padding:14px; margin-bottom:14px; }
-  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 10px; }
-  .banner { background:#7c2d12; border:1px solid #b45309; color:#fed7aa; padding:10px 14px; border-radius:8px; margin:0 18px 0; }
-  /* 현재 활동 */
-  .act-card { border-color:#2c3550; background:linear-gradient(180deg,#191e2b,#171a21); }
-  .act { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--bd);
-    border-left:3px solid var(--prog); border-radius:8px; margin-bottom:8px; background:var(--panel2); }
-  .act .spin { width:12px; height:12px; border:2px solid #334; border-top-color:var(--prog); border-radius:50%; animation:rot .8s linear infinite; flex:none; }
+
+  .banner { background:#7c2d12; border:1px solid #b45309; color:#fed7aa; padding:10px 14px; border-radius:8px; margin:14px 22px 0; }
+  .err { background:#7f1d1d; color:#fecaca; padding:14px; border-radius:8px; margin:14px 22px; }
+
+  /* 차분한 빈 상태(에러 아님) — WO#44/#49 */
+  .empty-hint { background:var(--panel2); border:1px solid var(--bd); color:var(--mut);
+    padding:30px 26px; border-radius:14px; margin:60px auto; max-width:560px; font-size:13.5px; line-height:1.9;
+    text-align:center; }
+  .empty-hint .eh-mark { font-size:30px; color:var(--accent); display:block; margin-bottom:10px; letter-spacing:.1em; }
+  .empty-hint b { color:var(--tx); }
+  .empty-hint code { background:var(--bg2); padding:2px 6px; border-radius:5px; font-family:var(--mono); font-size:12px; }
+
+  /* DW식 한눈 요약 헤더(WO#44) */
+  .summary { display:flex; flex-wrap:wrap; align-items:center; gap:7px 16px; margin:14px 22px 0;
+    padding:11px 16px; background:linear-gradient(180deg,#191d26,#171a21); border:1px solid var(--bd);
+    border-radius:12px; font-size:12.5px; }
+  .summary .sm-grp { display:flex; align-items:center; gap:6px; }
+  .summary .sm-k { color:var(--mut); text-transform:uppercase; font-size:10px; letter-spacing:.07em; }
+  .summary .sm-seg b { font-variant-numeric:tabular-nums; font-weight:700; }
+  .summary .sm-sep { width:1px; align-self:stretch; background:var(--bd); }
+
+  /* 메인 컬럼: 주 패널(스텝퍼) + 우측 레일(코스트/상세) */
+  .main-cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(320px,420px); gap:16px; padding:16px 22px 32px; align-items:start; }
+  @media (max-width:1180px){ .main-cols{ grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--bd); border-radius:12px; padding:15px; margin-bottom:16px; }
+  .card:last-child { margin-bottom:0; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 11px; display:flex; align-items:center; gap:7px; }
+  .card h2 .grow { flex:1; }
+  .stepper-card { border-color:#2c3550; background:linear-gradient(180deg,#191e2b,#171a21); }
+
+  /* 섹션 접이식 토글(공통) + 강등 라벨 (WO#47) */
+  .sectoggle { font:inherit; font-size:11px; line-height:1; padding:2px 7px; border-radius:6px;
+    border:1px solid var(--bd); background:var(--panel2); color:var(--mut); cursor:pointer; }
+  .sectoggle:hover { border-color:var(--prog); color:var(--tx); }
+  .sec-demote { color:var(--mut); font-weight:400; text-transform:none; letter-spacing:0; font-size:10.5px; }
+
+  /* 생애주기 단계 스텝퍼(WO#46 A) */
+  .phases { display:flex; flex-direction:column; gap:0; }
+  .phase { border-left:2px solid var(--bd); padding:8px 0 8px 16px; position:relative; }
+  .phase + .phase { margin-top:2px; }
+  .phase.active { border-left-color:var(--prog); }
+  .phase.ph-done { border-left-color:var(--done); }
+  .phase.ph-skipped { opacity:.55; }
+  .phase-h { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .phase-dot { width:9px; height:9px; border-radius:999px; background:var(--bd); margin-left:-21px;
+    border:2px solid var(--panel); box-shadow:0 0 0 1px var(--bd); }
+  .phase.active .phase-dot { background:var(--prog); box-shadow:0 0 0 3px rgba(96,165,250,.2); }
+  .phase.ph-done .phase-dot { background:var(--done); }
+  .phase-name { font-weight:700; font-size:12.5px; }
+  .phase-badge { font-size:9.5px; font-weight:700; padding:1px 6px; border-radius:5px;
+    text-transform:uppercase; letter-spacing:.04em; background:var(--bd); color:var(--mut); }
+  .phase-badge.pb-active { background:var(--prog); color:#04122b; }
+  .phase-badge.pb-done { background:var(--done); color:#04210f; }
+  .phase-badge.pb-pending { background:var(--bd); color:var(--mut); }
+  .phase-badge.pb-skipped { background:transparent; color:var(--mut); border:1px solid var(--bd); }
+  .phase-sum { font-size:11px; color:var(--mut); }
+  .phase-body { margin-top:8px; }
+
+  /* DW식 밀도 라이브 유닛 리스트(WO#42 A) — 빌드 단계 안에 중첩 */
+  .ulist .urow { display:flex; align-items:center; gap:8px; padding:6px 9px; border:1px solid var(--bd);
+    border-radius:8px; margin-bottom:6px; background:var(--panel2); cursor:pointer; font-size:12.5px; transition:.1s; }
+  .ulist .urow:hover { border-color:var(--prog); }
+  .ulist .urow.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .ulist .urow.active { border-left:3px solid var(--prog); background:linear-gradient(180deg,#1a2030,#171a21); }
+  .ulist .cur { width:9px; color:var(--prog); font-weight:700; flex:none; }
+  .ulist .spin { width:11px; height:11px; border:2px solid #334; border-top-color:var(--prog);
+    border-radius:50%; animation:rot .8s linear infinite; flex:none; }
   @keyframes rot { to{ transform:rotate(360deg); } }
-  .act .u { font-weight:700; font-size:13px; }
-  .act .el { margin-left:auto; font-variant-numeric:tabular-nums; color:var(--mut); font-size:12px; }
+  .ulist .u { font-weight:700; font-family:var(--mono); font-size:12px; }
+  .ulist .sp { flex:1; }
+  .ulist .el { color:var(--mut); font-variant-numeric:tabular-nums; min-width:44px; text-align:right; }
+  .ulist .tk { color:var(--mut); font-variant-numeric:tabular-nums; font-size:11.5px; }
+  .ulist .ck { font-size:11.5px; font-variant-numeric:tabular-nums; }
+  .ulist .st-mini { font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  .ulist .ubadge { font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; font-variant-numeric:tabular-nums; }
+  .ulist .ubadge.re { background:#1c1917; color:#fcd34d; }
+  .ulist .ubadge.or { background:#042f2e; color:#99f6e4; }
+  .ulist .ubadge.dr { background:#450a0a; color:#fecaca; }
+
   /* stage badge */
   .stage { font-size:10px; font-weight:700; padding:1px 7px; border-radius:5px; text-transform:uppercase; letter-spacing:.04em; }
   .stg-build{background:#172554;color:#bfdbfe} .stg-verify{background:#3b0764;color:#e9d5ff}
   .stg-synthesize{background:#042f2e;color:#99f6e4} .stg-scaffold{background:#1c1917;color:#d6d3d1}
   .stg-replan{background:#451a03;color:#fed7aa} .stg-done{background:#14532d;color:#bbf7d0} .stg-escalate{background:#450a0a;color:#fecaca}
+
   /* DAG */
   #dagwrap { position:relative; overflow:auto; }
   #edges { position:absolute; inset:0; pointer-events:none; z-index:0; }
@@ -61,7 +182,7 @@
   .node.sel { outline:2px solid var(--accent); }
   .node.blocked { box-shadow:0 0 0 1.5px var(--fail) inset; }
   .node.running { box-shadow:0 0 0 1.5px var(--prog) inset; }
-  .node .id { font-weight:700; font-size:13px; display:flex; align-items:center; gap:6px; }
+  .node .id { font-weight:700; font-size:13px; display:flex; align-items:center; gap:6px; font-family:var(--mono); }
   .node .goal { font-size:11.5px; color:var(--mut); margin-top:3px;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden; }
   .node .st { font-size:10.5px; font-weight:700; text-transform:uppercase; margin-top:5px; letter-spacing:.05em; }
@@ -69,20 +190,36 @@
   .b-done{border-left-color:var(--done)} .b-failed{border-left-color:var(--fail)}
   .t-pending{color:var(--pend)} .t-in_progress{color:var(--prog)} .t-done{color:var(--done)} .t-failed{color:var(--fail)}
   .blk { font-size:11px; color:#fca5a5; margin-top:5px; }
+  #edges .edge { fill:none; stroke:#333a4a; stroke-width:1.4; }
+  .dag-legend { font-size:11.5px; color:var(--mut); margin:0 0 10px;
+    padding:6px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent);
+    border-radius:6px; background:var(--panel2); }
+  .dag-legend b { color:var(--tx); }
+
   /* checks */
   .chk { border:1px solid var(--bd); border-radius:7px; padding:8px 10px; margin-bottom:8px; background:var(--panel2); }
   .chk .row { display:flex; align-items:center; gap:8px; }
   .badge { font-size:10px; font-weight:700; padding:1px 7px; border-radius:5px; text-transform:uppercase; }
   .ba-pass{background:#14532d;color:#bbf7d0} .ba-fail{background:#7f1d1d;color:#fecaca} .ba-skipped{background:#3f3f46;color:#d4d4d8}
   .ctype { font-size:11px; color:var(--mut); }
-  code,.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; }
-  .cmd { display:block; color:#cbd5e1; background:#0b0d11; padding:5px 7px; border-radius:5px; margin-top:6px; white-space:pre-wrap; word-break:break-all; }
+  code,.mono { font-family:var(--mono); font-size:11.5px; }
+  .cmd { display:block; color:#cbd5e1; background:var(--bg2); padding:5px 7px; border-radius:5px; margin-top:6px; white-space:pre-wrap; word-break:break-all; }
   details.ev { margin-top:6px; } details.ev summary { cursor:pointer; font-size:11.5px; color:var(--accent); }
   details.ev[open] summary { margin-bottom:6px; }
-  pre.trace { background:#0b0d11; border:1px solid var(--bd); border-radius:6px; padding:8px; max-height:280px;
+  pre.trace { background:var(--bg2); border:1px solid var(--bd); border-radius:6px; padding:8px; max-height:280px;
     overflow:auto; font-size:11px; white-space:pre-wrap; color:#cbd5e1; margin:6px 0 0; }
   .kv { display:flex; gap:6px; font-size:11.5px; flex-wrap:wrap; } .kv b{color:var(--mut);font-weight:600}
   .ev-good{color:var(--done)} .ev-bad{color:var(--fail)}
+
+  /* 유닛 라운드 드릴다운(WO#46 B) */
+  .round { border:1px solid var(--bd); border-radius:7px; padding:8px; margin-top:8px; background:var(--panel2); }
+  .round-h { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11.5px; }
+  .round-n { font-weight:700; }
+  .round-stages { display:flex; gap:4px; flex-wrap:wrap; margin:6px 0; }
+  .unit-log { background:var(--bg2); border:1px solid var(--bd); border-radius:7px; padding:8px; margin-top:6px;
+    max-height:180px; overflow:auto; }
+  .unit-log .ln { font-family:var(--mono); font-size:10.5px; white-space:pre-wrap; word-break:break-all; color:var(--tx); }
+
   /* timelines */
   .tl-row { display:flex; gap:10px; align-items:baseline; padding:5px 0; border-bottom:1px solid var(--bd); font-size:12.5px; }
   .tl-row:last-child{border-bottom:0}
@@ -91,11 +228,12 @@
   .flow .step { display:flex; align-items:center; gap:5px; padding:3px 8px; border:1px solid var(--bd); border-radius:7px; background:var(--panel2); font-size:11.5px; }
   .flow .arr { color:var(--mut); }
   .flow .ts { color:var(--mut); font-size:10px; font-variant-numeric:tabular-nums; }
+
   /* cost */
   .cost-total { display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; margin-bottom:10px; }
   .cost-total .big { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; }
   .cost-total .usd { font-size:15px; color:var(--done); font-variant-numeric:tabular-nums; }
-  .bar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#0b0d11; margin:8px 0; border:1px solid var(--bd); }
+  .bar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:var(--bg2); margin:8px 0; border:1px solid var(--bd); }
   .bar span { display:block; height:100%; }
   .seg-orchestration{background:var(--orch)} .seg-executor{background:var(--exec)} .seg-judge{background:var(--judge)}
   .seg-mixed{background:#64748b} .seg-unknown{background:#3f3f46}
@@ -109,202 +247,165 @@
   .gap { font-size:12px; padding:7px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent); border-radius:6px; margin-bottom:8px; background:var(--panel2); }
   .empty { color:var(--mut); font-size:12.5px; }
   #detail .ph { color:var(--mut); font-size:13px; }
-  .small { font-size:11.5px; }
-  .err { background:#7f1d1d; color:#fecaca; padding:14px; border-radius:8px; margin:14px 0; }
-  /* ── v3.1 (WO#44 A): 차분한 빈 상태(에러 아님) ── */
-  .empty-hint { background:var(--panel2); border:1px solid var(--bd); color:var(--mut);
-    padding:18px 18px; border-radius:10px; margin:14px 18px 0; font-size:13px; line-height:1.7; }
-  .empty-hint b { color:var(--tx); }
-  .empty-hint code { background:#0b0d11; padding:2px 6px; border-radius:5px; }
-  /* ── v3.1 (WO#44 B): DW식 한눈 요약 바 ── */
-  .summary { display:flex; flex-wrap:wrap; align-items:center; gap:7px 16px; margin:14px 18px 0;
-    padding:10px 14px; background:var(--panel); border:1px solid var(--bd); border-radius:10px; font-size:12.5px; }
-  .summary .sm-grp { display:flex; align-items:center; gap:6px; }
-  .summary .sm-k { color:var(--mut); text-transform:uppercase; font-size:10px; letter-spacing:.06em; }
-  .summary .sm-seg b { font-variant-numeric:tabular-nums; font-weight:700; }
-  .summary .sm-sep { width:1px; align-self:stretch; background:var(--bd); }
-  /* ── v3.1 (WO#44 C): 유닛 행 배지(재시도/OR 대안/분해 reject) ── */
-  .ulist .ubadge { font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; font-variant-numeric:tabular-nums; }
-  .ulist .ubadge.re { background:#1c1917; color:#fcd34d; }
-  .ulist .ubadge.or { background:#042f2e; color:#99f6e4; }
-  .ulist .ubadge.dr { background:#450a0a; color:#fecaca; }
-  /* 제어 표면: runs 목록 + 실행 폼 (WO#37) */
-  .runs-card { border-color:#2c3550; }
-  .runs-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-  .runs-head h2 { margin:0; }
-  .runs-head .sp { flex:1; }
-  .btn { font:inherit; font-size:12px; font-weight:600; padding:5px 11px; border-radius:7px;
-    border:1px solid var(--bd); background:var(--panel2); color:var(--tx); cursor:pointer; }
-  .btn:hover { border-color:var(--prog); }
-  .btn.primary { background:#1d4ed8; border-color:#1d4ed8; color:#fff; }
-  .btn.danger { background:#7f1d1d; border-color:#b91c1c; color:#fecaca; }
-  .btn.danger:hover { background:#991b1b; }
-  .btn:disabled { opacity:.5; cursor:not-allowed; }
-  .runs-list { display:flex; flex-direction:column; gap:6px; max-height:260px; overflow:auto; }
-  .run-row { display:flex; align-items:center; gap:10px; padding:7px 10px; border:1px solid var(--bd);
-    border-radius:8px; background:var(--panel2); cursor:pointer; }
-  .run-row:hover { border-color:var(--prog); }
-  .run-row.sel { outline:2px solid var(--accent); }
-  .run-row .rid { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; font-weight:700; }
-  .run-row .rorder { color:var(--mut); font-size:11.5px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .rbadge { font-size:10px; font-weight:700; padding:1px 8px; border-radius:999px; text-transform:uppercase; letter-spacing:.04em; }
-  .r-running{background:#1e3a8a;color:#bfdbfe} .r-finished{background:#14532d;color:#bbf7d0}
-  .r-stopped{background:#3f3f46;color:#e4e4e7} .r-failed{background:#7f1d1d;color:#fecaca} .r-unknown{background:#451a03;color:#fed7aa}
-  .run-form { border:1px solid var(--bd); border-radius:8px; padding:12px; margin-bottom:12px; background:var(--panel2); }
-  .run-form textarea { width:100%; min-height:64px; resize:vertical; background:#0b0d11; color:var(--tx);
-    border:1px solid var(--bd); border-radius:7px; padding:8px; font:inherit; font-size:12.5px; }
-  .opts { display:flex; flex-wrap:wrap; gap:10px 16px; margin:10px 0; align-items:center; }
+
+  /* 작업 로그(라이브 tail) */
+  .worklog { max-height:320px; overflow:auto; background:var(--bg2); border:1px solid var(--bd); border-radius:7px; padding:8px; }
+  .worklog .ln { font-family:var(--mono); font-size:11px; white-space:pre-wrap; word-break:break-all; color:#cbd5e1; line-height:1.5; }
+  .worklog .trunc { color:var(--mut); font-size:10.5px; margin-bottom:6px; }
+
+  /* ── 새 run 모달(WO#49 B) ── */
+  #modal-overlay { position:fixed; inset:0; z-index:60; display:none; align-items:flex-start; justify-content:center;
+    background:rgba(7,9,12,.66); backdrop-filter:blur(3px); padding:6vh 18px 18px; overflow:auto; }
+  #modal-overlay.show { display:flex; }
+  #modal { width:100%; max-width:680px; background:var(--panel); border:1px solid var(--bd);
+    border-radius:14px; box-shadow:0 24px 70px rgba(0,0,0,.6); overflow:hidden;
+    animation:modalin .16s ease; }
+  @keyframes modalin { from{ transform:translateY(-8px); opacity:0 } to{ transform:none; opacity:1 } }
+  .modal-head { display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid var(--bd); }
+  .modal-head h2 { margin:0; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--tx); }
+  .modal-head .x { margin-left:auto; }
+  .modal-body { padding:16px 18px 18px; }
+  .run-form textarea { width:100%; min-height:74px; resize:vertical; background:var(--bg2); color:var(--tx);
+    border:1px solid var(--bd); border-radius:8px; padding:9px; font:inherit; font-size:12.5px; }
+  .opts { display:flex; flex-wrap:wrap; gap:10px 16px; margin:12px 0; align-items:center; }
   .opt { display:flex; align-items:center; gap:5px; font-size:12px; }
   .opt label { color:var(--mut); }
-  .opt input[type=number], .opt input[type=text], .opt select { background:#0b0d11; color:var(--tx);
+  .opt input[type=number], .opt input[type=text], .opt select { background:var(--bg2); color:var(--tx);
     border:1px solid var(--bd); border-radius:6px; padding:3px 6px; font:inherit; font-size:12px; }
   .opt input[type=number] { width:64px; } .opt input[type=text] { width:130px; }
   .form-err { color:#fca5a5; font-size:12px; margin-top:6px; }
   .form-warn { color:#fbbf24; font-size:12px; margin:4px 0 0; }
   .opt .hint { color:var(--mut); font-size:10.5px; max-width:240px; line-height:1.3; }
   .opt.col { flex-direction:column; align-items:flex-start; gap:2px; }
-  /* 생애주기 단계 스텝퍼(WO#46 A) */
-  .phases { display:flex; flex-direction:column; gap:0; }
-  .phase { border-left:2px solid var(--bd); padding:8px 0 8px 14px; position:relative; }
-  .phase + .phase { margin-top:2px; }
-  .phase.active { border-left-color:var(--prog); }
-  .phase.ph-done { border-left-color:var(--done); }
-  .phase.ph-skipped { opacity:.55; }
-  .phase-h { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .phase-dot { width:9px; height:9px; border-radius:999px; background:var(--bd); margin-left:-19px;
-    border:2px solid var(--panel); box-shadow:0 0 0 1px var(--bd); }
-  .phase.active .phase-dot { background:var(--prog); box-shadow:0 0 0 3px rgba(96,165,250,.2); }
-  .phase.ph-done .phase-dot { background:var(--done); }
-  .phase-name { font-weight:700; font-size:12.5px; }
-  .phase-badge { font-size:9.5px; font-weight:700; padding:1px 6px; border-radius:5px;
-    text-transform:uppercase; letter-spacing:.04em; background:var(--bd); color:var(--mut); }
-  .phase-badge.pb-active { background:var(--prog); color:#04122b; }
-  .phase-badge.pb-done { background:var(--done); color:#04210f; }
-  .phase-badge.pb-pending { background:var(--bd); color:var(--mut); }
-  .phase-badge.pb-skipped { background:transparent; color:var(--mut); border:1px solid var(--bd); }
-  .phase-sum { font-size:11px; color:var(--mut); }
-  .phase-body { margin-top:8px; }
-  /* 유닛 라운드 드릴다운(WO#46 B) */
-  .round { border:1px solid var(--bd); border-radius:7px; padding:8px; margin-top:8px; background:var(--panel2); }
-  .round-h { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11.5px; }
-  .round-n { font-weight:700; }
-  .round-stages { display:flex; gap:4px; flex-wrap:wrap; margin:6px 0; }
-  .unit-log { background:#0b0d11; border:1px solid var(--bd); border-radius:7px; padding:8px; margin-top:6px;
-    max-height:180px; overflow:auto; }
-  .unit-log .ln { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10.5px;
-    white-space:pre-wrap; word-break:break-all; color:var(--tx); }
-  .ctl-off { color:var(--mut); font-size:12px; }
-  /* ── WO#47: 섹션 접이식 토글(공통) + 강등 라벨 ── */
-  .sectoggle { font:inherit; font-size:11px; line-height:1; padding:2px 6px; border-radius:6px;
-    border:1px solid var(--bd); background:var(--panel2); color:var(--mut); cursor:pointer; }
-  .sectoggle:hover { border-color:var(--prog); color:var(--tx); }
-  .card h2 .sectoggle { vertical-align:middle; margin-right:6px; }
-  .sec-demote { color:var(--mut); font-weight:400; text-transform:none; letter-spacing:0; font-size:10.5px; }
-  /* 화살표 의미 범례(WO#47 B) — DAG 펼침 시 한 줄 */
-  .dag-legend { font-size:11.5px; color:var(--mut); margin:0 0 10px;
-    padding:6px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent);
-    border-radius:6px; background:var(--panel2); }
-  .dag-legend b { color:var(--tx); }
-  /* ── v3 (WO#42 A): DW식 밀도 라이브 유닛 리스트 ── */
-  .ulist .urow { display:flex; align-items:center; gap:8px; padding:6px 9px; border:1px solid var(--bd);
-    border-radius:7px; margin-bottom:6px; background:var(--panel2); cursor:pointer; font-size:12.5px; }
-  .ulist .urow:hover { border-color:var(--prog); }
-  .ulist .urow.sel { outline:2px solid var(--accent); }
-  .ulist .urow.active { border-left:3px solid var(--prog); background:linear-gradient(180deg,#191e2b,#171a21); }
-  .ulist .cur { width:9px; color:var(--prog); font-weight:700; flex:none; }
-  .ulist .spin { width:11px; height:11px; border:2px solid #334; border-top-color:var(--prog);
-    border-radius:50%; animation:rot .8s linear infinite; flex:none; }
-  .ulist .u { font-weight:700; }
-  .ulist .sp { flex:1; }
-  .ulist .el { color:var(--mut); font-variant-numeric:tabular-nums; min-width:44px; text-align:right; }
-  .ulist .tk { color:var(--mut); font-variant-numeric:tabular-nums; font-size:11.5px; }
-  .ulist .ck { font-size:11.5px; font-variant-numeric:tabular-nums; }
-  .ulist .st-mini { font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
-  /* ── v3 (WO#42 C): 라이브 작업 로그 tail ── */
-  .worklog { max-height:320px; overflow:auto; background:#0b0d11; border:1px solid var(--bd); border-radius:7px; padding:8px; }
-  .worklog .ln { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px;
-    white-space:pre-wrap; word-break:break-all; color:#cbd5e1; line-height:1.5; }
-  .worklog .trunc { color:var(--mut); font-size:10.5px; margin-bottom:6px; }
-  /* ── v3 (WO#42 B): DAG 엣지 — 직교 라우팅 + 화살표 + 낮은 대비 ── */
-  #edges .edge { fill:none; stroke:#333a4a; stroke-width:1.4; }
-  /* ── v3 (WO#42 D): 메인↔사이드 드래그 리사이즈 핸들 ── */
-  #resizer { cursor:col-resize; align-self:stretch; position:relative; min-height:120px; }
-  #resizer::before { content:""; position:absolute; left:3px; top:0; bottom:0; width:2px; background:var(--bd); border-radius:2px; }
-  #resizer:hover::before { background:var(--prog); }
+  .modal-actions { display:flex; gap:8px; align-items:center; margin-top:6px; }
+
+  /* 버튼 */
+  .btn { display:inline-flex; align-items:center; gap:6px; font:inherit; font-size:12px; font-weight:600; padding:6px 12px; border-radius:8px;
+    border:1px solid var(--bd); background:var(--panel2); color:var(--tx); cursor:pointer; transition:.12s; }
+  .btn:hover { border-color:var(--prog); }
+  .btn.primary { background:#1d4ed8; border-color:#1d4ed8; color:#fff; }
+  .btn.primary:hover { background:#2563eb; }
+  .btn.danger { background:#7f1d1d; border-color:#b91c1c; color:#fecaca; }
+  .btn.danger:hover { background:#991b1b; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .ctl-off { color:var(--mut); font-size:11px; }
+
+  /* ── 반응형: 좁은 화면 → 사이드바 오버레이 + 단일 컬럼(WO#49 D) ── */
+  @media (max-width:900px){
+    #sidebar { position:fixed; top:0; bottom:0; left:0; z-index:50; box-shadow:6px 0 24px rgba(0,0,0,.5); }
+    #app.side-collapsed #sidebar { transform:translateX(-100%); width:var(--sidebar); border-right-color:var(--bd); }
+    #app.side-collapsed #topbar { padding-left:58px; }
+    #topbar { padding-left:58px; }
+    .main-cols { grid-template-columns:1fr; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>haetae <span class="mut">· live dashboard</span></h1>
-  <span id="status" class="pill mut">…</span>
-  <span id="specref" class="mut small"></span>
-  <span style="flex:1"></span>
-  <span id="live"><span class="dot"></span><span id="live-tx">연결 중…</span></span>
-  <span id="tick" class="mut small"></span>
-</header>
-<div id="banner-slot"></div>
-<div id="summary" class="summary" style="display:none"></div>
-<div id="runs-card" class="card runs-card" style="display:none; margin:14px 18px 0;">
-  <div class="runs-head">
-    <button id="runs-toggle" class="sectoggle" title="펼치기/접기">▸</button>
-    <h2 id="runs-h" style="cursor:pointer">RUNS</h2>
-    <span id="runs-headsel" class="mut small"></span>
-    <span class="sp"></span>
-    <button id="new-run-btn" class="btn primary" style="display:none">+ 새 run</button>
-  </div>
-  <div id="runs-body">
-  <span id="ctl-state" class="ctl-off"></span>
-  <div id="run-form" class="run-form" style="display:none">
-    <textarea id="f-order" placeholder="work order / 주문 원문 (예: '리테일 흐름 시뮬레이션을 만들어라 …')"></textarea>
-    <div class="opts">
-      <span class="opt"><label>executor</label>
-        <select id="f-executor"><option value="codex" selected>codex</option><option value="human">human</option></select></span>
-      <span class="opt"><label>max-parallel</label><input id="f-max-parallel" type="number" min="1" max="16" value="4"></span>
-      <span class="opt"><label>run-timeout</label><input id="f-run-timeout" type="number" min="1" max="3600" value="120"></span>
-      <span class="opt"><label>max-iters</label><input id="f-max-iters" type="number" min="1" max="200" value="30"></span>
-      <span class="opt"><label>unit-retries</label><input id="f-unit-retries" type="number" min="0" max="10" value="2"></span>
-      <span class="opt"><label>critic-model</label><input id="f-critic-model" type="text" placeholder="(옵션)"></span>
-      <!-- provider가 선언한 옵션(model·reasoning-effort 등)을 디스크립터로 렌더(WO#45).
-           executor 선택에 따라 자동 적응 — 다른 provider가 붙어도 폼이 자동으로 바뀐다. -->
-      <span id="provider-opts" class="provider-opts"></span>
-      <span class="opt"><input id="f-scaffold" type="checkbox" checked><label>scaffold</label></span>
-      <span class="opt"><input id="f-skills" type="checkbox" checked><label>skills</label></span>
+<div id="app">
+  <!-- ───────── 좌측 사이드바 (접이식) ───────── -->
+  <aside id="sidebar">
+    <div class="side-top">
+      <h1>haetae</h1>
+      <span class="sp"></span>
+      <button id="sidebar-toggle" title="사이드바 접기">«</button>
     </div>
-    <!-- critic-model 비면 분해 critic·OR노드가 조용히 OFF되는 지뢰를 알려준다(막진 않음). -->
-    <div id="critic-warn" class="form-warn" style="display:none">⚠ critic-model이 비어 있어 <b>분해 critic·OR노드가 꺼집니다</b> (둘 다 critic-model 필요). 알고도 끄는 건 괜찮습니다.</div>
-    <div style="display:flex; gap:8px; align-items:center;">
-      <button id="launch-btn" class="btn primary">▶ 실행 (launch)</button>
-      <button id="cancel-form-btn" class="btn">취소</button>
-      <span id="form-err" class="form-err"></span>
+    <div class="side-new">
+      <button id="new-run-btn" class="btn primary" style="display:none">+ 새 run</button>
     </div>
-  </div>
-  <div id="runs-list" class="runs-list"></div>
-  </div>
-</div>
-<div id="root" class="grid">
-  <div id="left">
-    <div class="card act-card"><h2>생애주기 · 단계 (phases)</h2><div id="phases" class="phases"></div></div>
-    <div class="card" id="worklog-card" style="display:none"><h2>작업 로그 (라이브 tail)</h2><div id="worklog" class="worklog"></div></div>
-    <div class="card">
-      <h2><button id="dag-toggle" class="sectoggle" title="펼치기/접기">▸</button>유닛 DAG (구조) <span class="sec-demote">— 구조 참고용 (기본 접힘)</span></h2>
-      <div id="dag-body" style="display:none">
-        <div class="dag-legend">화살표 <b>A→B</b> = <b>B가 A에 의존</b> (B는 A에 blocked by A) · A 완료 후 B 진행</div>
-        <div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div>
+    <div class="runs-section">
+      <div class="runs-head">
+        <button id="runs-toggle" class="sectoggle" title="펼치기/접기">▸</button>
+        <h2 id="runs-h">RUNS</h2>
+        <span id="runs-headsel" class="mut small"></span>
+      </div>
+      <div id="runs-body" style="display:flex; flex-direction:column; min-height:0; flex:1;">
+        <span id="ctl-state" class="ctl-off"></span>
+        <div id="runs-list" class="runs-list"></div>
       </div>
     </div>
-    <div class="card">
-      <h2><button id="tr-toggle" class="sectoggle" title="펼치기/접기">▸</button>raw transitions 보기 <span class="sec-demote">— 디버그용 (phase 스텝퍼·유닛 라운드와 중복, 기본 숨김)</span></h2>
-      <div id="tr-body" style="display:none"><div id="transitions" class="flow"></div></div>
+  </aside>
+  <button id="sidebar-open" title="사이드바 열기">☰</button>
+
+  <!-- ───────── 메인 영역 (선택된 run) ───────── -->
+  <main id="main">
+    <div id="topbar">
+      <span id="status" class="pill mut">…</span>
+      <span id="specref" class="runttl"></span>
+      <span class="grow"></span>
+      <span id="live"><span class="dot"></span><span id="live-tx">연결 중…</span></span>
+      <span id="tick" class="mut small"></span>
     </div>
-    <div class="card"><h2>검증 · 이벤트 타임라인</h2><div id="timeline"></div></div>
-    <div class="card" id="integration-card" style="display:none"><h2>통합 gate (verify · unit=none)</h2><div id="integration"></div></div>
-  </div>
-  <div id="resizer" title="드래그해서 사이드 폭 조절"></div>
-  <div id="right">
-    <div class="card" id="cost-card"><h2>코스트</h2><div id="cost"></div></div>
-    <div class="card"><h2 id="detail-h">상세</h2><div id="detail"><div class="ph">DAG 노드를 클릭하면 work order·gate 체크·실행 증거·비용이 여기에.</div></div></div>
-    <div class="card" id="critique-card" style="display:none"><h2>spec critique</h2><div id="critique"></div></div>
-    <div class="card" id="esc-card" style="display:none"><h2>pending escalations</h2><div id="esc"></div></div>
+    <div id="banner-slot"></div>
+    <div id="main-empty" class="empty-hint" style="display:none"></div>
+    <div id="summary" class="summary" style="display:none"></div>
+
+    <div id="main-cols" class="main-cols">
+      <!-- 주 패널: 생애주기 스텝퍼(빌드에 유닛 리스트 중첩) + 로그 + DAG/transitions(강등) -->
+      <div class="main-left">
+        <div class="card stepper-card"><h2>생애주기 · 단계 (phases)</h2><div id="phases" class="phases"></div></div>
+        <div class="card" id="worklog-card" style="display:none">
+          <h2><button id="wl-toggle" class="sectoggle" title="펼치기/접기">▾</button>작업 로그 (라이브 tail)</h2>
+          <div id="wl-body"><div id="worklog" class="worklog"></div></div>
+        </div>
+        <div class="card">
+          <h2><button id="dag-toggle" class="sectoggle" title="펼치기/접기">▸</button>유닛 DAG (구조) <span class="sec-demote">— 구조 참고용 (기본 접힘)</span></h2>
+          <div id="dag-body" style="display:none">
+            <div class="dag-legend">화살표 <b>A→B</b> = <b>B가 A에 의존</b> (B는 A에 blocked by A) · A 완료 후 B 진행</div>
+            <div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2><button id="tr-toggle" class="sectoggle" title="펼치기/접기">▸</button>raw transitions 보기 <span class="sec-demote">— 디버그용 (phase 스텝퍼·유닛 라운드와 중복, 기본 숨김)</span></h2>
+          <div id="tr-body" style="display:none"><div id="transitions" class="flow"></div></div>
+        </div>
+        <div class="card"><h2>검증 · 이벤트 타임라인</h2><div id="timeline"></div></div>
+        <div class="card" id="integration-card" style="display:none"><h2>통합 gate (verify · unit=none)</h2><div id="integration"></div></div>
+      </div>
+      <!-- 우측 레일: 코스트 + 상세 드릴다운 -->
+      <div class="main-right">
+        <div class="card" id="cost-card"><h2>코스트</h2><div id="cost"></div></div>
+        <div class="card"><h2 id="detail-h">상세</h2><div id="detail"><div class="ph">유닛(스텝퍼/DAG)을 클릭하면 work order·라운드·gate 체크·실행 증거·비용이 여기에.</div></div></div>
+        <div class="card" id="critique-card" style="display:none"><h2>spec critique</h2><div id="critique"></div></div>
+        <div class="card" id="esc-card" style="display:none"><h2>pending escalations</h2><div id="esc"></div></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ───────── 새 run 모달(오버레이) ───────── -->
+<div id="modal-overlay">
+  <div id="modal">
+    <div class="modal-head">
+      <h2>+ 새 run</h2>
+      <span class="x"></span>
+      <button id="modal-x" class="btn" title="닫기">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="run-form" class="run-form">
+        <textarea id="f-order" placeholder="work order / 주문 원문 (예: '리테일 흐름 시뮬레이션을 만들어라 …')"></textarea>
+        <div class="opts">
+          <span class="opt"><label>executor</label>
+            <select id="f-executor"><option value="codex" selected>codex</option><option value="human">human</option></select></span>
+          <span class="opt"><label>max-parallel</label><input id="f-max-parallel" type="number" min="1" max="16" value="4"></span>
+          <span class="opt"><label>run-timeout</label><input id="f-run-timeout" type="number" min="1" max="3600" value="120"></span>
+          <span class="opt"><label>max-iters</label><input id="f-max-iters" type="number" min="1" max="200" value="30"></span>
+          <span class="opt"><label>unit-retries</label><input id="f-unit-retries" type="number" min="0" max="10" value="2"></span>
+          <span class="opt"><label>critic-model</label><input id="f-critic-model" type="text" placeholder="(옵션)"></span>
+          <!-- provider가 선언한 옵션(model·reasoning-effort 등)을 디스크립터로 렌더(WO#45).
+               executor 선택에 따라 자동 적응 — 다른 provider가 붙어도 폼이 자동으로 바뀐다. -->
+          <span id="provider-opts" class="provider-opts"></span>
+          <span class="opt"><input id="f-scaffold" type="checkbox" checked><label>scaffold</label></span>
+          <span class="opt"><input id="f-skills" type="checkbox" checked><label>skills</label></span>
+        </div>
+        <!-- critic-model 비면 분해 critic·OR노드가 조용히 OFF되는 지뢰를 알려준다(막진 않음). -->
+        <div id="critic-warn" class="form-warn" style="display:none">⚠ critic-model이 비어 있어 <b>분해 critic·OR노드가 꺼집니다</b> (둘 다 critic-model 필요). 알고도 끄는 건 괜찮습니다.</div>
+        <div class="modal-actions">
+          <button id="launch-btn" class="btn primary">▶ 실행 (launch)</button>
+          <button id="cancel-form-btn" class="btn">취소</button>
+          <span id="form-err" class="form-err"></span>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -354,7 +455,7 @@ async function pollOnce(){
   }
 }
 
-// ── 제어 표면: runs 목록 / 실행 폼 / stop ──
+// ── 제어 표면: runs 목록 / 실행 폼(모달) / stop ──
 function clearViewer(){
   ["phases","unitlist","worklog","levels","transitions","timeline","integration","cost","critique","esc"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
 }
@@ -403,14 +504,10 @@ function unitLogLines(uid){
 const RSTAT_KO = {running:"도는 중", finished:"완료", stopped:"정지됨", failed:"실패", unknown:"미상"};
 function renderRuns(payload){
   const runs = (payload && payload.runs) || [];
-  const card = $("runs-card");
-  // 제어 ON이거나 run이 하나라도 있으면 카드 표시(클래식 단일 state 뷰는 깔끔히 숨김).
-  if (!ALLOW_RUN && runs.length===0) { card.style.display="none"; return; }
-  card.style.display = "block";
-  $("new-run-btn").style.display = ALLOW_RUN ? "inline-block" : "none";
+  $("new-run-btn").style.display = ALLOW_RUN ? "inline-flex" : "none";
   $("ctl-state").textContent = ALLOW_RUN
-    ? ($("ctl-state").textContent || "제어 활성")
-    : "제어 비활성 (--allow-run으로 켜기)";
+    ? ($("ctl-state").textContent || "제어 활성 (+ 새 run / 정지 가능)")
+    : "제어 비활성 (--allow-run으로 켜기 · 읽기 전용)";
   const list = $("runs-list");
   list.innerHTML = runs.length ? runs.map(r=>{
     const st = r.status||"unknown";
@@ -418,10 +515,10 @@ function renderRuns(payload){
     return '<div class="run-row'+(RUN===r.id?" sel":"")+'" data-id="'+esc(r.id)+'">'
       + '<span class="rid">'+esc(r.id)+'</span>'
       + '<span class="rbadge r-'+esc(st)+'">'+esc(RSTAT_KO[st]||st)+'</span>'
-      + '<span class="rorder">'+esc(r.order||"")+'</span>'
       + (canStop ? '<button class="btn danger stop-btn" data-id="'+esc(r.id)+'">정지</button>' : '')
+      + '<span class="rorder">'+esc(r.order||"")+'</span>'
       + '</div>';
-  }).join("") : '<div class="empty">아직 run 없음'+(ALLOW_RUN?' — "+ 새 run"으로 시작':'')+'</div>';
+  }).join("") : '<div class="empty" style="padding:8px 6px">아직 run 없음'+(ALLOW_RUN?' — "+ 새 run"으로 시작':'')+'</div>';
   list.querySelectorAll(".run-row").forEach(row=>{
     row.onclick = (e)=>{ if (e.target.classList.contains("stop-btn")) return; selectRun(row.dataset.id); };
   });
@@ -442,10 +539,10 @@ async function stopRun(id, btn){
   } catch(_){}
   loadRuns();
 }
+// 폼 = 모달 오버레이(WO#49 B). show 시 provider 옵션·critic 경고 갱신.
 function showForm(show){
-  $("run-form").style.display = show ? "block" : "none";
-  $("new-run-btn").style.display = (ALLOW_RUN && !show) ? "inline-block" : "none";
-  if (show){ renderProviderOpts(); updateCriticWarn(); }
+  $("modal-overlay").classList.toggle("show", !!show);
+  if (show){ renderProviderOpts(); updateCriticWarn(); setTimeout(()=>$("f-order").focus(), 30); }
 }
 
 // ── provider 옵션 디스크립터(WO#45) — 폼이 provider 선언을 읽어 렌더 ──
@@ -520,22 +617,27 @@ async function launchRun(){
 }
 
 function render(v) {
+  const empty = $("main-empty"), cols = $("main-cols");
   if (v && v.empty) {
-    // A(WO#44): run 미선택 + state-path 없음 — 에러 아님. 차분한 안내 + RUNS가 주인공.
-    $("banner-slot").innerHTML = '<div class="empty-hint">'
+    // run 미선택 — 에러 아님. 메인에 차분한 안내(사이드바에서 고르라고).
+    empty.style.display = "block";
+    empty.innerHTML = '<span class="eh-mark">◵</span>'
       + '<b>표시할 run이 선택되지 않았습니다.</b><br>'
-      + '위 <b>RUNS</b> 목록에서 run을 선택'
+      + '왼쪽 <b>RUNS</b>에서 run을 선택'
       + (ALLOW_RUN ? '하거나 <b>+ 새 run</b>으로 시작하세요.' : '하세요.')
-      + '<br><span class="mut small">또는 <code>--state-path</code>로 단일 state를 지정해 띄울 수 있습니다.</span>'
-      + '</div>';
+      + '<br><span class="mut small">또는 <code>--state-path</code>로 단일 state를 지정해 띄울 수 있습니다.</span>';
+    cols.style.display = "none";
     $("summary").style.display = "none"; $("summary").innerHTML = "";
+    $("banner-slot").innerHTML = "";
     $("specref").textContent = "";
     $("status").textContent = "—"; $("status").className = "pill mut";
     clearViewer();
     return;
   }
   if (v.error) {
-    // body를 통째로 갈아엎지 않는다(runs 목록/폼 유지) — 뷰어 영역에만 에러 표시.
+    // 메인 뷰어 영역에만 에러 표시(사이드바 runs 목록은 유지).
+    empty.style.display = "none";
+    cols.style.display = "none";
     $("banner-slot").innerHTML = '<div class="err">state 로드 실패: '+esc(v.error)
       + (RUN? '' : ' — 왼쪽에서 run을 고르거나 --state-path로 띄우세요.')+'</div>';
     $("summary").style.display = "none"; $("summary").innerHTML = "";
@@ -543,6 +645,7 @@ function render(v) {
     clearViewer();
     return;
   }
+  empty.style.display = "none"; cols.style.display = "";
   const st = $("status"); st.textContent = v.status; st.className = "pill s-"+v.status;
   $("specref").textContent = v.spec.spec_ref + " · v" + v.spec.spec_version + (v.spec.goal? " · "+v.spec.goal : "");
   const bs = $("banner-slot");
@@ -635,8 +738,6 @@ function renderSummary(v) {
        + (s.decomp_rejects ? '<span class="sm-seg">분해 reject <b>'+num(s.decomp_rejects)+'</b></span>' : '')
        + '</span>';
   }
-  // status(우측 정렬)
-  h += '<span style="flex:1"></span><span class="pill s-'+esc(s.status)+'">'+esc(s.status)+'</span>';
   box.innerHTML = h;
 }
 
@@ -686,7 +787,7 @@ function renderDag(v) {
       d.innerHTML = '<div class="id">'+esc(uid)+(n.stage?stageBadge(n.stage):"")+'</div>'
         + '<div class="goal">'+esc(n.goal||"")+'</div>'
         + '<div class="st t-'+n.state+'">'+esc(n.state)+'</div>'+blk;
-      d.onclick = () => { SEL=uid; renderDetail(uid); document.querySelectorAll(".node").forEach(x=>x.classList.toggle("sel", x.dataset.id===uid)); };
+      d.onclick = () => { SEL=uid; renderDetail(uid); document.querySelectorAll(".node,.urow").forEach(x=>x.classList.toggle("sel", x.dataset.id===uid)); };
       row.appendChild(d);
     });
     wrap.appendChild(row);
@@ -932,17 +1033,47 @@ function makeCollapse(toggleEl, bodyEl, key, defCollapsed, onExpand){
   apply();
   return { toggle:()=>set(!collapsed), expand:()=>set(false), isCollapsed:()=>collapsed };
 }
-// A: RUNS 기본 접힘(한 줄). B: DAG 기본 접힘(펼치면 엣지 재배치). C: raw transitions 기본 숨김.
+// RUNS 섹션 접이식(사이드바 안). defCollapsed=true(영속 키 보존) — 단 첫 방문(저장값 없음)엔
+// 사이드바의 주 내비라 펼쳐 보여준다(아래 expand). DAG: 기본 접힘(펼치면 엣지 재배치).
+// raw transitions: 기본 숨김. 작업 로그: 기본 펼침(라이브 피드).
 const RUNS_COL = makeCollapse($("runs-toggle"), $("runs-body"), "haetae.runs.collapsed", true, null);
 makeCollapse($("dag-toggle"), $("dag-body"), "haetae.dag.collapsed", true,
   ()=>{ if (VIEW && !VIEW.error) renderDag(VIEW); });   // 숨김 중엔 0폭 → 펼칠 때 재계산
 makeCollapse($("tr-toggle"), $("tr-body"), "haetae.transitions.hidden", true, null);
+makeCollapse($("wl-toggle"), $("wl-body"), "haetae.worklog.collapsed", false, null);
 $("runs-h").onclick = ()=>RUNS_COL.toggle();
+// 첫 방문(저장값 없음)엔 RUNS를 펼쳐 사이드바의 주 내비를 노출(이후엔 사용자 선택 존중).
+if (localStorage.getItem("haetae.runs.collapsed")===null) RUNS_COL.expand();
 
-// 제어 표면 이벤트 배선(폼 토글 / launch / stop은 위임으로).
-// "+ 새 run"은 접혀 있어도 동작하도록 RUNS를 먼저 펼친 뒤 폼을 연다.
+// ── 사이드바 접이식(WO#49 A) — « 토글 + 좁은 화면 자동 접힘 · localStorage 영속 ──
+const SIDEBAR_KEY = "haetae.sidebar.collapsed";
+function setSidebar(collapsed, persist){
+  $("app").classList.toggle("side-collapsed", collapsed);
+  if (persist){ try{ localStorage.setItem(SIDEBAR_KEY, collapsed?"1":"0"); }catch(_){} }
+}
+function initSidebar(){
+  let collapsed = localStorage.getItem(SIDEBAR_KEY)==="1";
+  if (window.innerWidth <= 900) collapsed = true;   // 좁은 화면 → 자동 접힘(오버레이)
+  setSidebar(collapsed, false);
+}
+$("sidebar-toggle").onclick = ()=> setSidebar(true, true);
+$("sidebar-open").onclick = ()=> setSidebar(false, window.innerWidth>900);
+let _wasNarrow = window.innerWidth <= 900;
+window.addEventListener("resize", ()=>{
+  const narrow = window.innerWidth <= 900;
+  if (narrow && !_wasNarrow) setSidebar(true, false);    // 좁아지면 접기
+  if (!narrow && _wasNarrow && localStorage.getItem(SIDEBAR_KEY)!=="1") setSidebar(false, false); // 넓어지면 복원
+  _wasNarrow = narrow;
+});
+initSidebar();
+
+// ── 모달(새 run 폼) 배선(WO#49 B) ──
+// "+ 새 run"은 RUNS를 먼저 펼친 뒤 모달을 연다(선택 run 컨텍스트 유지).
 $("new-run-btn").onclick = ()=>{ RUNS_COL.expand(); showForm(true); };
 $("cancel-form-btn").onclick = ()=>{ showForm(false); $("form-err").textContent=""; };
+$("modal-x").onclick = ()=>{ showForm(false); $("form-err").textContent=""; };
+$("modal-overlay").addEventListener("click", (e)=>{ if (e.target===$("modal-overlay")){ showForm(false); $("form-err").textContent=""; } });
+document.addEventListener("keydown", (e)=>{ if (e.key==="Escape" && $("modal-overlay").classList.contains("show")){ showForm(false); $("form-err").textContent=""; } });
 $("launch-btn").onclick = launchRun;
 // provider 옵션 디스크립터(WO#45): executor 바뀌면 폼 자동 적응 · critic-model 경고 라이브.
 $("f-executor").addEventListener("change", renderProviderOpts);
@@ -957,31 +1088,10 @@ loadRuns();
 setInterval(pollOnce, POLL_MS);
 setInterval(loadRuns, Math.max(2000, POLL_MS));   // runs 상태 배지 주기 갱신
 // 경과시간이 SSE 갱신 사이에도 흐르게 보이도록 유닛 리스트만 1s마다 다시 그림.
-setInterval(()=>{ if (VIEW && !VIEW.error) renderUnitList(VIEW); }, 1000);
+setInterval(()=>{ if (VIEW && !VIEW.error && !VIEW.empty) renderUnitList(VIEW); }, 1000);
 // 라이브 작업 로그(RUN 타겟 있을 때만) 주기 tail 폴링.
 loadLog();
 setInterval(loadLog, Math.max(1500, POLL_MS));
-
-// ── 사이드탭 드래그 리사이즈 (WO#42 D) — --side 갱신 + localStorage 영속 ──
-(function initResizer(){
-  const rz = $("resizer"); if (!rz) return;
-  const root = document.documentElement;
-  const saved = parseInt(localStorage.getItem("haetae.side")||"", 10);
-  if (saved && saved>=280 && saved<=900) root.style.setProperty("--side", saved+"px");
-  let drag = false;
-  rz.addEventListener("mousedown", (e)=>{ drag=true; e.preventDefault(); document.body.style.userSelect="none"; });
-  window.addEventListener("mousemove", (e)=>{
-    if (!drag) return;
-    const w = Math.max(280, Math.min(900, window.innerWidth - e.clientX - 24));
-    root.style.setProperty("--side", w+"px");
-    if (VIEW && !VIEW.error) requestAnimationFrame(()=>drawEdges(VIEW));  // 폭 바뀌면 엣지 재배치
-  });
-  window.addEventListener("mouseup", ()=>{
-    if (!drag) return; drag=false; document.body.style.userSelect="";
-    const px = parseInt(getComputedStyle(root).getPropertyValue("--side"), 10);
-    if (px) localStorage.setItem("haetae.side", px);
-  });
-})();
 </script>
 </body>
 </html>
