@@ -21,6 +21,14 @@ from pathlib import Path
 
 from haetae.metering import Usage
 
+# provider가 선언하는 실행 폼 옵션 디스크립터(WO#45) — 실행 로직과 분리된 *메타데이터*.
+# 엔진-free 리프에 정의하고 여기서 re-export해 "codex provider가 자기 launch 옵션을
+# 선언한다"는 표면을 제공한다(additive). 대시보드는 이 리프를 직접 import한다(격리 유지).
+from haetae.providers.launch_options import (  # noqa: F401 — 공개 re-export
+    LaunchOption,
+    codex_launch_options as launch_options,
+)
+
 CODEX_BIN = "codex"
 
 # 허용 sandbox 화이트리스트. danger-full-access는 코드 레벨에서 차단한다

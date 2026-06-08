@@ -447,7 +447,15 @@ def test_stream_missing_file_sends_error_event_not_crash(tmp_path: Path):
 
 
 def test_dashboard_does_not_import_engine_modules():
-    """대시보드는 models만 의존 — loop/gate/executor/replan/scaffold 등 엔진 미import."""
+    """대시보드는 엔진을 import하지 않는다 — models + launch_options(엔진-free 리프)만 허용.
+
+    WO#45: provider가 선언한 launch-options 디스크립터를 폼이 *직접* 읽으려면 대시보드가
+    그 디스크립터를 import해야 한다. `haetae.providers.launch_options`는 순수 옵션
+    메타데이터(+read-only config 읽기)뿐이고 엔진/실행 코드를 일절 끌어오지 않는다
+    (test_launch_options.py의 test_launch_options_is_engine_free가 이를 강제). 그래서 이
+    리프만 추가 허용하고, 실제 엔진/실행 모듈(loop/gate/executors/providers.codex 등)은
+    여전히 금지한다 — read-only 뷰어 불변식 유지.
+    """
     tree = ast.parse(DASH.read_text(encoding="utf-8"))
     imported: set[str] = set()
     for node in ast.walk(tree):
@@ -457,7 +465,11 @@ def test_dashboard_does_not_import_engine_modules():
             for a in node.names:
                 imported.add(a.name)
     haetae_imports = {m for m in imported if m.startswith("haetae")}
-    assert haetae_imports <= {"haetae.models"}, f"엔진 모듈 import 발견: {haetae_imports}"
+    assert haetae_imports <= {
+        "haetae.models", "haetae.providers.launch_options"
+    }, f"엔진 모듈 import 발견: {haetae_imports}"
+    # 실행 코드가 든 codex provider 본체는 여전히 금지(디스크립터 리프만 허용).
+    assert "haetae.providers.codex" not in imported
     forbidden = {"loop", "gate", "executors", "replan", "scaffold", "run_harness",
                  "scheduler", "worktree", "deps", "judge"}
     assert not any(f in m.split(".") for m in imported for f in forbidden)
@@ -486,6 +498,7 @@ def test_validate_options_defaults():
     assert o["scaffold"] is True and o["skills"] is True
     assert o["critic_model"] is None
     assert o["reasoning_effort"] is None  # 미설정 = codex 기본(기존 동작 불변)
+    assert o["model"] is None  # WO#45: 미설정 = codex 기본 모델 자동(기존 동작 불변)
 
 
 def test_validate_options_rejects_unknown_key():
@@ -521,6 +534,27 @@ def test_validate_options_reasoning_effort(monkeypatch=None):
         validate_options({"reasoning_effort": "ultra"})  # 화이트리스트 밖
     with pytest.raises(ValueError):
         validate_options({"reasoning_effort": 5})  # 타입 불일치
+
+
+def test_validate_options_model(monkeypatch=None):
+    """WO#45: model은 안전 문자만, 빈/미설정은 None, 나쁜 문자 거부."""
+    assert validate_options({"model": "gpt-5.5"})["model"] == "gpt-5.5"
+    assert validate_options({"model": "gpt-5-codex"})["model"] == "gpt-5-codex"
+    assert validate_options({"model": ""})["model"] is None  # 빈 = 미설정(자동)
+    assert validate_options({})["model"] is None
+    with pytest.raises(ValueError):
+        validate_options({"model": "a; rm -rf /"})  # 셸 메타문자 거부
+    with pytest.raises(ValueError):
+        validate_options({"model": 5})  # 타입 불일치
+
+
+def test_build_run_argv_model():
+    """설정 시 `--model <model>` 부착, 미설정이면 미부착(codex 기본 자동 — 기존 동작 불변)."""
+    set_opts = validate_options({"model": "gpt-5.5"})
+    argv = build_run_argv("o", Path("/abs/runs/r"), set_opts)
+    assert argv[argv.index("--model") + 1] == "gpt-5.5"
+    unset = validate_options({})
+    assert "--model" not in build_run_argv("o", Path("/abs/runs/r"), unset)
 
 
 def test_build_run_argv_reasoning_effort():
@@ -814,6 +848,53 @@ def test_launcher_uses_only_subprocess_not_engine_import():
     src = DASH.read_text(encoding="utf-8")
     assert "subprocess.Popen" in src  # 서브프로세스 spawn(엔진 직접 호출 아님)
     assert "signal.SIGINT" in src  # stop은 SIGINT 신호로
+
+
+# ──────────────────── WO#45: provider-declared launch-options ────────────────────
+
+
+HTML = REPO_ROOT / "src" / "haetae" / "dashboard.html"
+
+
+def test_api_launch_options_returns_provider_descriptors(tmp_path: Path):
+    """GET /api/launch-options → provider별 디스크립터(폼이 읽어 렌더). effort 기본·model placeholder."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/launch-options")
+        assert code == 200
+        data = json.loads(body)
+        ex = data["executors"]
+        assert "codex" in ex and "human" in ex
+        codex = {o["name"]: o for o in ex["codex"]}
+        assert codex["reasoning_effort"]["kind"] == "select"
+        # 기본값은 사용자 ~/.codex/config.toml을 best-effort pre-fill하므로 환경 의존 —
+        # 정확값(medium) 단언은 config_path 주입한 test_launch_options 유닛테스트에 둔다.
+        # 여기선 유효 레벨 중 하나임만 확인(엔드포인트 동작·shape 검증).
+        assert codex["reasoning_effort"]["default"] in (
+            "", "minimal", "low", "medium", "high", "xhigh"
+        )
+        assert "xhigh" in codex["reasoning_effort"]["choices"]
+        assert codex["reasoning_effort"]["hint"]  # 권장/비용 힌트
+        assert codex["model"]["kind"] == "text" and codex["model"]["placeholder"]
+        assert ex["human"] == []  # 사람 릴레이는 provider 옵션 없음
+    finally:
+        httpd.shutdown()
+
+
+def test_form_html_has_critic_warning_and_provider_opts_render():
+    """폼 HTML: critic-model 경고 표식 + provider-opts 디스크립터 렌더 + model placeholder 안내."""
+    src = HTML.read_text(encoding="utf-8")
+    # critic-model 비면 경고: 분해 critic·OR노드 OFF 안내(막진 않음).
+    assert 'id="critic-warn"' in src
+    assert "분해 critic" in src and "OR노드" in src
+    assert "updateCriticWarn" in src  # 라이브 토글 로직
+    # provider 디스크립터를 읽어 렌더하는 컨테이너 + 로직.
+    assert 'id="provider-opts"' in src
+    assert "renderProviderOpts" in src
+    assert "/api/launch-options" in src  # 디스크립터를 폼이 읽는다
+    # model 입력 placeholder 안내(비우면 자동·최신)는 디스크립터에서 옴 — JS가 o.placeholder 사용.
+    assert "placeholder" in src
 
 
 # ──────────────────── WO#38 Part A: 예상된 SSE 끊김 traceback 억제 ────────────────────

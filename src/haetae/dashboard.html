@@ -160,6 +160,9 @@
     border:1px solid var(--bd); border-radius:6px; padding:3px 6px; font:inherit; font-size:12px; }
   .opt input[type=number] { width:64px; } .opt input[type=text] { width:130px; }
   .form-err { color:#fca5a5; font-size:12px; margin-top:6px; }
+  .form-warn { color:#fbbf24; font-size:12px; margin:4px 0 0; }
+  .opt .hint { color:var(--mut); font-size:10.5px; max-width:240px; line-height:1.3; }
+  .opt.col { flex-direction:column; align-items:flex-start; gap:2px; }
   .ctl-off { color:var(--mut); font-size:12px; }
   /* ── v3 (WO#42 A): DW식 밀도 라이브 유닛 리스트 ── */
   .ulist .urow { display:flex; align-items:center; gap:8px; padding:6px 9px; border:1px solid var(--bd);
@@ -217,18 +220,14 @@
       <span class="opt"><label>max-iters</label><input id="f-max-iters" type="number" min="1" max="200" value="30"></span>
       <span class="opt"><label>unit-retries</label><input id="f-unit-retries" type="number" min="0" max="10" value="2"></span>
       <span class="opt"><label>critic-model</label><input id="f-critic-model" type="text" placeholder="(옵션)"></span>
-      <span class="opt"><label>reasoning-effort</label>
-        <select id="f-reasoning-effort">
-          <option value="" selected>codex 기본(medium)</option>
-          <option value="minimal">minimal</option>
-          <option value="low">low</option>
-          <option value="medium">medium</option>
-          <option value="high">high</option>
-          <option value="xhigh">xhigh</option>
-        </select></span>
+      <!-- provider가 선언한 옵션(model·reasoning-effort 등)을 디스크립터로 렌더(WO#45).
+           executor 선택에 따라 자동 적응 — 다른 provider가 붙어도 폼이 자동으로 바뀐다. -->
+      <span id="provider-opts" class="provider-opts"></span>
       <span class="opt"><input id="f-scaffold" type="checkbox" checked><label>scaffold</label></span>
       <span class="opt"><input id="f-skills" type="checkbox" checked><label>skills</label></span>
     </div>
+    <!-- critic-model 비면 분해 critic·OR노드가 조용히 OFF되는 지뢰를 알려준다(막진 않음). -->
+    <div id="critic-warn" class="form-warn" style="display:none">⚠ critic-model이 비어 있어 <b>분해 critic·OR노드가 꺼집니다</b> (둘 다 critic-model 필요). 알고도 끄는 건 괜찮습니다.</div>
     <div style="display:flex; gap:8px; align-items:center;">
       <button id="launch-btn" class="btn primary">▶ 실행 (launch)</button>
       <button id="cancel-form-btn" class="btn">취소</button>
@@ -379,15 +378,52 @@ async function stopRun(id, btn){
 function showForm(show){
   $("run-form").style.display = show ? "block" : "none";
   $("new-run-btn").style.display = (ALLOW_RUN && !show) ? "inline-block" : "none";
+  if (show){ renderProviderOpts(); updateCriticWarn(); }
+}
+
+// ── provider 옵션 디스크립터(WO#45) — 폼이 provider 선언을 읽어 렌더 ──
+let LAUNCH_OPTS = {};   // {executor: [ {name,label,kind,default,choices,optional,hint,placeholder} ]}
+async function loadLaunchOptions(){
+  try {
+    const r = await fetch("/api/launch-options");
+    const data = await r.json();
+    LAUNCH_OPTS = (data && data.executors) || {};
+  } catch(_){ LAUNCH_OPTS = {}; }
+  renderProviderOpts();
+}
+function renderProviderOpts(){
+  const host = $("provider-opts"); if (!host) return;
+  const ex = $("f-executor").value;
+  const opts = LAUNCH_OPTS[ex] || [];
+  host.innerHTML = opts.map(o => {
+    const id = "f-opt-"+o.name;
+    const hint = o.hint ? '<span class="hint">'+esc(o.hint)+'</span>' : '';
+    if (o.kind === "select"){
+      const cur = o.default || "";
+      const choices = (o.choices||[]).map(c =>
+        '<option value="'+esc(c)+'"'+(c===cur?' selected':'')+'>'+esc(c)+'</option>').join("");
+      return '<span class="opt col"><label>'+esc(o.label)+'</label>'
+        + '<select id="'+id+'">'+choices+'</select>'+hint+'</span>';
+    }
+    // text: 비우면 provider 기본(자동). default를 pre-fill(세팅 추적)·placeholder 안내.
+    return '<span class="opt col"><label>'+esc(o.label)+'</label>'
+      + '<input id="'+id+'" type="text" value="'+esc(o.default||"")+'" placeholder="'+esc(o.placeholder||"")+'">'
+      + hint+'</span>';
+}).join("");
+}
+function updateCriticWarn(){
+  const w = $("critic-warn"); if (!w) return;
+  const empty = !$("f-critic-model").value.trim();
+  w.style.display = empty ? "block" : "none";
 }
 async function launchRun(){
   const order = $("f-order").value.trim();
   const errEl = $("form-err"); errEl.textContent="";
   if (!order){ errEl.textContent="order를 입력하세요."; return; }
   const cm = $("f-critic-model").value.trim();
-  const re = $("f-reasoning-effort").value;
+  const ex = $("f-executor").value;
   const options = {
-    executor: $("f-executor").value,
+    executor: ex,
     max_parallel: parseInt($("f-max-parallel").value,10),
     run_timeout: parseFloat($("f-run-timeout").value),
     max_iters: parseInt($("f-max-iters").value,10),
@@ -396,7 +432,13 @@ async function launchRun(){
     skills: $("f-skills").checked,
   };
   if (cm) options.critic_model = cm;
-  if (re) options.reasoning_effort = re;  // 미설정(빈값)이면 안 붙임 → codex 기본
+  // provider 디스크립터 필드를 일반적으로 수집(미입력=빈값이면 안 붙임 → provider 기본).
+  for (const o of (LAUNCH_OPTS[ex] || [])){
+    const el = $("f-opt-"+o.name);
+    if (!el) continue;
+    const v = (el.value || "").trim();
+    if (v) options[o.name] = v;
+  }
   const btn = $("launch-btn"); btn.disabled=true; btn.textContent="실행 중…";
   try {
     const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"},
@@ -740,6 +782,10 @@ function renderEsc(v) {
 $("new-run-btn").onclick = ()=>showForm(true);
 $("cancel-form-btn").onclick = ()=>{ showForm(false); $("form-err").textContent=""; };
 $("launch-btn").onclick = launchRun;
+// provider 옵션 디스크립터(WO#45): executor 바뀌면 폼 자동 적응 · critic-model 경고 라이브.
+$("f-executor").addEventListener("change", renderProviderOpts);
+$("f-critic-model").addEventListener("input", updateCriticWarn);
+if (ALLOW_RUN) loadLaunchOptions();   // 디스크립터 선로딩(폼 열기 전에 미리)
 
 // 부팅: 즉시 1회 폴링(첫 페인트) → SSE 구독 → 폴링 폴백 인터벌(SSE 살면 자동 휴면).
 setLive("reconnecting","연결 중…");

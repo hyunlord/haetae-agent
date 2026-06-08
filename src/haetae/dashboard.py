@@ -33,8 +33,11 @@ from pathlib import Path
 from typing import Any
 
 from haetae.models import ProjectSpec, State
+from haetae.providers.launch_options import all_launch_options
 
-# 엔진 모듈을 절대 import하지 않는다(WO#28/#37 불변식). models만 의존.
+# 엔진 모듈을 절대 import하지 않는다(WO#28/#37 불변식). models + launch_options(엔진-free
+# 리프)만 의존. launch_options는 *순수 옵션 메타데이터*(+read-only config 읽기)뿐이라 엔진/
+# 실행 코드를 끌어오지 않는다 — provider가 선언한 디스크립터를 폼이 그대로 읽기 위함(WO#45).
 # 제어 표면(launch/stop)은 엔진을 *import해 돌리지 않고* `python -m haetae.run`을
 # 별도 서브프로세스로 spawn할 뿐 — 런처는 stdlib(subprocess/signal/os)만 쓴다.
 
@@ -574,7 +577,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
     raw = raw or {}
     allowed = {
         "executor", "max_parallel", "run_timeout", "scaffold", "skills",
-        "critic_model", "max_iters", "unit_retries", "reasoning_effort",
+        "critic_model", "max_iters", "unit_retries", "reasoning_effort", "model",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -620,6 +623,16 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
         if critic_model and not _CRITIC_MODEL_RE.match(critic_model):
             raise ValueError("critic_model has invalid characters")
 
+    # model(WO#45): provider 모델 override. 미설정(None/빈문자)이면 argv에 `--model` 미부착
+    # → codex 기본(최신) 자동(기존 동작 불변). critic_model과 같은 안전 문자 집합으로 검증.
+    model = raw.get("model")
+    if model is not None:
+        if not isinstance(model, str):
+            raise ValueError("model must be a string")
+        model = model.strip() or None
+        if model and not _CRITIC_MODEL_RE.match(model):
+            raise ValueError("model has invalid characters")
+
     # reasoning_effort(WO#38): 미설정(None/빈문자)이면 플래그 미부착 → codex 기본(기존 동작
     # 불변). 설정 시 화이트리스트 밖이면 거부. sandbox 권한과 무관(가드 불변).
     reasoning_effort = raw.get("reasoning_effort")
@@ -640,6 +653,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
         "max_iters": _int("max_iters", 30, 1, 200),
         "unit_retries": _int("unit_retries", 2, 0, 10),
         "reasoning_effort": reasoning_effort,
+        "model": model,
     }
 
 
@@ -663,6 +677,9 @@ def build_run_argv(order: str, run_dir: Path, opts: dict[str, Any]) -> list[str]
     argv.append("--skills" if opts["skills"] else "--no-skills")
     if opts["critic_model"]:
         argv += ["--critic-model", opts["critic_model"]]
+    # model(WO#45): 설정 시만 `--model` 부착. 비우면 미부착 → codex 기본(최신) 자동(기존 동작 불변).
+    if opts.get("model"):
+        argv += ["--model", opts["model"]]
     # reasoning_effort: 설정 시만 플래그 부착. 미설정이면 codex 기본(기존 동작 불변).
     if opts.get("reasoning_effort"):
         argv += ["--reasoning-effort", opts["reasoning_effort"]]
@@ -1045,6 +1062,10 @@ def make_handler(
             elif path == "/api/runs":
                 runs = run_manager.list_runs() if run_manager else []
                 self._send_json(200, {"runs": runs, "allow_run": allow_run})
+            elif path == "/api/launch-options":
+                # provider가 선언한 실행 폼 옵션 디스크립터(WO#45) — read-only·best-effort.
+                # config pre-fill을 매 요청 신선하게 반영. 실패해도 정적 기본으로 폴백(무크래시).
+                self._handle_launch_options()
             elif path.startswith("/api/runs/") and path.endswith("/log"):
                 self._handle_log(path[len("/api/runs/"):-len("/log")])
             elif path == "/":
@@ -1082,6 +1103,18 @@ def make_handler(
                 self._send_json(500, {"error": f"launch failed: {type(e).__name__}: {e}"})
                 return
             self._send_json(200, {"run_id": run_id})
+
+        def _handle_launch_options(self) -> None:
+            # provider 디스크립터를 JSON으로(폼이 읽어 렌더). best-effort: config 읽기 실패도
+            # launch_options 내부에서 정적 기본으로 흡수하므로 여기선 추가 폴백만 둔다.
+            try:
+                executors = all_launch_options()
+            except Exception as e:  # noqa: BLE001 — 디스크립터 빌드 실패도 서버를 안 죽인다
+                self._send_json(
+                    500, {"error": f"launch options failed: {type(e).__name__}: {e}", "executors": {}}
+                )
+                return
+            self._send_json(200, {"executors": executors})
 
         def _handle_log(self, run_id: str) -> None:
             # 라이브 작업 로그 tail(WO#42 C) — read-only(allow_run 불필요, /api/runs와 동급).
