@@ -339,6 +339,37 @@ def state_to_view(
         "by_unit": by_unit,
     }
 
+    # ── v3(WO#42): DW식 밀도 라이브 리스트용 per-unit 행(plan 순서, 결정론) ──
+    # 한 줄 = 유닛 · 단계/상태 · tokens · 경과 · 체크수(pass/fail). 전부 기존 view
+    # 데이터(activity/by_unit/units/checks)에서 모은다. 부재 필드는 None/0(무크래시).
+    activity_elapsed: dict[str, float | None] = {
+        a["unit"]: a["elapsed_s"] for a in activity if a["unit"] is not None
+    }
+    unit_rows: list[dict[str, Any]] = []
+    for p in plan:
+        uid = p.unit
+        ev = latest_event.get(uid)
+        ev_checks = ev.checks if ev else []
+        cp = sum(1 for c in ev_checks if c.status == "pass")
+        cf = sum(1 for c in ev_checks if c.status == "fail")
+        bu_u = by_unit.get(uid) or {}
+        unit_rows.append(
+            {
+                "unit": uid,
+                "goal": unit_goal(uid),
+                "state": p.state.value,
+                "stage": activity_by_unit.get(uid),  # in_progress면 현재 세부 단계
+                "active": uid in activity_by_unit,  # in-flight 강조(DW의 '>' 커서)
+                "elapsed_s": activity_elapsed.get(uid),  # in-flight면 경과(now-started)
+                "tokens": bu_u.get("tokens"),
+                "usd": bu_u.get("usd"),
+                "checks_pass": cp,
+                "checks_fail": cf,
+                "checks_total": len(ev_checks),
+                "verdict": _verdict_val(ev.verdict) if ev else None,
+            }
+        )
+
     return {
         "status": state.status.value,
         "spec": spec_view,
@@ -357,6 +388,7 @@ def state_to_view(
         "activity": activity,
         "transitions": transitions,
         "cost": cost,
+        "unit_rows": unit_rows,
     }
 
 
@@ -398,6 +430,11 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
 
 _RUNS_DIR_DEFAULT = "runs"
 _STOP_GRACE_S = 5.0  # SIGINT 후 정리 대기. 초과 시 SIGTERM→SIGKILL 에스컬레이트(best-effort).
+# 라이브 작업 로그 tail(WO#42 C) — bounded. 끝에서 최대 N바이트만 읽고 마지막 N줄만 노출
+# (대용량 로그 덤프 금지). 기본/상한을 둬 임의 tail 값으로도 안전하게 클램프.
+_LOG_TAIL_DEFAULT_LINES = 200
+_LOG_TAIL_MAX_LINES = 2000
+_LOG_TAIL_MAX_BYTES = 256 * 1024
 _EXECUTOR_CHOICES = ("codex", "human")
 # codex 추론 강도 화이트리스트(WO#38). 엔진 격리 불변식상 providers.codex를 import하지
 # 않으므로 여기서 미러링한다(run.py argparse + codex 헬퍼가 재검증 — 다중 가드).
@@ -563,6 +600,49 @@ class RunManager:
         if not valid_run_id(run_id):
             return None
         return self.run_dir(run_id) / "state.yaml"
+
+    # ── 라이브 작업 로그 tail (WO#42 C) — read-only, 경로 안전, bounded ──
+    def read_log_tail(self, run_id: str, tail: int | str | None = None) -> dict[str, Any]:
+        """runs/<id>/run.log의 마지막 tail줄을 **bounded**하게 반환(read-only).
+
+        안전 설계:
+          - 경로: valid_run_id로 traversal 차단(`../`·`/` 등 거부). runs/<id>/run.log만.
+          - bounded: 파일 끝에서 최대 _LOG_TAIL_MAX_BYTES만 읽고 마지막 N줄만(대용량 덤프 금지).
+            tail은 [1, _LOG_TAIL_MAX_LINES]로 클램프. bytes 컷에 걸린 부분 첫 줄은 버린다.
+          - 무크래시: 로그 부재/읽기 실패는 빈 lines로 흡수(서버 안 죽음).
+        반환: {lines:[...], missing:bool, truncated:bool, size:int}  (실패 시 error 동봉).
+        """
+        if not valid_run_id(run_id):
+            return {"error": "invalid run id", "lines": [], "missing": False, "truncated": False}
+        n = _LOG_TAIL_DEFAULT_LINES
+        if tail is not None:
+            try:
+                n = int(tail)
+            except (TypeError, ValueError):
+                n = _LOG_TAIL_DEFAULT_LINES
+        n = max(1, min(n, _LOG_TAIL_MAX_LINES))
+        path = self.run_dir(run_id) / "run.log"
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return {"lines": [], "missing": True, "truncated": False, "size": 0}
+        read_bytes = min(size, _LOG_TAIL_MAX_BYTES)
+        try:
+            with open(path, "rb") as f:  # noqa: SIM115 — with로 즉시 닫음
+                if size > read_bytes:
+                    f.seek(size - read_bytes)
+                data = f.read(read_bytes)
+        except OSError as e:
+            return {"lines": [], "missing": False, "truncated": False,
+                    "error": f"read failed: {e}", "size": size}
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        byte_cut = size > read_bytes
+        if byte_cut and lines:
+            lines = lines[1:]  # bytes 경계로 잘린 부분 첫 줄 제거(깔끔한 tail)
+        truncated = byte_cut or len(lines) > n
+        lines = lines[-n:]
+        return {"lines": lines, "missing": False, "truncated": truncated, "size": size}
 
     # ── meta 영속 ──
     @staticmethod
@@ -854,6 +934,8 @@ def make_handler(
             elif path == "/api/runs":
                 runs = run_manager.list_runs() if run_manager else []
                 self._send_json(200, {"runs": runs, "allow_run": allow_run})
+            elif path.startswith("/api/runs/") and path.endswith("/log"):
+                self._handle_log(path[len("/api/runs/"):-len("/log")])
             elif path == "/":
                 self._send(200, _index_html(poll_ms, allow_run), "text/html; charset=utf-8")
             else:
@@ -889,6 +971,24 @@ def make_handler(
                 self._send_json(500, {"error": f"launch failed: {type(e).__name__}: {e}"})
                 return
             self._send_json(200, {"run_id": run_id})
+
+        def _handle_log(self, run_id: str) -> None:
+            # 라이브 작업 로그 tail(WO#42 C) — read-only(allow_run 불필요, /api/runs와 동급).
+            # 경로 안전(valid_run_id)·bounded는 read_log_tail이 강제. 부재/실패는 흡수.
+            if run_manager is None:
+                self._send_json(404, {"error": "no run manager (use --runs-dir)", "lines": []})
+                return
+            if not valid_run_id(run_id):
+                self._send_json(400, {"error": "invalid run id", "lines": []})
+                return
+            query = urllib.parse.urlsplit(self.path).query
+            tail = (urllib.parse.parse_qs(query).get("tail") or [None])[0]
+            try:
+                payload = run_manager.read_log_tail(run_id, tail)
+            except Exception as e:  # noqa: BLE001 — 로그 읽기 실패도 흡수(서버 안 죽음)
+                self._send_json(500, {"error": f"log read failed: {type(e).__name__}: {e}", "lines": []})
+                return
+            self._send_json(200, payload)
 
         def _handle_stop(self, run_id: str) -> None:
             if run_manager is None or not run_manager.allow_run:

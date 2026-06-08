@@ -853,3 +853,145 @@ def test_handle_error_surfaces_real_errors(capsys):
     # stdlib 기본 handle_error는 stderr로 traceback을 찍는다 → surface됨을 단언.
     assert "Traceback" in captured.err
     assert "ValueError" in captured.err
+
+
+# ════════════════════ v3 대시보드 폴리시 (WO#42) ════════════════════
+
+
+# ──────────────────── A. 밀도 라이브 리스트용 per-unit 행 ────────────────────
+
+
+def test_unit_rows_dense_list_fields():
+    """unit_rows: plan 순서 한 줄씩 + in-flight 유닛의 stage/active/elapsed/tokens."""
+    v = state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")
+    assert [r["unit"] for r in v["unit_rows"]] == ["u1", "u2", "u3"]  # plan 순서(결정론)
+    rows = {r["unit"]: r for r in v["unit_rows"]}
+    # in-flight(activity 있는) 유닛: 현재 단계 + active + 경과
+    assert rows["u2"]["stage"] == "build" and rows["u2"]["active"] is True
+    assert rows["u2"]["elapsed_s"] == 15.0  # now - started_at
+    assert rows["u3"]["stage"] == "verify" and rows["u3"]["active"] is True
+    # tokens는 cost.by_unit 집계에서
+    assert rows["u1"]["tokens"] == 150 and rows["u2"]["tokens"] == 4000
+    # done 유닛: 비활성, 단계 없음
+    assert rows["u1"]["active"] is False and rows["u1"]["stage"] is None
+
+
+def test_unit_rows_check_counts():
+    """체크 pass/fail/total 카운트가 유닛 최신 event에서 집계된다."""
+    v = state_to_view(_state())
+    rows = {r["unit"]: r for r in v["unit_rows"]}
+    assert rows["u1"]["checks_pass"] == 1 and rows["u1"]["checks_fail"] == 0
+    assert rows["u1"]["checks_total"] == 1
+
+
+def test_unit_rows_empty_fields_when_absent_no_crash():
+    """데이터 부재(activity/cost 없음) → stage/elapsed/tokens None, active False (무크래시)."""
+    v = state_to_view(_state())  # 구버전 state: activity/cost 없음
+    rows = {r["unit"]: r for r in v["unit_rows"]}
+    # u3은 in_progress이지만 activity가 없음 → 단계/경과 None, active False
+    assert rows["u3"]["stage"] is None
+    assert rows["u3"]["elapsed_s"] is None
+    assert rows["u3"]["active"] is False
+    assert rows["u3"]["tokens"] is None
+    assert rows["u3"]["checks_total"] == 0  # u3 event 없음
+
+
+def test_unit_rows_json_serializable():
+    json.dumps(state_to_view(_state_v2(), now="2026-06-07T14:00:30Z")["unit_rows"])
+
+
+# ──────────────────── C. 라이브 작업 로그 tail 엔드포인트 ────────────────────
+
+
+def _get_status(port: int, path: str) -> tuple[int, str]:
+    """_get과 같지만 4xx/5xx도 (code, body)로 반환(HTTPError 흡수) — 거부 경로 검증용."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as r:
+            return r.status, r.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8")
+
+
+def _write_log(runs_dir: Path, rid: str, content: str) -> None:
+    d = runs_dir / rid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run.log").write_text(content, encoding="utf-8")
+
+
+def test_log_endpoint_returns_tail(tmp_path: Path):
+    """GET /api/runs/<id>/log?tail=N → run.log 마지막 N줄."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)  # 읽기 — allow_run 불필요
+    _write_log(rm.runs_dir, "20260608-120000-a",
+               "\n".join(f"line{i}" for i in range(100)) + "\n")
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/runs/20260608-120000-a/log?tail=5")
+        assert code == 200
+        data = json.loads(body)
+        assert data["lines"] == ["line95", "line96", "line97", "line98", "line99"]
+        assert data["missing"] is False
+    finally:
+        httpd.shutdown()
+
+
+def test_log_endpoint_rejects_traversal(tmp_path: Path):
+    """경로 안전: run id에 `..`가 들어가면 400(valid_run_id 거부).
+
+    `..%2F..` 형태는 urllib 클라이언트가 전송 전 정규화해버리므로, 단일 세그먼트로
+    서버까지 그대로 도달하는 `a..b`(`..` 포함)로 엔드포인트의 valid_run_id 가드를 검증한다.
+    (실제 `../` traversal 차단은 read_log_tail 단위 테스트가 직접 검증한다.)
+    """
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get_status(port, "/api/runs/a..b/log?tail=5")
+        assert code == 400
+        assert "invalid run id" in json.loads(body)["error"]
+    finally:
+        httpd.shutdown()
+
+
+def test_log_endpoint_missing_log_absorbed(tmp_path: Path):
+    """로그 부재 → missing=True, 빈 lines, 200(서버 안 죽음)."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    (rm.runs_dir / "20260608-120000-b").mkdir(parents=True)  # 디렉토리만, run.log 없음
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/runs/20260608-120000-b/log")
+        assert code == 200
+        data = json.loads(body)
+        assert data["missing"] is True and data["lines"] == []
+    finally:
+        httpd.shutdown()
+
+
+def test_read_log_tail_rejects_bad_id(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    out = rm.read_log_tail("../etc/passwd")
+    assert "error" in out and out["lines"] == []
+
+
+def test_read_log_tail_bounded_and_clamps(tmp_path: Path):
+    """대용량 로그도 bounded — tail 상한 클램프 + 끝에서 제한 바이트만(덤프 금지)."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    # 5만 줄(수백 KB) — 상한을 훨씬 넘김
+    _write_log(rm.runs_dir, "20260608-120000-c",
+               "\n".join(f"L{i}" for i in range(50000)) + "\n")
+    out = rm.read_log_tail("20260608-120000-c", 999999)  # 상한 초과 요청
+    assert len(out["lines"]) <= 2000  # _LOG_TAIL_MAX_LINES로 클램프
+    assert out["truncated"] is True
+    # 마지막 줄은 보존(끝에서 읽으므로)
+    assert out["lines"][-1] == "L49999"
+
+
+def test_log_endpoint_no_run_manager_404(tmp_path: Path):
+    """run_manager 없는(레거시 단일 state) 모드 → 로그 엔드포인트 404(서버 안 죽음)."""
+    sp = tmp_path / "s.yaml"
+    sp.write_text(_state_yaml(), encoding="utf-8")
+    httpd, port = _serve(sp)  # run_manager 없이
+    try:
+        code, body = _get_status(port, "/api/runs/20260608-120000-x/log")
+        assert code == 404
+        assert "lines" in json.loads(body)
+    finally:
+        httpd.shutdown()

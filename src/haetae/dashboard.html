@@ -10,6 +10,7 @@
     --pend:#6b7280; --prog:#3b82f6; --done:#22c55e; --fail:#ef4444;
     --pass:#22c55e; --failc:#ef4444; --skip:#6b7280; --accent:#f59e0b;
     --build:#3b82f6; --verify:#a855f7; --synth:#14b8a6; --replan:#f59e0b; --judge:#a855f7; --exec:#22c55e; --orch:#3b82f6;
+    --side:420px;  /* 우측 상세 컬럼 폭(드래그 리사이즈, localStorage 저장) — WO#42 D */
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--tx);
@@ -31,8 +32,8 @@
   #live.offline .dot { background:var(--fail); }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
-  .grid { display:grid; grid-template-columns: 1fr 360px; gap:14px; padding:14px 18px; align-items:start; }
-  @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+  .grid { display:grid; grid-template-columns: minmax(0,1fr) 8px var(--side); gap:14px; padding:14px 18px; align-items:start; }
+  @media (max-width:900px){ .grid{ grid-template-columns:1fr; } #resizer{ display:none; } }
   .card { background:var(--panel); border:1px solid var(--bd); border-radius:10px; padding:14px; margin-bottom:14px; }
   .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); margin:0 0 10px; }
   .banner { background:#7c2d12; border:1px solid #b45309; color:#fed7aa; padding:10px 14px; border-radius:8px; margin:0 18px 0; }
@@ -143,6 +144,32 @@
   .opt input[type=number] { width:64px; } .opt input[type=text] { width:130px; }
   .form-err { color:#fca5a5; font-size:12px; margin-top:6px; }
   .ctl-off { color:var(--mut); font-size:12px; }
+  /* ── v3 (WO#42 A): DW식 밀도 라이브 유닛 리스트 ── */
+  .ulist .urow { display:flex; align-items:center; gap:8px; padding:6px 9px; border:1px solid var(--bd);
+    border-radius:7px; margin-bottom:6px; background:var(--panel2); cursor:pointer; font-size:12.5px; }
+  .ulist .urow:hover { border-color:var(--prog); }
+  .ulist .urow.sel { outline:2px solid var(--accent); }
+  .ulist .urow.active { border-left:3px solid var(--prog); background:linear-gradient(180deg,#191e2b,#171a21); }
+  .ulist .cur { width:9px; color:var(--prog); font-weight:700; flex:none; }
+  .ulist .spin { width:11px; height:11px; border:2px solid #334; border-top-color:var(--prog);
+    border-radius:50%; animation:rot .8s linear infinite; flex:none; }
+  .ulist .u { font-weight:700; }
+  .ulist .sp { flex:1; }
+  .ulist .el { color:var(--mut); font-variant-numeric:tabular-nums; min-width:44px; text-align:right; }
+  .ulist .tk { color:var(--mut); font-variant-numeric:tabular-nums; font-size:11.5px; }
+  .ulist .ck { font-size:11.5px; font-variant-numeric:tabular-nums; }
+  .ulist .st-mini { font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  /* ── v3 (WO#42 C): 라이브 작업 로그 tail ── */
+  .worklog { max-height:320px; overflow:auto; background:#0b0d11; border:1px solid var(--bd); border-radius:7px; padding:8px; }
+  .worklog .ln { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px;
+    white-space:pre-wrap; word-break:break-all; color:#cbd5e1; line-height:1.5; }
+  .worklog .trunc { color:var(--mut); font-size:10.5px; margin-bottom:6px; }
+  /* ── v3 (WO#42 B): DAG 엣지 — 직교 라우팅 + 화살표 + 낮은 대비 ── */
+  #edges .edge { fill:none; stroke:#333a4a; stroke-width:1.4; }
+  /* ── v3 (WO#42 D): 메인↔사이드 드래그 리사이즈 핸들 ── */
+  #resizer { cursor:col-resize; align-self:stretch; position:relative; min-height:120px; }
+  #resizer::before { content:""; position:absolute; left:3px; top:0; bottom:0; width:2px; background:var(--bd); border-radius:2px; }
+  #resizer:hover::before { background:var(--prog); }
 </style>
 </head>
 <body>
@@ -194,12 +221,14 @@
 </div>
 <div id="root" class="grid">
   <div id="left">
-    <div class="card act-card"><h2>현재 활동 (라이브)</h2><div id="activity"></div></div>
-    <div class="card"><h2>유닛 DAG</h2><div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div></div>
+    <div class="card act-card"><h2>유닛 · 라이브</h2><div id="unitlist" class="ulist"></div></div>
+    <div class="card" id="worklog-card" style="display:none"><h2>작업 로그 (라이브 tail)</h2><div id="worklog" class="worklog"></div></div>
+    <div class="card"><h2>유닛 DAG (구조)</h2><div id="dagwrap"><svg id="edges"></svg><div id="levels" class="levels"></div></div></div>
     <div class="card"><h2>단계 타임라인 (transitions)</h2><div id="transitions" class="flow"></div></div>
     <div class="card"><h2>검증 · 이벤트 타임라인</h2><div id="timeline"></div></div>
     <div class="card" id="integration-card" style="display:none"><h2>통합 gate (verify · unit=none)</h2><div id="integration"></div></div>
   </div>
+  <div id="resizer" title="드래그해서 사이드 폭 조절"></div>
   <div id="right">
     <div class="card" id="cost-card"><h2>코스트</h2><div id="cost"></div></div>
     <div class="card"><h2 id="detail-h">상세</h2><div id="detail"><div class="ph">DAG 노드를 클릭하면 work order·gate 체크·실행 증거·비용이 여기에.</div></div></div>
@@ -256,13 +285,36 @@ async function pollOnce(){
 
 // ── 제어 표면: runs 목록 / 실행 폼 / stop ──
 function clearViewer(){
-  ["activity","levels","transitions","timeline","integration","cost","critique","esc"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
+  ["unitlist","worklog","levels","transitions","timeline","integration","cost","critique","esc"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
 }
 function selectRun(id){
   RUN = id; SEL = null; VIEW = null;
   document.querySelectorAll(".run-row").forEach(x=>x.classList.toggle("sel", x.dataset.id===id));
   $("ctl-state").textContent = id ? ("보는 중: "+id) : "";
-  startSSE(); pollOnce();
+  startSSE(); pollOnce(); loadLog();
+}
+
+// ── 라이브 작업 로그 tail (WO#42 C) — RUN 타겟 있을 때만 /api/runs/<id>/log 폴링 ──
+const LOG_TAIL = 200;
+async function loadLog(){
+  const card = $("worklog-card");
+  if (!RUN) { card.style.display="none"; $("worklog").innerHTML=""; return; }
+  card.style.display = "block";
+  try {
+    const r = await fetch("/api/runs/"+encodeURIComponent(RUN)+"/log?tail="+LOG_TAIL, {cache:"no-store"});
+    renderLog(await r.json());
+  } catch(_) { /* 로그 로드 실패는 조용히(뷰어는 계속) */ }
+}
+function renderLog(d){
+  const box = $("worklog");
+  if (!d || d.error) { box.innerHTML = '<div class="empty">로그 읽기 실패'+(d&&d.error?': '+esc(d.error):'')+'</div>'; return; }
+  const lines = d.lines||[];
+  if (!lines.length) { box.innerHTML = '<div class="empty">'+(d.missing?'로그 없음 (아직 시작 전?)':'로그 비어있음')+'</div>'; return; }
+  // 바닥 근처면 새 줄 도착 시 자동 스크롤(라이브 피드 느낌), 위로 올려봤으면 유지.
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.innerHTML = (d.truncated? '<div class="trunc">… 앞부분 생략 (bounded tail · '+lines.length+'줄)</div>':'')
+    + lines.map(l=>'<div class="ln">'+esc(l)+'</div>').join("");
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 const RSTAT_KO = {running:"도는 중", finished:"완료", stopped:"정지됨", failed:"실패", unknown:"미상"};
 function renderRuns(payload){
@@ -356,7 +408,7 @@ function render(v) {
     const e0 = (v.pending_escalations||[])[0] || {};
     bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
   } else bs.innerHTML = "";
-  renderActivity(v);
+  renderUnitList(v);
   renderDag(v);
   renderTransitions(v);
   renderTimeline(v);
@@ -378,13 +430,31 @@ function liveElapsed(a){
   if (a.elapsed_s==null) return null;
   return a.elapsed_s + Math.max(0, (Date.now()-lastMsg)/1000);
 }
-function renderActivity(v) {
-  const acts = v.activity||[];
-  $("activity").innerHTML = acts.length ? acts.map(a=>
-    '<div class="act"><span class="spin"></span><span class="u">'+esc(a.unit||"(전역)")+'</span>'
-    + stageBadge(a.stage)
-    + '<span class="el">'+dur(liveElapsed(a))+' 경과</span></div>'
-  ).join("") : '<div class="empty">지금 도는 작업 없음 (idle)</div>';
+// DW식 밀도 라이브 리스트: 유닛 한 줄씩(정렬=plan 순서). in-flight는 ▸커서+스핀+경과로 강조.
+function renderUnitList(v) {
+  const rows = v.unit_rows||[];
+  if (!rows.length) { $("unitlist").innerHTML = '<div class="empty">유닛 없음</div>'; return; }
+  $("unitlist").innerHTML = rows.map(r=>{
+    const active = !!r.active;
+    // 단계 배지(in-flight) 또는 상태 미니배지(정적).
+    const mid = r.stage ? stageBadge(r.stage)
+      : '<span class="st-mini t-'+esc(r.state)+'">'+esc(r.state)+'</span>';
+    const chk = r.checks_total
+      ? '<span class="ck"><span class="ev-good">'+r.checks_pass+'✓</span>'
+        + (r.checks_fail? ' <span class="ev-bad">'+r.checks_fail+'✗</span>':'')+'</span>'
+      : '';
+    const tok = r.tokens!=null ? '<span class="tk">'+num(r.tokens)+' tok</span>' : '';
+    const el = active ? '<span class="el">'+dur(liveElapsed(r))+'</span>' : '';
+    return '<div class="urow'+(active?' active':'')+(SEL===r.unit?' sel':'')+'" data-id="'+esc(r.unit)+'">'
+      + '<span class="cur">'+(active?'▸':'')+'</span>'
+      + (active?'<span class="spin"></span>':'')
+      + '<span class="u">'+esc(r.unit)+'</span>'+mid
+      + '<span class="sp"></span>'+chk+tok+el+'</div>';
+  }).join("");
+  $("unitlist").querySelectorAll(".urow").forEach(row=>{
+    row.onclick = ()=>{ SEL=row.dataset.id; renderDetail(SEL);
+      document.querySelectorAll(".node,.urow").forEach(x=>x.classList.toggle("sel", x.dataset.id===SEL)); };
+  });
 }
 
 function renderDag(v) {
@@ -410,8 +480,12 @@ function renderDag(v) {
   requestAnimationFrame(()=>drawEdges(v));
 }
 
+// v3(WO#42 B): 층 레이아웃은 유지, 엣지만 정리한다 —
+//  (1) 앵커 분배: 한 노드의 출/입 엣지를 노드 폭에 고루 펼쳐 겹침(엉킴) 최소화.
+//  (2) 직교 elbow + 둥근 모서리 라우팅(레이어드 DAG에 깔끔), (3) 낮은 대비 + 화살표.
 function drawEdges(v) {
   const svg = $("edges"); const wrap = $("dagwrap");
+  if (!svg || !wrap || !v || !v.dag) return;
   const W = wrap.scrollWidth, H = wrap.scrollHeight;
   svg.setAttribute("width",W); svg.setAttribute("height",H);
   svg.setAttribute("viewBox","0 0 "+W+" "+H);
@@ -419,15 +493,40 @@ function drawEdges(v) {
   const pos = {};
   document.querySelectorAll(".node").forEach(el=>{
     const r = el.getBoundingClientRect();
-    pos[el.dataset.id] = {x:r.left-base.left+wrap.scrollLeft+r.width/2, top:r.top-base.top+wrap.scrollTop, bot:r.top-base.top+wrap.scrollTop+r.height};
+    pos[el.dataset.id] = {
+      left:r.left-base.left+wrap.scrollLeft, w:r.width,
+      top:r.top-base.top+wrap.scrollTop, bot:r.top-base.top+wrap.scrollTop+r.height,
+    };
   });
+  const edges = (v.dag.edges||[]).filter(e=>pos[e.from]&&pos[e.to]);
+  // 노드별 출(자식)·입(부모) 목록을 상대 x로 정렬 → 폭에 분산 배치(겹침 최소화).
+  const outs={}, ins={};
+  edges.forEach(e=>{ (outs[e.from]=outs[e.from]||[]).push(e.to); (ins[e.to]=ins[e.to]||[]).push(e.from); });
+  const byLeft = (a,b)=> pos[a].left - pos[b].left;
+  Object.values(outs).forEach(l=>l.sort(byLeft));
+  Object.values(ins).forEach(l=>l.sort(byLeft));
+  const anchorX = (node, list, other)=>{
+    const n=list.length, i=Math.max(0, list.indexOf(other));
+    return pos[node].left + pos[node].w*((i+1)/(n+1));  // 1..n번째를 폭에 균등 분할
+  };
   let p = "";
-  (v.dag.edges||[]).forEach(e=>{
-    const a=pos[e.from], b=pos[e.to]; if(!a||!b) return;
-    const x1=a.x,y1=a.bot,x2=b.x,y2=b.top, my=(y1+y2)/2;
-    p += `<path d="M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}" fill="none" stroke="#2a2f3a" stroke-width="1.5"/>`;
+  edges.forEach(e=>{
+    const a=pos[e.from], b=pos[e.to];
+    const x1=anchorX(e.from, outs[e.from], e.to), y1=a.bot;
+    const x2=anchorX(e.to, ins[e.to], e.from), y2=b.top;
+    const my=(y1+y2)/2;
+    if (Math.abs(x2-x1) < 1) {
+      p += `<path class="edge" d="M${x1},${y1} L${x2},${y2-1}" marker-end="url(#ah)"/>`;
+    } else {
+      const dir = x2>x1 ? 1 : -1;
+      const r = Math.max(0, Math.min(8, Math.abs(x2-x1)/2, (y2-y1)/2));
+      // 세로↓ → (둥근 코너) 가로 → (둥근 코너) 세로↓: 직교 라우팅으로 교차를 단정하게.
+      p += `<path class="edge" d="M${x1},${y1} L${x1},${my-r} Q${x1},${my} ${x1+dir*r},${my} `
+        + `L${x2-dir*r},${my} Q${x2},${my} ${x2},${my+r} L${x2},${y2-1}" marker-end="url(#ah)"/>`;
+    }
   });
-  svg.innerHTML = p;
+  svg.innerHTML = '<defs><marker id="ah" markerWidth="7" markerHeight="7" refX="4.5" refY="3" '
+    + 'orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#3a4254"/></marker></defs>' + p;
 }
 
 function tsShort(ts){ if(!ts) return ""; const m=String(ts).match(/T(\d\d:\d\d:\d\d)/); return m?m[1]:String(ts); }
@@ -572,8 +671,32 @@ startSSE();
 loadRuns();
 setInterval(pollOnce, POLL_MS);
 setInterval(loadRuns, Math.max(2000, POLL_MS));   // runs 상태 배지 주기 갱신
-// 경과시간이 SSE 갱신 사이에도 흐르게 보이도록 활동 패널만 1s마다 다시 그림.
-setInterval(()=>{ if (VIEW && !VIEW.error) renderActivity(VIEW); }, 1000);
+// 경과시간이 SSE 갱신 사이에도 흐르게 보이도록 유닛 리스트만 1s마다 다시 그림.
+setInterval(()=>{ if (VIEW && !VIEW.error) renderUnitList(VIEW); }, 1000);
+// 라이브 작업 로그(RUN 타겟 있을 때만) 주기 tail 폴링.
+loadLog();
+setInterval(loadLog, Math.max(1500, POLL_MS));
+
+// ── 사이드탭 드래그 리사이즈 (WO#42 D) — --side 갱신 + localStorage 영속 ──
+(function initResizer(){
+  const rz = $("resizer"); if (!rz) return;
+  const root = document.documentElement;
+  const saved = parseInt(localStorage.getItem("haetae.side")||"", 10);
+  if (saved && saved>=280 && saved<=900) root.style.setProperty("--side", saved+"px");
+  let drag = false;
+  rz.addEventListener("mousedown", (e)=>{ drag=true; e.preventDefault(); document.body.style.userSelect="none"; });
+  window.addEventListener("mousemove", (e)=>{
+    if (!drag) return;
+    const w = Math.max(280, Math.min(900, window.innerWidth - e.clientX - 24));
+    root.style.setProperty("--side", w+"px");
+    if (VIEW && !VIEW.error) requestAnimationFrame(()=>drawEdges(VIEW));  // 폭 바뀌면 엣지 재배치
+  });
+  window.addEventListener("mouseup", ()=>{
+    if (!drag) return; drag=false; document.body.style.userSelect="";
+    const px = parseInt(getComputedStyle(root).getPropertyValue("--side"), 10);
+    if (px) localStorage.setItem("haetae.side", px);
+  });
+})();
 </script>
 </body>
 </html>
