@@ -188,3 +188,58 @@ def test_main_keyboardinterrupt_clean_exit(monkeypatch, capsys):
     assert rc == 0  # 종료코드 0 → 대시보드가 "failed"로 오해하지 않게 정합
     err = capsys.readouterr().err
     assert "중단됨" in err
+
+
+# ──────────────────────────── codex idle timeout 배선 (WO#54) ────────────────────────────
+
+
+def test_main_codex_idle_timeout_default_and_essential_stall_retries(monkeypatch):
+    """기본 --codex-idle-timeout=300. brain은 *필수* → stall_retries=1로 배선."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x"])
+    client = captured["client"]
+    assert client.idle_timeout == 300.0
+    assert client.stall_retries == 1  # 합성/replan/scaffold = 필수 → bounded 재시도
+
+
+def test_main_codex_idle_timeout_override(monkeypatch):
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--codex-idle-timeout", "45"])
+    assert captured["client"].idle_timeout == 45.0
+
+
+def test_main_codex_max_duration_default_off(monkeypatch):
+    """절대 backstop 기본 off(None) — 주 메커니즘은 idle."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x"])
+    assert captured["client"].max_duration is None
+
+
+def test_main_codex_idle_timeout_wires_into_codexexecutor(monkeypatch):
+    """빌드(executor)도 idle_timeout + stall_retries=1(필수)로 배선."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--executor", "codex", "--workdir", "/tmp/s",
+          "--codex-idle-timeout", "77"])
+    ex = captured["executor"]
+    assert isinstance(ex, CodexExecutor)
+    assert ex.idle_timeout == 77.0
+    assert ex.stall_retries == 1
+
+
+def test_main_critic_client_best_effort_stall_retries_zero(monkeypatch):
+    """critic은 *best-effort* → stall_retries=0(멈추면 degrade/진행, 재시도 안 함)."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--critic-model", "some-critic"])
+    critic = captured["critic_client"]
+    assert critic is not None
+    assert critic.idle_timeout == 300.0
+    assert critic.stall_retries == 0
+
+
+def test_main_help_lists_codex_idle_timeout(capsys):
+    """--help에 --codex-idle-timeout 노출(관측 가능)."""
+    import pytest
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--codex-idle-timeout" in out

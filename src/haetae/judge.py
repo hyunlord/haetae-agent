@@ -22,7 +22,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from haetae.llm import LLMClient
+from haetae.llm import CodexStalled, LLMClient
 from haetae.models import (
     AcceptanceCriterion,
     CheckReport,
@@ -125,13 +125,23 @@ class LLMJudge:
         files = self._collect_files()
         user = self._build_user(judge_acs, result, files)
 
-        raw = self.client.complete(system, user)
+        # WO#54: judge 무진행(멈춤) = degrade — **절대 가짜 pass 아님**. complete가 멈추면
+        # 모든 기준을 skipped로 떨궈 aggregate_verdict가 ambiguous→escalate(사람 tier)시킨다.
+        # 루프는 안 죽인다(best-effort). 멈춤 외 다른 예외는 기존대로 전파(동작 불변).
+        stall_detail: str | None = None
+        raw = ""
+        try:
+            raw = self.client.complete(system, user)
+        except CodexStalled:
+            stall_detail = "judge 평가 불가 (codex 무진행/idle timeout)"
 
         by_id: dict[str, _JudgeVerdict] = {}
-        try:
-            parsed = parse_yaml_model(raw, _JudgeOutput)
-        except ParseError:
-            parsed = None  # 통째로 깨짐 → 전부 skipped로 떨군다(아래 루프).
+        parsed = None
+        if stall_detail is None:
+            try:
+                parsed = parse_yaml_model(raw, _JudgeOutput)
+            except ParseError:
+                parsed = None  # 통째로 깨짐 → 전부 skipped로 떨군다(아래 루프).
         if parsed is not None:
             for v in parsed.verdicts:
                 by_id[v.ac_id] = v
@@ -159,7 +169,7 @@ class LLMJudge:
                         cmd=None,
                         status="skipped",
                         exit_code=None,
-                        detail="judge 평가 불가",
+                        detail=stall_detail or "judge 평가 불가",
                     )
                 )
         return reports
@@ -182,13 +192,21 @@ class LLMJudge:
 
         system = Path(self.run_prompt_path).read_text(encoding="utf-8")
         user = self._build_run_user(run_items, result)
-        raw = self.client.complete(system, user)
+        # WO#54: run-judge 멈춤도 동일하게 degrade(가짜 pass 금지) — 전부 skipped→ambiguous.
+        stall_detail: str | None = None
+        raw = ""
+        try:
+            raw = self.client.complete(system, user)
+        except CodexStalled:
+            stall_detail = "run judge 평가 불가 (codex 무진행/idle timeout)"
 
         by_id: dict[str, _JudgeVerdict] = {}
-        try:
-            parsed = parse_yaml_model(raw, _JudgeOutput)
-        except ParseError:
-            parsed = None  # 통째로 깨짐 → 전부 skipped.
+        parsed = None
+        if stall_detail is None:
+            try:
+                parsed = parse_yaml_model(raw, _JudgeOutput)
+            except ParseError:
+                parsed = None  # 통째로 깨짐 → 전부 skipped.
         if parsed is not None:
             for v in parsed.verdicts:
                 by_id[v.ac_id] = v
@@ -217,7 +235,7 @@ class LLMJudge:
                         cmd=ac.check.cmd,
                         status="skipped",
                         exit_code=ev.exit_code,
-                        detail="run judge 평가 불가",
+                        detail=stall_detail or "run judge 평가 불가",
                         run_evidence=ev,
                     )
                 )

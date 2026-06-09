@@ -65,6 +65,6 @@ class MockClient:
 
 
 # 실제 provider 재노출 (codex.py는 llm.py를 import하지 않아 순환 없음)
-from haetae.providers.codex import CodexClient, CodexError  # noqa: E402
+from haetae.providers.codex import CodexClient, CodexError, CodexStalled  # noqa: E402
 
-__all__ = ["LLMClient", "MockClient", "CodexClient", "CodexError"]
+__all__ = ["LLMClient", "MockClient", "CodexClient", "CodexError", "CodexStalled"]

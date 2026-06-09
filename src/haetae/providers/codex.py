@@ -15,8 +15,13 @@ Codex는 chat 엔드포인트가 아니라 agentic 코딩 에이전트라, 순�
 from __future__ import annotations
 
 import json
+import os
+import queue
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from haetae.metering import Usage
@@ -60,6 +65,181 @@ class CodexError(RuntimeError):
         super().__init__(message + detail)
 
 
+class CodexStalled(RuntimeError):
+    """codex 호출이 *무진행(idle)* 으로 멈춤 — idle_timeout초 동안 새 `--json` 이벤트가
+    하나도 안 옴(무음). hung 프로세스(+자식)를 정리한 뒤 던진다.
+
+    **총 시간 cap이 아니다**: 진행 중인(이벤트를 계속 뱉는) 긴 호출은 절대 죽이지 않는다 —
+    "마지막 이벤트 이후 침묵"만 잰다. 신호는 *진행*이지 경과시간이 아니다.
+
+    **CodexError의 하위가 아니다(의도적)**: CodexExecutor의 `except CodexError` 래핑에
+    걸리지 않고 그대로 전파돼, 호출부가 멈춤을 타입으로 라우팅한다(필수=재시도/escalate,
+    best-effort=degrade). stdout/stderr 일부를 디버깅용으로 동봉한다.
+    """
+
+    def __init__(self, message: str, stdout: str = "", stderr: str = ""):
+        self.stdout = stdout
+        self.stderr = stderr
+
+        def _tail(s: str, n: int = 800) -> str:
+            s = (s or "").strip()
+            return s if len(s) <= n else "…" + s[-n:]
+
+        detail = ""
+        if stdout:
+            detail += f"\n--- stdout(tail) ---\n{_tail(stdout)}"
+        if stderr:
+            detail += f"\n--- stderr(tail) ---\n{_tail(stderr)}"
+        super().__init__(message + detail)
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    """멈춘 codex 프로세스와 *그 자식들*까지 정리한다(좀비 금지). best-effort.
+
+    Popen을 start_new_session=True로 띄워 새 세션/프로세스그룹 리더로 만들었으므로
+    killpg(SIGKILL)로 codex가 띄운 하위 셸/모델 프로세스까지 한 번에 보낸다. 프로세스가
+    이미 죽었거나 그룹 조회가 실패하면 단일 kill로 폴백하고, 마지막에 wait로 거둔다.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)  # 거둬서 좀비 방지
+    except Exception:  # noqa: BLE001 — 정리는 best-effort, 2차 크래시 금지
+        pass
+
+
+def _stream_codex(
+    cmd: list[str],
+    prompt: str,
+    *,
+    idle_timeout: float,
+    max_duration: float | None,
+) -> tuple[int, str, str]:
+    """`codex --json`을 Popen으로 띄워 stdout JSONL을 *줄 단위*로 읽으며 idle을 감시한다.
+
+    토대(WO#54): subprocess.run(끝나고 캡처) 대신 Popen + readline 루프. codex --json은
+    이벤트가 일어나는 대로 JSONL을 한 줄씩 흘리므로(검증됨: thread.started→turn.started→
+    item.completed…→turn.completed) "마지막 줄 이후 idle_timeout초 침묵"을 멈춤 신호로 쓴다.
+
+    반환: (returncode, stdout_text, stderr_text). stdout_text는 그때까지 받은 전체 JSONL이라
+    usage 파싱(#33–34)이 스트리밍 경로에서도 동일하게 동작한다(부분 출력도 파싱 가능).
+    멈추면 hung 프로세스(+자식)를 정리하고 CodexStalled를 던진다.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,  # 새 프로세스그룹 → 멈춤 시 자식까지 killpg
+    )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    q: queue.Queue = queue.Queue()
+    _EOF = object()
+
+    def _pump_stdin() -> None:
+        # 큰 프롬프트로 메인이 블록되지 않게 별도 스레드에서 쓰고 닫는다.
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def _read_stdout() -> None:
+        try:
+            for line in proc.stdout:  # 이벤트 도착마다 한 줄
+                stdout_lines.append(line)
+                q.put(line)  # idle 타이머 리셋 신호
+        except (ValueError, OSError):
+            pass
+        finally:
+            q.put(_EOF)
+
+    def _read_stderr() -> None:
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except (ValueError, OSError):
+            pass
+
+    threading.Thread(target=_pump_stdin, daemon=True).start()
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    start = time.monotonic()
+    while True:
+        try:
+            item = q.get(timeout=idle_timeout)
+        except queue.Empty:
+            # idle_timeout초간 새 이벤트 0 = 무음 = 멈춤. 정리 후 CodexStalled.
+            _terminate_process(proc)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            raise CodexStalled(
+                f"codex 무진행(idle): {idle_timeout}s 동안 새 이벤트 없음 — 멈춘 프로세스 정리",
+                "".join(stdout_lines),
+                "".join(stderr_lines),
+            )
+        if item is _EOF:
+            break
+        # 진행 중 — (선택) 아주 넉넉한 절대 backstop. 진행해도 pathological하게 길면 차단.
+        if max_duration is not None and (time.monotonic() - start) > max_duration:
+            _terminate_process(proc)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            raise CodexStalled(
+                f"codex 절대 시간(max_duration) {max_duration}s 초과 — 정리",
+                "".join(stdout_lines),
+                "".join(stderr_lines),
+            )
+
+    rc = proc.wait()
+    t_err.join(timeout=2)
+    return rc, "".join(stdout_lines), "".join(stderr_lines)
+
+
+def _run_streaming_with_retries(
+    cmd: list[str],
+    prompt: str,
+    *,
+    idle_timeout: float,
+    max_duration: float | None,
+    stall_retries: int,
+) -> tuple[int, str, str]:
+    """스트리밍 실행을 *bounded* 재시도로 감싼다. 멈춤이 지속되면 마지막 CodexStalled 전파.
+
+    stall_retries=0(기본·best-effort)이면 첫 멈춤에서 즉시 전파(degrade 빠르게).
+    stall_retries≥1(필수: 빌드·replan·합성)이면 그만큼 재시도 후에도 멈추면 전파 →
+    호출부(run_loop)가 escalate한다. CLI 미설치(FileNotFoundError)는 CodexError로 변환.
+    """
+    last: CodexStalled | None = None
+    for _ in range(stall_retries + 1):
+        try:
+            return _stream_codex(
+                cmd, prompt, idle_timeout=idle_timeout, max_duration=max_duration
+            )
+        except FileNotFoundError as e:
+            raise CodexError(
+                f"codex CLI를 찾을 수 없음 ('{CODEX_BIN}' on PATH?)"
+            ) from e
+        except CodexStalled as e:
+            last = e
+    assert last is not None
+    raise last
+
+
 def _parse_usage(stdout: str, model: str | None) -> Usage | None:
     """codex `--json` stdout(JSONL)에서 마지막 `turn.completed.usage`를 파싱한다.
 
@@ -100,6 +280,9 @@ def exec_codex(
     timeout: float | None = None,
     ephemeral: bool = True,
     reasoning_effort: str | None = None,
+    idle_timeout: float | None = None,
+    max_duration: float | None = None,
+    stall_retries: int = 0,
 ) -> str:
     """`codex exec`를 한 턴 돌려 `-o` 최종 메시지 파일을 읽어 반환하는 공유 헬퍼.
 
@@ -109,6 +292,7 @@ def exec_codex(
     text, _usage = exec_codex_with_usage(
         prompt, sandbox=sandbox, cwd=cwd, model=model, timeout=timeout,
         ephemeral=ephemeral, reasoning_effort=reasoning_effort,
+        idle_timeout=idle_timeout, max_duration=max_duration, stall_retries=stall_retries,
     )
     return text
 
@@ -122,6 +306,9 @@ def exec_codex_with_usage(
     timeout: float | None = None,
     ephemeral: bool = True,
     reasoning_effort: str | None = None,
+    idle_timeout: float | None = None,
+    max_duration: float | None = None,
+    stall_retries: int = 0,
 ) -> tuple[str, Usage | None]:
     """`codex exec`를 한 턴 돌려 (최종 메시지, token usage)를 반환하는 저수준 헬퍼.
 
@@ -139,6 +326,15 @@ def exec_codex_with_usage(
     reasoning_effort(WO#38): 설정 시 `-c model_reasoning_effort=<effort>`로 codex 추론
              강도를 건다. None(기본)이면 플래그 미부착 → codex 기본(medium) 그대로(후방호환).
              ALLOWED_REASONING_EFFORTS 화이트리스트 밖이면 ValueError. **sandbox 불변.**
+
+    idle_timeout(WO#54): 설정 시 *스트리밍 경로*(Popen + 줄 단위 idle 감시)로 실행한다 —
+             `--json` 이벤트가 idle_timeout초간 끊기면(무음=멈춤) hung 프로세스(+자식)를
+             정리하고 CodexStalled. **진행 중인 긴 호출은 안 죽임**(총 시간 아님). None(기본)
+             이면 기존 subprocess.run 경로 그대로(무회귀 — 기존 테스트 seam 보존).
+    max_duration: idle_timeout 경로의 *선택적* 절대 backstop(기본 None=off). 진행해도
+             pathological하게 길면 차단. 주 메커니즘은 idle.
+    stall_retries: 멈춤 시 bounded 재시도 횟수(기본 0). 필수 호출(빌드·replan·합성)은 1+,
+             best-effort(critic·judge)는 0(degrade 빠르게). idle_timeout 경로에서만 의미.
     """
     if sandbox not in ALLOWED_SANDBOXES:
         raise ValueError(
@@ -166,30 +362,41 @@ def exec_codex_with_usage(
             cmd += ["-c", f"model_reasoning_effort={reasoning_effort}"]
         cmd.append("-")  # 프롬프트는 stdin으로
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+        if idle_timeout is not None:
+            # 스트리밍 경로(WO#54): Popen + 줄 단위 idle 감시. 멈춤은 CodexStalled로 전파
+            # (호출부가 라우팅). CodexStalled는 의도적으로 여기서 안 잡는다.
+            returncode, stdout_text, stderr_text = _run_streaming_with_retries(
+                cmd, prompt,
+                idle_timeout=idle_timeout, max_duration=max_duration,
+                stall_retries=stall_retries,
             )
-        except FileNotFoundError as e:
-            raise CodexError(
-                f"codex CLI를 찾을 수 없음 ('{CODEX_BIN}' on PATH?)"
-            ) from e
-        except subprocess.TimeoutExpired as e:
-            raise CodexError(
-                f"codex exec 타임아웃 ({timeout}s 초과)",
-                e.stdout or "",
-                e.stderr or "",
-            ) from e
+        else:
+            # 기존 경로(무회귀): subprocess.run(끝나고 캡처). 기존 테스트 seam(subprocess.run) 보존.
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except FileNotFoundError as e:
+                raise CodexError(
+                    f"codex CLI를 찾을 수 없음 ('{CODEX_BIN}' on PATH?)"
+                ) from e
+            except subprocess.TimeoutExpired as e:
+                raise CodexError(
+                    f"codex exec 타임아웃 ({timeout}s 초과)",
+                    e.stdout or "",
+                    e.stderr or "",
+                ) from e
+            returncode, stdout_text, stderr_text = proc.returncode, proc.stdout, proc.stderr
 
-        if proc.returncode != 0:
+        if returncode != 0:
             raise CodexError(
-                f"codex exec 비정상 종료 (exit {proc.returncode})",
-                proc.stdout,
-                proc.stderr,
+                f"codex exec 비정상 종료 (exit {returncode})",
+                stdout_text,
+                stderr_text,
             )
 
         text = ""
@@ -197,12 +404,13 @@ def exec_codex_with_usage(
             text = out_path.read_text(encoding="utf-8").strip()
         if not text:
             raise CodexError(
-                "codex exec가 빈 최종 메시지를 반환함", proc.stdout, proc.stderr
+                "codex exec가 빈 최종 메시지를 반환함", stdout_text, stderr_text
             )
         # usage 파싱은 best-effort 부가물 — 실패해도 text 반환은 영향 없음.
+        # 스트리밍 경로에서도 동일: stdout_text는 그때까지 받은 전체 JSONL(부분 포함).
         usage = None
         try:
-            usage = _parse_usage(proc.stdout, model)
+            usage = _parse_usage(stdout_text, model)
         except Exception:  # noqa: BLE001 — 계측은 run을 죽이지 않는다
             usage = None
         return text, usage
@@ -215,9 +423,22 @@ class CodexClient:
     workdir: codex의 작업 루트. None이면 호출마다 임시 디렉토리(완전 격리).
     """
 
-    def __init__(self, model: str | None = None, workdir: str | None = None, **default_opts):
+    def __init__(
+        self,
+        model: str | None = None,
+        workdir: str | None = None,
+        *,
+        idle_timeout: float | None = None,
+        max_duration: float | None = None,
+        stall_retries: int = 0,
+        **default_opts,
+    ):
         self.model = model
         self.workdir = workdir
+        # WO#54: idle(무진행) timeout. None(기본)이면 기존 subprocess.run 경로(무회귀).
+        self.idle_timeout = idle_timeout
+        self.max_duration = max_duration
+        self.stall_retries = stall_retries
         self.default_opts = default_opts  # 향후 플래그 확장용으로 보존
         # 직전 호출의 token usage(WO#33). 미노출/파싱 실패면 None(날조 금지).
         self.last_usage: Usage | None = None
@@ -245,6 +466,9 @@ class CodexClient:
             sandbox="read-only",
             cwd=self.workdir,
             model=self.model,
+            idle_timeout=self.idle_timeout,
+            max_duration=self.max_duration,
+            stall_retries=self.stall_retries,
         )
         self.last_usage = usage  # 읽기만 — sandbox 권한 불변
         return text

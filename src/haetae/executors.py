@@ -123,12 +123,20 @@ class CodexExecutor:
         timeout: float = 1800.0,
         sandbox: str = "workspace-write",
         reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
+        max_duration: float | None = None,
+        stall_retries: int = 1,
     ):
         self.model = model
         self.workdir = Path(workdir)
         self.timeout = timeout
         self.sandbox = sandbox
         self.reasoning_effort = reasoning_effort
+        # WO#54: idle(무진행) timeout. None(기본)이면 기존 subprocess.run 경로(무회귀).
+        # 빌드는 *필수* 호출이라 멈춤 시 bounded 재시도(stall_retries 기본 1) 후 escalate.
+        self.idle_timeout = idle_timeout
+        self.max_duration = max_duration
+        self.stall_retries = stall_retries
         # 직전 실행의 token usage(WO#33). 미노출/파싱 실패면 None(날조 금지).
         self.last_usage: Usage | None = None
 
@@ -139,6 +147,8 @@ class CodexExecutor:
 
     # ── 테스트 seam: 실제 subprocess 실행은 공유 헬퍼로 격리 ────────────
     def _run(self, prompt: str) -> str:
+        # CodexStalled(무진행 멈춤)는 *의도적으로* 잡지 않는다 — CodexError가 아니므로
+        # 이 except에 안 걸리고 그대로 전파돼, 루프가 "빌드 멈춤"을 타입으로 escalate한다.
         try:
             text, usage = exec_codex_with_usage(
                 prompt,
@@ -147,6 +157,9 @@ class CodexExecutor:
                 model=self.model,
                 timeout=self.timeout,
                 reasoning_effort=self.reasoning_effort,
+                idle_timeout=self.idle_timeout,
+                max_duration=self.max_duration,
+                stall_retries=self.stall_retries,
             )
         except CodexError as e:
             raise CodexExecutorError(str(e)) from e

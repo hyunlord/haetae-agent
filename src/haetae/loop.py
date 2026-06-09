@@ -18,7 +18,7 @@ from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_
 from haetae.capability import PocRunner, governed_capability_preflight
 from haetae.deps import Runner as DepsRunner, ensure_deps
 from haetae.intake import SynthesisError, nudge_integration_deps, synthesize
-from haetae.llm import LLMClient
+from haetae.llm import CodexStalled, LLMClient
 from haetae.metering import (
     MeteredClient,
     accumulate,
@@ -915,6 +915,30 @@ def run_loop(
         emit(_final_label(state))
         try_save()
 
+        return state
+    except CodexStalled as e:
+        # WO#54: *필수* codex 호출(합성·replan·빌드)이 bounded 재시도 후에도 무진행(멈춤).
+        #   가짜 진행 금지 — 정직하게 사람 tier로 escalate한다(무한 hang 대신 클린 종료).
+        #   (병렬 경로의 worktree 정리는 _parallel_loop의 finally가 보장한다.)
+        #   best-effort — 기록/저장 중 추가 예외도 흡수(2차 크래시 금지).
+        try:
+            record_transition(STAGE_ESCALATE)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if state is not None and state.status == Status.running:
+                state.status = Status.escalated
+                state.pending_escalations.append({
+                    "reason": "codex 무진행(idle) — bounded 재시도 후에도 멈춤(stalled), escalate",
+                    "detail": str(e),
+                })
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            emit(_final_label(state))
+        except Exception:  # noqa: BLE001
+            pass
+        try_save()
         return state
     except KeyboardInterrupt:
         # 웹 stop/SIGINT: 순차 경로는 worktree 미사용이라 state 저장만으로 충분.

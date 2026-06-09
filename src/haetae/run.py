@@ -205,6 +205,26 @@ def main(argv: list[str] | None = None) -> int:
         help="run 체크(산출물 실행)의 타임아웃 초 (기본 120). 호스트에서 실행, 바운드 필수.",
     )
     parser.add_argument(
+        "--codex-idle-timeout",
+        type=float,
+        default=300.0,
+        help=(
+            "codex 호출의 *무진행(idle) timeout* 초 (기본 300). `--json` 이벤트가 이 시간 동안 "
+            "끊기면(무음=멈춤) 멈춘 프로세스를 정리하고 라우팅한다(필수=재시도/escalate, "
+            "best-effort=degrade). **총 시간 cap이 아니라 침묵만 잼** — 진행 중인 긴 호출은 "
+            "안 죽인다. 추론 갭보단 길고 무한 hang보단 짧게."
+        ),
+    )
+    parser.add_argument(
+        "--codex-max-duration",
+        type=float,
+        default=None,
+        help=(
+            "codex 호출의 *선택적* 절대 backstop 초 (기본 없음=off). 진행 중이어도 pathological"
+            "하게 길면 차단. 주 메커니즘은 idle — 이건 안전망일 뿐."
+        ),
+    )
+    parser.add_argument(
         "--install-deps",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -287,7 +307,15 @@ def main(argv: list[str] | None = None) -> int:
 
     pricing = _load_pricing(args.pricing)
 
-    client = CodexClient(model=args.model)
+    # WO#54: idle(무진행) timeout을 모든 codex 클라이언트에 건다. brain(합성/replan/scaffold)과
+    #   executor(빌드)는 *필수* → stall_retries=1(bounded 재시도 후 escalate). judge/critic은
+    #   *best-effort* → stall_retries=0(degrade 빠르게). 멈춰도 무한 hang 없이 종료.
+    idle_to = args.codex_idle_timeout
+    max_dur = args.codex_max_duration
+
+    client = CodexClient(
+        model=args.model, idle_timeout=idle_to, max_duration=max_dur, stall_retries=1
+    )
 
     # judge LLM 비용 계측(WO#34): judge client를 passthrough MeteredClient로 감싼다.
     # complete 결과를 그대로 통과시키므로 gate 검증 *행동*은 불변 — 비용만 기록된다.
@@ -295,7 +323,11 @@ def main(argv: list[str] | None = None) -> int:
     # event.cost/budget에 합산한다. judge_model이 없으면 codex 기본(모델 미상→usd=null).
     def make_judge_client() -> LLMClient:
         return MeteredClient(
-            CodexClient(model=args.judge_model), source="judge", pricing=pricing
+            CodexClient(
+                model=args.judge_model, idle_timeout=idle_to, max_duration=max_dur,
+                stall_retries=0,  # best-effort: 멈추면 degrade(skipped→ambiguous, 가짜 pass 금지)
+            ),
+            source="judge", pricing=pricing,
         )
 
     # judge는 read-only CodexClient(executor와 다른 --judge-model 가능). judge 타입
@@ -313,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         executor: Executor = CodexExecutor(
             model=args.model, workdir=args.workdir,
             reasoning_effort=args.reasoning_effort,
+            idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
         )
     else:
         executor = HumanRelayExecutor()
@@ -324,7 +357,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_parallel > 1:
         if args.executor == "codex":
             executor_factory = lambda wt: CodexExecutor(
-                model=args.model, workdir=wt, reasoning_effort=args.reasoning_effort
+                model=args.model, workdir=wt, reasoning_effort=args.reasoning_effort,
+                idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
             )
         else:
             executor_factory = lambda wt: HumanRelayExecutor()
@@ -336,7 +370,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # spec critic: --critic-model 줄 때만 ON(read-only, 합성기와 다른 모델 권장 = 독립성).
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
-    critic_client = CodexClient(model=args.critic_model) if args.critic_model else None
+    critic_client = (
+        CodexClient(
+            model=args.critic_model, idle_timeout=idle_to, max_duration=max_dur,
+            stall_retries=0,  # best-effort: 멈추면 진행(critic은 advisory)
+        )
+        if args.critic_model else None
+    )
 
     # 선제 스캐폴드(WO#27): --scaffold(기본 on)면 brain client를 scaffold 생성에 재사용.
     # --no-scaffold면 None → 스캐폴드 OFF(기존 동작 그대로). 생성기는 dep 스택 필요할 때만
