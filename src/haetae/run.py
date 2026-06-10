@@ -53,6 +53,7 @@ def run(
     capabilities_on: bool = False,
     capability_registry_path: str | Path | None = None,
     capability_allowlist: list[str] | None = None,
+    capability_searcher=None,
     heartbeat=None,
     synth_context: str | None = None,
     seeded: bool = False,
@@ -70,6 +71,7 @@ def run(
         capabilities_on=capabilities_on,
         capability_registry_path=capability_registry_path,
         capability_allowlist=capability_allowlist,
+        capability_searcher=capability_searcher,
         max_iters=max_iters,
         decomp_critic=decomp_critic,
         decomp_retries=decomp_retries,
@@ -465,6 +467,17 @@ def main(argv: list[str] | None = None) -> int:
             "미승인은 escalate(검토 후 여기 추가하고 재실행). 비면 전부 미승인(자동 채택 없음)."
         ),
     )
+    parser.add_argument(
+        "--capability-search",
+        action="store_true",
+        default=False,
+        help=(
+            "능력 발견을 인터넷(pypi)으로 확장 ON(기본 OFF · --capabilities 전제). director-side "
+            "검색으로 *원격 후보*를 만들어 기존 escalation(사람 검토)에 surface한다. **실행 0**"
+            "(메타데이터만, ok=None)·**자동 채택 없음**(allowlist 게이트 그대로)·sandbox 불변. "
+            "OFF면 큐레이션-only(네트워크 0)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     pricing = _load_pricing(args.pricing)
@@ -582,6 +595,14 @@ def main(argv: list[str] | None = None) -> int:
     # 스킬 주입(빌더 전용): --skills(기본 on)면 --skills-dir에서 로드. --no-skills면 None.
     skills_dir = args.skills_dir if args.skills else None
 
+    # 능력 발견 F.2(opt-in): --capability-search(+ --capabilities)일 때만 인터넷 searcher를 만든다.
+    # **네트워크 모듈은 여기서만 import**(opt-in 경로) — 기본 경로는 network-free 유지.
+    capability_searcher = None
+    if args.capabilities and args.capability_search:
+        from haetae.capability_search import make_searcher  # opt-in 시에만 import(네트워크 격리)
+
+        capability_searcher = make_searcher("pypi")
+
     # 진행 표시: 느린 codex 호출이 "행"으로 안 보이게 stderr로 한 줄씩.
     def progress(msg: str) -> None:
         print(f"… {msg}", file=sys.stderr, flush=True)
@@ -622,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
                 [s.strip() for s in args.capability_allowlist.split(",") if s.strip()]
                 if args.capabilities else None
             ),
+            capability_searcher=capability_searcher,  # F.2: opt-in 원격 발견(off면 None)
         )
     except KeyboardInterrupt:
         print("중단됨 (사용자 stop/SIGINT)", file=sys.stderr, flush=True)

@@ -243,3 +243,35 @@ def test_main_help_lists_codex_idle_timeout(capsys):
         main(["--help"])
     out = capsys.readouterr().out
     assert "--codex-idle-timeout" in out
+
+
+# ──────────────────────────── 능력 발견 F.2 배선 (WO#61) ────────────────────────────
+
+
+def test_main_capability_search_off_by_default_no_searcher(monkeypatch):
+    """기본(--capability-search 없음) → capability_searcher=None(네트워크-free)."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--capabilities"])
+    assert captured["capability_searcher"] is None
+
+
+def test_main_capability_search_wires_searcher_when_on(monkeypatch):
+    """--capabilities --capability-search → PypiSearcher 주입(director-side opt-in)."""
+    from haetae.capability_search import PypiSearcher
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--capabilities", "--capability-search"])
+    assert isinstance(captured["capability_searcher"], PypiSearcher)
+
+
+def test_main_capability_search_requires_capabilities(monkeypatch):
+    """--capability-search만(--capabilities 없이) → searcher 미주입(전제 불충족, no-op)."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--capability-search"])
+    assert captured["capability_searcher"] is None
+
+
+def test_main_help_lists_capability_search(capsys):
+    import pytest
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "--capability-search" in capsys.readouterr().out

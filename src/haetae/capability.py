@@ -7,10 +7,18 @@
 핵심 안전 불변(이 모듈이 강제):
   1. **자동 채택 절대 없음.** 발견·POC는 자동이나 *신뢰 결정(채택)은 사람*. 승인(allowlist)된
      후보에만 provenance를 만들고, 미승인은 escalation(사람 검토 대기)으로만 surface한다.
-  2. **큐레이션 소스만(F.1).** in-repo 검증된 `capabilities/*.yaml` 엔트리만. **이 모듈엔
-     인터넷 검색·임의 fetch·subprocess·네트워크 import가 *없다*** (넓은 검색=F.2, 코드실행=F.3).
+  2. **이 모듈엔 인터넷 검색·임의 fetch·subprocess·네트워크 import가 *없다*.** 큐레이션 소스
+     (`capabilities/*.yaml`)는 직접 로드하고, 인터넷 발견(F.2)은 *주입된* `CapabilitySearcher`로만
+     한다 — 실제 네트워크는 별 모듈 `capability_search.py`에 격리(이 모듈은 인터페이스만 안다).
+     코드 실행(F.3)·라이브 POC(F.1b)도 여기엔 없다.
   3. **executor sandbox 무관.** 이 모듈은 executor에 네트워크를 주지 않는다(데이터 처리만).
-  4. **best-effort.** 로드/발견/POC 실패는 흡수 — 절대 raise하지 않는다.
+     인터넷 검색은 *director-side*(검색 모듈)라 ALLOWED_SANDBOXES와 무관.
+  4. **best-effort.** 로드/발견/검색/POC 실패는 흡수 — 절대 raise하지 않는다.
+
+F.2(인터넷 발견, discovery-only): opt-in 시 능력 요청을 인터넷 레지스트리에서도 검색해 **원격
+후보**(`source="remote:<registry>"`)를 만들고 큐레이션 후보와 함께 기존 escalation에 surface한다.
+**실행 0**(원격 후보는 install/import/run 안 함 — 메타데이터 POC, ok=None), **자동 채택 없음**
+(allowlist 게이트 그대로). searcher 미주입이면 원격 후보 0(기존 F.1 동작과 완전 동일).
 
 POC(F.1): 기본은 **메타데이터 증거**(코드 *미실행* — 안전). 후보의 선언된 import/설치 needs를
 증거로 캡처하되 ok=None(미실행)로 둔다. *라이브 기능 스모크*(실제 import/실행)는 주입 runner로
@@ -58,6 +66,15 @@ class CapabilityEntry:
 
 # POC runner 시그니처(주입형, F.1b/테스트용): entry → CapabilityPOC. 기본 None=메타데이터 POC.
 PocRunner = Callable[[CapabilityEntry], CapabilityPOC]
+
+# 인터넷 발견 searcher 시그니처(F.2, 주입형): request → 원격 후보 원시 dict 리스트.
+# **이 모듈은 인터페이스만 안다** — 실제 네트워크 구현은 capability_search.py에 격리(주입).
+CapabilitySearcher = Callable[[CapabilityRequest], list]
+
+
+def _is_remote(entry: CapabilityEntry) -> bool:
+    """원격(인터넷 발견) 후보인가 — source가 `remote:`로 시작하면 미검증·정밀검토 대상."""
+    return entry.source.startswith("remote:")
 
 
 def _strs(v: object) -> tuple[str, ...]:
@@ -128,6 +145,58 @@ def discover(request: CapabilityRequest, registry: list[CapabilityEntry]) -> lis
     if not text:
         return []
     return [e for e in registry if any(kw in text or text in kw for kw in e.keywords)]
+
+
+def _parse_remote_entry(data: object, request: CapabilityRequest) -> CapabilityEntry | None:
+    """searcher가 돌려준 원시 dict → CapabilityEntry. **source는 항상 `remote:<registry>`로 표기.**
+
+    identifier 없으면 None(스킵). registry는 dict의 registry/ecosystem에서, capability는 dict 또는
+    요청에서. 네트워크 호출 없음(이미 검색된 결과를 정규화만). install/imports를 *데이터로만* 보유
+    (실행 안 함 — 원격 후보 POC는 메타데이터 ok=None).
+    """
+    if not isinstance(data, dict):
+        return None
+    identifier = str(data.get("identifier") or data.get("name") or "").strip()
+    if not identifier:
+        return None
+    registry = str(data.get("registry") or data.get("ecosystem") or "unknown").strip() or "unknown"
+    capability = str(data.get("capability") or request.capability or "").strip() or identifier
+    return CapabilityEntry(
+        capability=capability,
+        keywords=(capability.lower(),),
+        identifier=identifier,
+        ecosystem=str(data.get("ecosystem") or registry).strip() or "unknown",
+        source=f"remote:{registry}",  # 명확 표기 — 큐레이션(curated:)과 구분, 정밀검토 신호
+        license=str(data.get("license") or "unknown").strip() or "unknown",
+        install=_strs(data.get("install")),
+        imports=_strs(data.get("imports")),
+        note=str(data.get("note") or "").strip(),
+    )
+
+
+def discover_remote(
+    request: CapabilityRequest, *, searcher: CapabilitySearcher | None
+) -> list[CapabilityEntry]:
+    """인터넷 레지스트리에서 원격 후보를 발견한다(F.2, discovery-only·best-effort).
+
+    searcher 미주입(None)이면 빈 리스트(off-by-default — 기존 F.1 동작과 완전 동일). 주입 시
+    best-effort 호출 → 반환 dict들을 `source="remote:<registry>"` 엔트리로 정규화. searcher 예외·
+    형식 불량은 흡수 → [](큐레이션-only 폴백). **네트워크 import 없음**(searcher가 주입됨).
+    """
+    if searcher is None:
+        return []
+    try:
+        raw = searcher(request)
+    except Exception:  # noqa: BLE001 — 검색 실패는 흡수(큐레이션-only 폴백, 절대 raise 안 함)
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[CapabilityEntry] = []
+    for item in raw:
+        entry = _parse_remote_entry(item, request)
+        if entry is not None:
+            out.append(entry)
+    return out
 
 
 def to_candidate(entry: CapabilityEntry) -> CapabilityCandidate:
@@ -201,28 +270,48 @@ def build_capability_escalation(
     사람이 검토해 allowlist에 추가(승인)한 뒤 *재실행*하면 채택된다(out-of-band 승인).
     """
     reqs = []
+    remote_total = 0
     for req, cand_pocs in unresolved:
         candidates = []
+        curated_n = remote_n = 0
         for entry, poc in cand_pocs:
+            remote = _is_remote(entry)
+            if remote:
+                remote_n += 1
+            else:
+                curated_n += 1
             candidates.append({
                 "candidate": to_candidate(entry).model_dump(mode="json"),
                 "poc": poc.model_dump(mode="json"),
                 "license": entry.license,
                 "source": entry.source,
+                # F.2: 사람이 출처로 신뢰도 판단 — 큐레이션(in-repo 검증) vs 원격(미검증·정밀검토).
+                "trust": "remote-unverified" if remote else "curated-verified",
+                "needs_scrutiny": remote,  # 원격 후보는 사람 정밀검토 필요(실행 0·메타데이터만)
             })
+        remote_total += remote_n
+        # 큐레이션을 앞, 원격(정밀검토 요)을 뒤로 정렬 — 검토 우선순위.
+        candidates.sort(key=lambda c: 1 if c["needs_scrutiny"] else 0)
         reqs.append({
             "capability": req.capability,
             "unit": req.unit,
             "why": req.reason,
             "candidates": candidates,
+            "curated_count": curated_n,
+            "remote_count": remote_n,
         })
     n = len(reqs)
+    remote_note = (
+        f" 그중 원격(인터넷 발견·미검증) 후보 {remote_total}건은 *실행되지 않았으며*(메타데이터만) "
+        "사람 정밀검토가 필요하다." if remote_total else ""
+    )
     return {
-        "reason": f"능력 획득 승인 대기 — 미승인 능력 요청 {n}건 (사람 검토 필요)",
+        "reason": f"능력 획득 승인 대기 — 미승인 능력 요청 {n}건 (사람 검토 필요).{remote_note}",
         "capability_gate": True,
         "how_to_approve": (
-            "후보·POC 증거·라이선스를 검토하고, 신뢰하면 식별자를 capability-allowlist에 "
-            "추가해 *재실행*하라(out-of-band 승인). 자동 채택은 하지 않는다."
+            "후보·POC 증거·라이선스·source(curated vs remote)를 검토하고, 신뢰하면 식별자를 "
+            "capability-allowlist에 추가해 *재실행*하라(out-of-band 승인). 자동 채택은 하지 않는다. "
+            "원격(remote:) 후보는 미검증이니 더 신중히 — 실행되지 않았고 메타데이터 증거뿐이다."
         ),
         "requests": reqs,
     }
@@ -244,29 +333,38 @@ def governed_capability_preflight(
     approved_at: str,
     poc_runner: PocRunner | None = None,
     approved_by: str = "human-allowlist",
+    searcher: CapabilitySearcher | None = None,
 ) -> CapabilityOutcome:
-    """능력 요청 → 발견 → POC → 승인 분기. 순수·best-effort(절대 raise 안 함).
+    """능력 요청 → 발견(큐레이션+원격) → POC → 승인 분기. 순수·best-effort(절대 raise 안 함).
 
-    각 요청에 대해 큐레이션 후보를 발견하고:
+    각 요청에 대해 큐레이션 후보(discover) + 원격 후보(discover_remote, searcher 주입 시)를 발견하고:
       - **승인(allowlist)된 후보**가 있으면 → provenance 기록(채택 결정). 그 요청은 해소됨.
-      - 승인된 후보가 없으면(미승인 후보 or 후보 없음) → escalation에 모은다(사람 검토 대기).
+      - 승인된 후보가 없으면(미승인 후보 or 후보 0) → escalation에 모은다(사람 검토 대기).
     반환 CapabilityOutcome: provenance(채택된 것) + escalation(미승인 있으면 dict, 없으면 None).
-    **자동 채택 없음**: provenance는 *승인된 후보에만* 생기고, 미승인은 escalation으로만 surface.
+
+    F.2 불변:
+      - **자동 채택 없음**: provenance는 *승인(allowlist)된 후보에만* — 원격도 동일 게이트(allowlist).
+      - **원격 후보는 실행 0**: poc_runner를 *주지 않는다*(메타데이터 POC, ok=None). 라이브 POC는
+        큐레이션 후보에만(F.1b runner). searcher 미주입이면 원격 후보 0(기존 F.1 동작 불변).
     """
     registry = load_capability_registry(registry_dir)
     provenance: list[CapabilityProvenance] = []
     unresolved: list[tuple[CapabilityRequest, list[tuple[CapabilityEntry, CapabilityPOC]]]] = []
+
+    def _poc(entry: CapabilityEntry) -> CapabilityPOC:
+        # 원격 후보는 **절대 라이브 실행 안 함** — runner 무시(메타데이터 ok=None). 큐레이션만 F.1b runner.
+        return run_poc(entry, runner=None if _is_remote(entry) else poc_runner)
+
     for req in requests or []:
-        candidates = discover(req, registry)
+        candidates = discover(req, registry) + discover_remote(req, searcher=searcher)
         approved = [e for e in candidates if is_approved(e, allowlist)]
         if approved:
             for entry in approved:
-                poc = run_poc(entry, runner=poc_runner)
                 provenance.append(build_provenance(
-                    entry, approved_by=approved_by, approved_at=approved_at, poc=poc))
+                    entry, approved_by=approved_by, approved_at=approved_at, poc=_poc(entry)))
         else:
             # 미승인(또는 후보 0) → 후보별 POC 증거를 모아 사람 검토로 escalate.
-            cand_pocs = [(e, run_poc(e, runner=poc_runner)) for e in candidates]
+            cand_pocs = [(e, _poc(e)) for e in candidates]
             unresolved.append((req, cand_pocs))
     escalation = build_capability_escalation(unresolved) if unresolved else None
     return CapabilityOutcome(provenance=provenance, escalation=escalation)

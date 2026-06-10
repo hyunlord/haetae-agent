@@ -415,6 +415,7 @@ def run_loop(
     capability_registry_path: str | Path | None = None,
     capability_allowlist: list[str] | None = None,
     capability_poc_runner: PocRunner | None = None,
+    capability_searcher=None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -704,6 +705,7 @@ def run_loop(
                     allowlist=capability_allowlist,
                     approved_at=now() or "",
                     poc_runner=capability_poc_runner,
+                    searcher=capability_searcher,  # F.2: opt-in 인터넷 발견(off면 None=큐레이션-only)
                 )
                 # 승인되어 채택된 능력의 provenance를 감사 기록(미승인은 없음 — 자동 채택 X).
                 state.capability_provenance.extend(outcome.provenance)
