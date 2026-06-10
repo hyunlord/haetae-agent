@@ -51,6 +51,7 @@ class CapabilityEntry:
     identifier: 패키지/툴 식별자. ecosystem: npm|pip|tool. source/license: provenance용.
     install: host-side 설치 명령(채택 *실행*은 F.1b — 여기선 데이터로만 보유, 실행 안 함).
     imports: POC가 참조할 모듈명(증거). note: 사람이 읽는 설명.
+    relevance: 원격 의미 검색의 관련도 score(F.2+, npm 등). 큐레이션/미지면 None.
     """
 
     capability: str
@@ -62,6 +63,7 @@ class CapabilityEntry:
     install: tuple[str, ...] = ()
     imports: tuple[str, ...] = ()
     note: str = ""
+    relevance: float | None = None
 
 
 # POC runner 시그니처(주입형, F.1b/테스트용): entry → CapabilityPOC. 기본 None=메타데이터 POC.
@@ -161,9 +163,13 @@ def _parse_remote_entry(data: object, request: CapabilityRequest) -> CapabilityE
         return None
     registry = str(data.get("registry") or data.get("ecosystem") or "unknown").strip() or "unknown"
     capability = str(data.get("capability") or request.capability or "").strip() or identifier
+    # F.2+: 의미 검색 메타데이터 — 패키지가 선언한 keywords + 관련도 score(사람 리뷰 신호).
+    kw = tuple(k.lower() for k in _strs(data.get("keywords")) if k.strip())
+    rel = data.get("relevance")
+    relevance = float(rel) if isinstance(rel, (int, float)) else None
     return CapabilityEntry(
         capability=capability,
-        keywords=(capability.lower(),),
+        keywords=kw or (capability.lower(),),  # 패키지 keywords(있으면) — 없으면 capability
         identifier=identifier,
         ecosystem=str(data.get("ecosystem") or registry).strip() or "unknown",
         source=f"remote:{registry}",  # 명확 표기 — 큐레이션(curated:)과 구분, 정밀검토 신호
@@ -171,6 +177,7 @@ def _parse_remote_entry(data: object, request: CapabilityRequest) -> CapabilityE
         install=_strs(data.get("install")),
         imports=_strs(data.get("imports")),
         note=str(data.get("note") or "").strip(),
+        relevance=relevance,
     )
 
 
@@ -288,6 +295,10 @@ def build_capability_escalation(
                 # F.2: 사람이 출처로 신뢰도 판단 — 큐레이션(in-repo 검증) vs 원격(미검증·정밀검토).
                 "trust": "remote-unverified" if remote else "curated-verified",
                 "needs_scrutiny": remote,  # 원격 후보는 사람 정밀검토 필요(실행 0·메타데이터만)
+                # F.2+: 의미 검색 메타데이터 — 사람이 *이게 뭘 하는 패키지인지* 이름만이 아니라 본다.
+                "note": entry.note,
+                "keywords": list(entry.keywords),
+                "relevance": entry.relevance,
             })
         remote_total += remote_n
         # 큐레이션을 앞, 원격(정밀검토 요)을 뒤로 정렬 — 검토 우선순위.

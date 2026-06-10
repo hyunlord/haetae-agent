@@ -232,6 +232,120 @@ def test_make_searcher_pypi_and_unknown():
         make_searcher("npm-not-yet")
 
 
+# ──────────────────────────── NpmSearcher (의미 검색, 주입 opener) ────────────────────────────
+
+
+def test_npm_searcher_semantic_search_via_opener():
+    """npm은 능력 *텍스트*를 query로 의미 검색(이름 추측 아님) → 관련도순 후보 + 메타데이터."""
+    from haetae.capability_search import NpmSearcher
+    seen = {}
+
+    def opener(query):
+        seen["q"] = query
+        return {"objects": [
+            {"package": {"name": "easystarjs", "description": "A* on a grid",
+                         "keywords": ["astar", "pathfinding"], "license": "MIT"},
+             "score": {"final": 0.9}},
+            {"package": {"name": "pathfinding", "description": "pathfinding lib",
+                         "keywords": ["astar"], "license": {"type": "ISC"}},
+             "score": {"final": 0.8}},
+        ]}
+
+    res = NpmSearcher(opener=opener)(CapabilityRequest(capability="pathfinding for AI"))
+    assert seen["q"] == "pathfinding for AI"           # query=능력 텍스트(슬러그 추측 아님)
+    assert [r["identifier"] for r in res] == ["easystarjs", "pathfinding"]  # 관련도순
+    assert res[0]["registry"] == "npm" and res[0]["ecosystem"] == "npm"
+    assert res[0]["relevance"] == 0.9
+    assert "pathfinding" in res[0]["keywords"]
+    assert res[0]["note"] == "A* on a grid"
+    assert res[1]["license"] == "ISC"                  # dict license({type}) 흡수
+
+
+def test_npm_searcher_empty_query_and_bad_responses():
+    from haetae.capability_search import NpmSearcher
+    assert NpmSearcher(opener=lambda q: {"objects": []})(CapabilityRequest(capability="")) == []  # 빈 query
+    assert NpmSearcher(opener=lambda q: None)(CapabilityRequest(capability="x")) == []
+    assert NpmSearcher(opener=lambda q: {"objects": []})(CapabilityRequest(capability="x")) == []
+    assert NpmSearcher(opener=lambda q: {"no_objects": 1})(CapabilityRequest(capability="x")) == []
+    assert NpmSearcher(opener=lambda q: {"objects": [1, "x"]})(CapabilityRequest(capability="x")) == []
+
+
+def test_npm_searcher_absorbs_opener_exception():
+    from haetae.capability_search import NpmSearcher
+
+    def boom(q):
+        raise RuntimeError("net down")
+    assert NpmSearcher(opener=boom)(CapabilityRequest(capability="x")) == []
+
+
+def test_npm_searcher_bounded_by_size():
+    from haetae.capability_search import NpmSearcher
+    objs = [{"package": {"name": f"pkg{i}"}, "score": {"final": 0.5}} for i in range(20)]
+    res = NpmSearcher(size=3, opener=lambda q: {"objects": objs})(CapabilityRequest(capability="x"))
+    assert len(res) == 3  # bounded
+
+
+# ──────────────────────────── 멀티 레지스트리 (composite·dedup) ────────────────────────────
+
+
+def test_composite_merges_and_dedups():
+    from haetae.capability_search import _CompositeSearcher
+    npm = _remote_searcher([{"identifier": "easystar", "registry": "npm", "note": "npm one"}])
+    pypi = _remote_searcher([
+        {"identifier": "pathfinding", "registry": "pypi"},
+        {"identifier": "easystar", "registry": "npm"},  # 중복(npm) → dedup
+    ])
+    res = _CompositeSearcher([npm, pypi])(CapabilityRequest(capability="x"))
+    keys = {(r["identifier"], r["registry"]) for r in res}
+    assert ("easystar", "npm") in keys and ("pathfinding", "pypi") in keys
+    assert sum(1 for r in res if r["identifier"] == "easystar") == 1  # dedup
+
+
+def test_composite_absorbs_one_searcher_failure():
+    from haetae.capability_search import _CompositeSearcher
+
+    def boom(_r):
+        raise RuntimeError("registry down")
+    ok = _remote_searcher([{"identifier": "good", "registry": "npm"}])
+    res = _CompositeSearcher([boom, ok])(CapabilityRequest(capability="x"))
+    assert [r["identifier"] for r in res] == ["good"]  # 한 레지스트리 실패가 다른 것 안 막음
+
+
+def test_make_searcher_multi_and_whitespace_and_errors():
+    from haetae.capability_search import NpmSearcher, _CompositeSearcher
+    assert isinstance(make_searcher("npm"), NpmSearcher)
+    assert isinstance(make_searcher("npm,pypi"), _CompositeSearcher)
+    assert isinstance(make_searcher(" npm , pypi "), _CompositeSearcher)  # 공백 흡수
+    with pytest.raises(ValueError):
+        make_searcher("npm,bogus")   # 미지 하나라도 있으면 거부
+    with pytest.raises(ValueError):
+        make_searcher("")            # 빈 리스트
+
+
+# ──────────────────────────── 메타데이터 → escalation (사람 판단 신호) ────────────────────────────
+
+
+def test_npm_metadata_flows_to_escalation():
+    """npm description/keywords/relevance가 escalation 후보까지 흘러 사람에게 노출된다."""
+    items = [{
+        "identifier": "easystarjs", "registry": "npm", "ecosystem": "npm", "license": "MIT",
+        "note": "A* pathfinding on a 2D grid", "keywords": ["astar", "pathfinding"],
+        "relevance": 0.83,
+    }]
+    out = governed_capability_preflight(
+        [CapabilityRequest(capability="pathfinding", unit="u1")],
+        registry_dir=None, allowlist=[], approved_at="t",
+        searcher=_remote_searcher(items),
+    )
+    c = out.escalation["requests"][0]["candidates"][0]
+    assert c["source"] == "remote:npm"
+    assert c["note"] == "A* pathfinding on a 2D grid"
+    assert "pathfinding" in c["keywords"]
+    assert c["relevance"] == 0.83
+    assert c["poc"]["ok"] is None              # 실행 0(무회귀)
+    assert c["trust"] == "remote-unverified"
+
+
 # ──────────────────────────── (선택) 실 pypi 통합 — opt-in ────────────────────────────
 
 
@@ -243,3 +357,14 @@ def test_real_pypi_discovery_smoke():
     res = make_searcher("pypi")(CapabilityRequest(capability="requests"))
     assert any(r["identifier"].lower() == "requests" for r in res)
     assert all(r["registry"] == "pypi" for r in res)
+
+
+@pytest.mark.skipif(
+    os.environ.get("HAETAE_CAP_SEARCH_IT") != "1",
+    reason="실 네트워크 능력 검색 통합 테스트는 opt-in (HAETAE_CAP_SEARCH_IT=1)",
+)
+def test_real_npm_semantic_discovery_smoke():
+    # npm 진짜 의미 검색: 능력 텍스트로 관련 패키지(이름이 텍스트와 안 같아도) 발견.
+    res = make_searcher("npm")(CapabilityRequest(capability="a star pathfinding grid"))
+    assert res and all(r["registry"] == "npm" for r in res)
+    assert all("identifier" in r for r in res)

@@ -469,13 +469,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--capability-search",
-        action="store_true",
-        default=False,
+        nargs="?",
+        const="npm,pypi",
+        default=None,
+        metavar="REGISTRIES",
         help=(
-            "능력 발견을 인터넷(pypi)으로 확장 ON(기본 OFF · --capabilities 전제). director-side "
-            "검색으로 *원격 후보*를 만들어 기존 escalation(사람 검토)에 surface한다. **실행 0**"
-            "(메타데이터만, ok=None)·**자동 채택 없음**(allowlist 게이트 그대로)·sandbox 불변. "
-            "OFF면 큐레이션-only(네트워크 0)."
+            "능력 발견을 인터넷으로 확장(기본 OFF · --capabilities 전제). 레지스트리 콤마 리스트: "
+            "`npm`(키워드 의미 검색)·`pypi`(이름 기반)·`npm,pypi`. 플래그만 주면 기본 'npm,pypi'. "
+            "director-side 검색으로 *원격 후보*(description/keywords/관련도 포함)를 만들어 기존 "
+            "escalation(사람 검토)에 surface. **실행 0**(메타데이터만, ok=None)·**자동 채택 없음**"
+            "(allowlist 게이트 그대로)·sandbox 불변. 미지정이면 큐레이션-only(네트워크 0)."
         ),
     )
     args = parser.parse_args(argv)
@@ -601,7 +604,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.capabilities and args.capability_search:
         from haetae.capability_search import make_searcher  # opt-in 시에만 import(네트워크 격리)
 
-        capability_searcher = make_searcher("pypi")
+        # 콤마 리스트(npm,pypi 등) 통과 — 미지 레지스트리는 make_searcher가 ValueError.
+        capability_searcher = make_searcher(args.capability_search)
 
     # 진행 표시: 느린 codex 호출이 "행"으로 안 보이게 stderr로 한 줄씩.
     def progress(msg: str) -> None:

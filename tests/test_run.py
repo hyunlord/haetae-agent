@@ -256,11 +256,27 @@ def test_main_capability_search_off_by_default_no_searcher(monkeypatch):
 
 
 def test_main_capability_search_wires_searcher_when_on(monkeypatch):
-    """--capabilities --capability-search → PypiSearcher 주입(director-side opt-in)."""
-    from haetae.capability_search import PypiSearcher
+    """--capabilities --capability-search(bare) → searcher 주입(기본 npm,pypi composite)."""
     captured = _capture_main_run(monkeypatch)
     main(["--order", "x", "--capabilities", "--capability-search"])
+    s = captured["capability_searcher"]
+    assert s is not None and callable(s)  # composite(npm,pypi) — director-side opt-in
+
+
+def test_main_capability_search_single_registry(monkeypatch):
+    """--capability-search pypi → 단일 PypiSearcher(콤마 리스트의 단일 케이스)."""
+    from haetae.capability_search import PypiSearcher
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--capabilities", "--capability-search", "pypi"])
     assert isinstance(captured["capability_searcher"], PypiSearcher)
+
+
+def test_main_capability_search_unknown_registry_errors(monkeypatch):
+    """미지 레지스트리 → make_searcher가 ValueError(배선 단계에서 명확히 실패)."""
+    import pytest
+    _capture_main_run(monkeypatch)
+    with pytest.raises(ValueError):
+        main(["--order", "x", "--capabilities", "--capability-search", "bogusreg"])
 
 
 def test_main_capability_search_requires_capabilities(monkeypatch):
