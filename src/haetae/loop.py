@@ -232,7 +232,7 @@ def _executor_cost(executor: "Executor", pricing) -> Cost | None:
 
 def _exec_and_gate(
     executor: "Executor", gate: "Gate", order: NextOrder, spec: ProjectSpec,
-    pricing=None,
+    pricing=None, heartbeat=None,
 ) -> tuple[str, GateResult, Cost | None]:
     """ThreadPoolExecutor 워커 — 느린 부분(executor 실행 + unit gate)만 병렬화한다.
 
@@ -246,8 +246,20 @@ def _exec_and_gate(
     (전체-spec 기준은 통합 gate로 연기 → 기반 유닛이 전체-시스템 기준 때문에
     escalate하던 회귀 해소). 통합 gate는 main에서 unit 없이(전체) 호출된다.
     """
+    # WO#55: 빌드/judge codex 호출을 *이 워커 스레드*에 라이브 컨텍스트로 깐다(best-effort).
+    # 워커별 executor/gate 인스턴스라 스레드당 한 번에 한 호출 → 컨텍스트 race 없음.
+    if heartbeat is not None:
+        try:
+            heartbeat.set_context("빌드", order.unit)
+        except Exception:  # noqa: BLE001
+            pass
     result = executor.run(order)
     exec_cost = _executor_cost(executor, pricing)
+    if heartbeat is not None:
+        try:
+            heartbeat.set_context("judge", order.unit)
+        except Exception:  # noqa: BLE001
+            pass
     return result, gate.judge(result, spec, unit=order.unit), exec_cost
 
 
@@ -380,6 +392,7 @@ def run_loop(
     pricing: dict | None = None,
     clock: Callable[[], str] | None = None,
     activity_observer: Callable[[list["Activity"]], None] | None = None,
+    heartbeat=None,
     capabilities_on: bool = False,
     capability_registry_path: str | Path | None = None,
     capability_allowlist: list[str] | None = None,
@@ -428,6 +441,19 @@ def run_loop(
     def emit(msg: str) -> None:
         if progress is not None:
             progress(msg)
+
+    def hb(call_kind: str, unit: str | None = None) -> None:
+        """WO#55: codex 호출 직전 라이브 하트비트 컨텍스트(종류·유닛)를 *이 스레드*에 깐다.
+
+        codex 클라이언트가 _run 시작 시 이 컨텍스트를 읽어 활성으로 표면화한다. heartbeat가
+        없으면 no-op. best-effort(컨텍스트 설정 실패가 run을 죽이지 않는다 — 순수 텔레메트리).
+        """
+        if heartbeat is None:
+            return
+        try:
+            heartbeat.set_context(call_kind, unit)
+        except Exception:  # noqa: BLE001
+            pass
 
     def try_save() -> None:
         """비치명적 + 증분 저장. write 실패해도 run을 죽이지 않고 경고만 흘린다.
@@ -577,6 +603,7 @@ def run_loop(
     state = State(spec_ref="(interrupted)", spec_version=0, status=Status.running)
     try:
         emit("합성 중…")
+        hb("합성")
         critique: SpecCritique | None = None
         try:
             if critic_client is not None:
@@ -604,6 +631,7 @@ def run_loop(
         # 자기가 엮는 빌더 유닛에 의존하도록 deps를 교정한다. 과소 지정 시에만 #31 재합성
         # 피드백 채널로 *바운드 1회* 보정 → DAG 말단 직렬화 → 통합 시점 머지 충돌 근본 차단.
         # deps만 바꾸고 criteria/done_when 불변. best-effort(실패→원본 진행). 비용은 아래 drain.
+        hb("합성")
         spec = nudge_integration_deps(order, spec, m_client, prompt_path=syn_prompt)
 
         state = _init_state(spec)
@@ -650,6 +678,7 @@ def run_loop(
         if scaffold_client is not None:
             emit("scaffold 생성 중…")
             record_transition(STAGE_SCAFFOLD)
+            hb("scaffold")
             scaffold = generate_scaffold(spec, m_scaffold, prompt_path=scaffold_prompt)
             account(combine_costs(m_scaffold.drain()))  # scaffold(전역 단계) 비용 누적
             emit(
@@ -686,6 +715,7 @@ def run_loop(
                 record_transition=record_transition,
                 activity_start=activity_start,
                 activity_end=activity_end,
+                heartbeat=heartbeat,
                 decomp_retries=decomp_retries,
                 run_decomp_critic=run_decomp_critic,
                 account_decomp_cost=(
@@ -719,6 +749,7 @@ def run_loop(
             # 바깥 루프 = 분해 critic 재계획(bounded decomp_retries), 안쪽 = replan 파싱 재시도.
             # weak 판정 → 피드백 주고 재replan; 재시도 소진 후에도 weak면 *진행*(데드락 금지)+기록.
             record_transition(STAGE_REPLAN)
+            hb("replan")
             decision = None
             last_err: ReplanError | None = None
             decomp_feedback: str | None = None  # weak 판정 시 다음 replan에 얹는 피드백
@@ -809,12 +840,14 @@ def run_loop(
                 record_transition(STAGE_BUILD, no.unit)
                 emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
                 try_save()  # 증분: in-flight activity가 대시보드 폴링에 보이도록
+                hb("빌드", no.unit)  # WO#55: 빌드 codex 호출 라이브 표면화
                 result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
                 exec_cost = _executor_cost(executor, pricing)  # 읽기만(best-effort)
                 # WO#33: gate 진입=verify 단계로 갱신.
                 activity_set_stage(no.unit, STAGE_VERIFY)
                 record_transition(STAGE_VERIFY, no.unit)
                 emit("gate 검사 중…")
+                hb("judge", no.unit)  # WO#55: judge codex 호출 라이브 표면화
                 gr = gate.judge(result, spec)
                 verdict = gr.verdict
                 emit(_summarize_gate(gr))
@@ -977,6 +1010,7 @@ def _parallel_loop(
     record_transition: Callable[[str, str | None], None] = lambda s, u=None: None,
     activity_start: Callable[[str | None, str], None] = lambda u, s: None,
     activity_end: Callable[[str | None], None] = lambda u: None,
+    heartbeat=None,
     decomp_retries: int = 1,
     run_decomp_critic: Callable[[NextOrder, str], "DecompCritique | None"] = lambda no, last: None,
     account_decomp_cost: Callable[[], None] = lambda: None,
@@ -994,6 +1028,15 @@ def _parallel_loop(
       - 뒷정리: try/finally로 모든 종료 경로(done/escalate/예외)에서 cleanup_all().
       - 이벤트: (unit-id, attempt)로 정렬해 완료 타이밍 비결정성을 봉인.
     """
+    def hb(call_kind: str, unit: str | None = None) -> None:
+        """WO#55: codex 호출 직전 *이 스레드*에 라이브 하트비트 컨텍스트를 깐다(best-effort)."""
+        if heartbeat is None:
+            return
+        try:
+            heartbeat.set_context(call_kind, unit)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ── 상태 봉투(closure로 공유) ──────────────────────────────────────────
     terminal: str | None = None  # None | "done"(brain stop) | "escalated" | "stuck"
     last_result = "(시작 — 아직 실행 없음)"
@@ -1048,6 +1091,7 @@ def _parallel_loop(
         """
         nonlocal terminal, last_result
         record_transition(STAGE_REPLAN, unit)
+        hb("replan", unit)  # WO#55: replan codex 호출 라이브(director-side도 활성 표기)
         ctx = (
             f"스케줄러가 unit '{unit}'를 ready로 선택했다(deps 충족). "
             f"이 unit의 work order만 생성하라(action=next_order, unit={unit}).\n"
@@ -1308,7 +1352,7 @@ def _parallel_loop(
                         # 증강 order를 _exec_and_gate에 줘도 gate엔 스킬이 새지 않는다(분리 보존).
                         fut = pool.submit(
                             _exec_and_gate, executor_factory(wt), gate_factory(wt),
-                            apply_skills(order), spec, pricing)
+                            apply_skills(order), spec, pricing, heartbeat)
                         futures[fut] = (u, order, wt)
 
                 dispatch_ready()
@@ -1346,6 +1390,7 @@ def _parallel_loop(
                 # 통합 gate: 머지된 main에서 spec 체크 1회 → cross-unit 깨짐 포착(판정 로직 불변).
                 emit("통합 gate 검사 중…")
                 record_transition(STAGE_VERIFY, None)
+                hb("통합 judge")  # WO#55: 통합 gate codex 호출 라이브 표면화
                 igr = integration_gate.judge("(integration — 머지된 main 통합 검사)", spec)
                 emit(_summarize_gate(igr))
                 account(igr.judge_cost)  # 통합 gate judge 비용을 budget에 누적

@@ -13,6 +13,7 @@ from typing import Callable
 
 from haetae.executors import CodexExecutor, HumanRelayExecutor
 from haetae.gate import CompositeGate
+from haetae.heartbeat import HeartbeatWriter
 from haetae.llm import CodexClient
 from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
@@ -51,6 +52,7 @@ def run(
     capabilities_on: bool = False,
     capability_registry_path: str | Path | None = None,
     capability_allowlist: list[str] | None = None,
+    heartbeat=None,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -59,6 +61,7 @@ def run(
         executor,
         gate,
         critic_client=critic_client,
+        heartbeat=heartbeat,
         capabilities_on=capabilities_on,
         capability_registry_path=capability_registry_path,
         capability_allowlist=capability_allowlist,
@@ -313,8 +316,16 @@ def main(argv: list[str] | None = None) -> int:
     idle_to = args.codex_idle_timeout
     max_dur = args.codex_max_duration
 
+    # WO#55: 라이브 하트비트 사이드카. state.yaml 옆(같은 run 디렉터리)에 heartbeat.json을
+    #   best-effort로 쓴다(순수 텔레메트리·state 스키마 무변경). --state-path 없으면 None(무사이드카).
+    heartbeat = (
+        HeartbeatWriter(Path(args.state_path).parent / "heartbeat.json")
+        if args.state_path else None
+    )
+
     client = CodexClient(
-        model=args.model, idle_timeout=idle_to, max_duration=max_dur, stall_retries=1
+        model=args.model, idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
+        heartbeat=heartbeat,
     )
 
     # judge LLM 비용 계측(WO#34): judge client를 passthrough MeteredClient로 감싼다.
@@ -326,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             CodexClient(
                 model=args.judge_model, idle_timeout=idle_to, max_duration=max_dur,
                 stall_retries=0,  # best-effort: 멈추면 degrade(skipped→ambiguous, 가짜 pass 금지)
+                heartbeat=heartbeat,
             ),
             source="judge", pricing=pricing,
         )
@@ -346,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model, workdir=args.workdir,
             reasoning_effort=args.reasoning_effort,
             idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
+            heartbeat=heartbeat,
         )
     else:
         executor = HumanRelayExecutor()
@@ -359,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt: CodexExecutor(
                 model=args.model, workdir=wt, reasoning_effort=args.reasoning_effort,
                 idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
+                heartbeat=heartbeat,
             )
         else:
             executor_factory = lambda wt: HumanRelayExecutor()
@@ -374,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         CodexClient(
             model=args.critic_model, idle_timeout=idle_to, max_duration=max_dur,
             stall_retries=0,  # best-effort: 멈추면 진행(critic은 advisory)
+            heartbeat=heartbeat, default_call_kind="critic",
         )
         if args.critic_model else None
     )
@@ -416,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             install_deps=args.install_deps,
             skills_dir=skills_dir,
             pricing=pricing,
+            heartbeat=heartbeat,
             capabilities_on=args.capabilities,
             # opt-in: --capabilities일 때만 레지스트리/allowlist를 넘긴다(OFF면 no-op).
             capability_registry_path=(args.capability_registry if args.capabilities else None),

@@ -673,12 +673,48 @@ def _jsonable(obj: Any) -> Any:
     return obj
 
 
+def _heartbeat_path(state_path: str | Path | None) -> Path | None:
+    """state.yaml 옆 heartbeat.json 경로(WO#55 사이드카). state_path 없으면 None."""
+    if state_path is None:
+        return None
+    return Path(state_path).parent / "heartbeat.json"
+
+
+def load_heartbeat(state_path: str | Path | None) -> dict[str, Any] | None:
+    """state.yaml 옆 heartbeat.json을 best-effort로 읽는다(WO#55, read-only).
+
+    미생성/깨짐/부분쓰기는 *조용히 None*(에러 아님 — #44 빈 상태 패턴). 사이드카라
+    실패해도 state 뷰엔 무영향. 반환 dict는 {updated_at, activities:[...]} 형태.
+    """
+    hb = _heartbeat_path(state_path)
+    if hb is None:
+        return None
+    try:
+        data = json.loads(hb.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    acts = data.get("activities")
+    if not isinstance(acts, list):
+        return None
+    return data
+
+
 def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> dict[str, Any]:
-    """state(+옵션 spec) 재로드 → view. 실패는 {error}로 흡수(서버 안 죽음)."""
+    """state(+옵션 spec) 재로드 → view. 실패는 {error}로 흡수(서버 안 죽음).
+
+    WO#55: 라이브 하트비트(heartbeat.json 사이드카)가 있으면 view["heartbeat"]로 동봉한다.
+    state 로드 실패({error})에도 하트비트는 별도라 — 멈춤 진단을 위해 가능하면 같이 싣는다.
+    """
+    heartbeat = load_heartbeat(state_path)
     try:
         state = State.from_yaml(state_path)
     except Exception as e:  # noqa: BLE001 — 파일없음/파싱에러 전부 흡수
-        return {"error": f"{type(e).__name__}: {e}", "state_path": str(state_path)}
+        err: dict[str, Any] = {"error": f"{type(e).__name__}: {e}", "state_path": str(state_path)}
+        if heartbeat is not None:
+            err["heartbeat"] = heartbeat
+        return err
     spec = None
     if spec_path:
         try:
@@ -686,9 +722,12 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
         except Exception:  # noqa: BLE001 — spec은 옵션, 실패해도 state 뷰는 제공
             spec = None
     try:
-        return state_to_view(state, spec)
+        view = state_to_view(state, spec)
     except Exception as e:  # noqa: BLE001 — 변환 에러도 흡수
-        return {"error": f"view build failed: {type(e).__name__}: {e}"}
+        view = {"error": f"view build failed: {type(e).__name__}: {e}"}
+    if heartbeat is not None:
+        view["heartbeat"] = heartbeat
+    return view
 
 
 # ──────────────────── 제어 표면: 실행 레지스트리 + 서브프로세스 (WO#37) ────────────────────
@@ -1191,10 +1230,18 @@ def make_handler(
             last_sig: Any = object()  # 센티넬 → 첫 루프에서 무조건 push
             idle = 0
             ping_every = max(1, int(15.0 / stream_interval))
+            hb_path = _heartbeat_path(sp)
             try:
                 while True:
                     try:
-                        sig = os.path.getmtime(sp) if sp is not None else None
+                        # WO#55: state.yaml + heartbeat.json mtime 둘 다 감시 → 라이브 하트비트가
+                        #   단계 경계 사이(state 미변경)에도 배너를 갱신(멈춤 차오름이 보이게).
+                        st_m = os.path.getmtime(sp) if sp is not None else None
+                        try:
+                            hb_m = os.path.getmtime(hb_path) if hb_path is not None else None
+                        except OSError:
+                            hb_m = None
+                        sig = (st_m, hb_m)
                     except OSError:
                         sig = None  # 파일 부재 → load_view가 {error}를 내고 그대로 push
                     if sig != last_sig:

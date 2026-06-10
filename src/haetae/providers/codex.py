@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from haetae.metering import Usage
 
@@ -115,12 +116,66 @@ def _terminate_process(proc: subprocess.Popen) -> None:
         pass
 
 
+def _event_summary(line: str) -> str | None:
+    """codex `--json` 이벤트 한 줄에서 사람이 읽을 *최근 액션* 요약을 best-effort로 뽑는다(WO#55).
+
+    editing X / running <cmd> / reasoning 같은 한 줄. 못 뽑으면 이벤트 *종류*로 폴백,
+    JSON이 깨지면 None(호출부가 직전 요약 유지). 순수 텔레메트리 — 절대 raise하지 않는다.
+    """
+    s = (line or "").strip()
+    if not s.startswith("{"):
+        return None
+    try:
+        ev = json.loads(s)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(ev, dict):
+        return None
+    t = ev.get("type")
+    item = ev.get("item") if isinstance(ev.get("item"), dict) else None
+
+    def _short(x: str, n: int = 60) -> str:
+        x = " ".join((x or "").split())
+        return x if len(x) <= n else x[: n - 1] + "…"
+
+    if item is not None:
+        it = item.get("type")
+        if it == "command_execution":
+            return f"running: {_short(item.get('command') or '')}"
+        if it in ("file_change", "file_update", "patch", "edit"):
+            # 경로 후보 키를 폭넓게 시도(코덱스 버전별 변종). 없으면 종류로.
+            path = (
+                item.get("path")
+                or item.get("file")
+                or item.get("filename")
+                or item.get("target")
+            )
+            return f"editing: {_short(str(path))}" if path else "editing files"
+        if it == "agent_message":
+            return "reasoning/message"
+        if it == "reasoning":
+            return "reasoning"
+        if it == "error":
+            return f"error: {_short(item.get('message') or '')}"
+        return str(it) if it else (str(t) if t else None)
+    if t == "turn.completed":
+        return "turn completed"
+    if t == "turn.started":
+        return "turn started"
+    if t == "thread.started":
+        return "thread started"
+    if t == "turn.failed":
+        return "turn failed"
+    return str(t) if t else None
+
+
 def _stream_codex(
     cmd: list[str],
     prompt: str,
     *,
     idle_timeout: float,
     max_duration: float | None,
+    on_event: Callable[[str | None], None] | None = None,
 ) -> tuple[int, str, str]:
     """`codex --json`을 Popen으로 띄워 stdout JSONL을 *줄 단위*로 읽으며 idle을 감시한다.
 
@@ -194,6 +249,12 @@ def _stream_codex(
             )
         if item is _EOF:
             break
+        # WO#55: 진행 이벤트를 라이브 하트비트로 표면화(순수 텔레메트리 — 절대 run 안 죽임).
+        if on_event is not None:
+            try:
+                on_event(_event_summary(item))
+            except Exception:  # noqa: BLE001 — 텔레메트리가 codex 호출을 죽이지 않는다
+                pass
         # 진행 중 — (선택) 아주 넉넉한 절대 backstop. 진행해도 pathological하게 길면 차단.
         if max_duration is not None and (time.monotonic() - start) > max_duration:
             _terminate_process(proc)
@@ -217,6 +278,7 @@ def _run_streaming_with_retries(
     idle_timeout: float,
     max_duration: float | None,
     stall_retries: int,
+    on_event: Callable[[str | None], None] | None = None,
 ) -> tuple[int, str, str]:
     """스트리밍 실행을 *bounded* 재시도로 감싼다. 멈춤이 지속되면 마지막 CodexStalled 전파.
 
@@ -228,7 +290,8 @@ def _run_streaming_with_retries(
     for _ in range(stall_retries + 1):
         try:
             return _stream_codex(
-                cmd, prompt, idle_timeout=idle_timeout, max_duration=max_duration
+                cmd, prompt, idle_timeout=idle_timeout, max_duration=max_duration,
+                on_event=on_event,
             )
         except FileNotFoundError as e:
             raise CodexError(
@@ -283,6 +346,7 @@ def exec_codex(
     idle_timeout: float | None = None,
     max_duration: float | None = None,
     stall_retries: int = 0,
+    on_event: Callable[[str | None], None] | None = None,
 ) -> str:
     """`codex exec`를 한 턴 돌려 `-o` 최종 메시지 파일을 읽어 반환하는 공유 헬퍼.
 
@@ -293,6 +357,7 @@ def exec_codex(
         prompt, sandbox=sandbox, cwd=cwd, model=model, timeout=timeout,
         ephemeral=ephemeral, reasoning_effort=reasoning_effort,
         idle_timeout=idle_timeout, max_duration=max_duration, stall_retries=stall_retries,
+        on_event=on_event,
     )
     return text
 
@@ -309,6 +374,7 @@ def exec_codex_with_usage(
     idle_timeout: float | None = None,
     max_duration: float | None = None,
     stall_retries: int = 0,
+    on_event: Callable[[str | None], None] | None = None,
 ) -> tuple[str, Usage | None]:
     """`codex exec`를 한 턴 돌려 (최종 메시지, token usage)를 반환하는 저수준 헬퍼.
 
@@ -368,7 +434,7 @@ def exec_codex_with_usage(
             returncode, stdout_text, stderr_text = _run_streaming_with_retries(
                 cmd, prompt,
                 idle_timeout=idle_timeout, max_duration=max_duration,
-                stall_retries=stall_retries,
+                stall_retries=stall_retries, on_event=on_event,
             )
         else:
             # 기존 경로(무회귀): subprocess.run(끝나고 캡처). 기존 테스트 seam(subprocess.run) 보존.
@@ -416,6 +482,40 @@ def exec_codex_with_usage(
         return text, usage
 
 
+def heartbeat_wrapped(heartbeat, default_kind, idle_timeout, run_fn):
+    """heartbeat가 있으면 start/finish로 감싸고 on_event를 주입해 run_fn(on_event)를 실행한다(WO#55).
+
+    순수 텔레메트리·best-effort: 하트비트 관련 *어떤 예외도* codex 호출을 죽이지 않는다.
+    call_kind/unit은 루프가 set_context로 깔아둔 스레드별 컨텍스트에서 읽고(없으면 default_kind),
+    이벤트는 명시 handle로 보고한다. run_fn이 던지는 예외(CodexStalled 등)는 그대로 전파된다.
+    """
+    if heartbeat is None:
+        return run_fn(None)
+    try:
+        kind, unit = heartbeat.get_context()
+    except Exception:  # noqa: BLE001
+        kind, unit = None, None
+    kind = kind or default_kind
+    try:
+        handle = heartbeat.start(kind, unit, idle_timeout=idle_timeout)
+    except Exception:  # noqa: BLE001 — 텔레메트리 실패 → 그냥 실행(하트비트 없이)
+        return run_fn(None)
+
+    def on_event(summary):
+        try:
+            heartbeat.beat(handle, summary)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        return run_fn(on_event)
+    finally:
+        try:
+            heartbeat.finish(handle)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class CodexClient:
     """`codex exec`를 한 턴 돌려 최종 텍스트를 반환하는 LLMClient.
 
@@ -431,6 +531,8 @@ class CodexClient:
         idle_timeout: float | None = None,
         max_duration: float | None = None,
         stall_retries: int = 0,
+        heartbeat=None,
+        default_call_kind: str | None = None,
         **default_opts,
     ):
         self.model = model
@@ -439,6 +541,10 @@ class CodexClient:
         self.idle_timeout = idle_timeout
         self.max_duration = max_duration
         self.stall_retries = stall_retries
+        # WO#55: 라이브 하트비트 sink(HeartbeatWriter, duck-typed). None이면 텔레메트리 off(무회귀).
+        # call_kind/unit은 루프가 set_context로 깔고 _run이 읽는다. default_call_kind는 폴백.
+        self.heartbeat = heartbeat
+        self.default_call_kind = default_call_kind
         self.default_opts = default_opts  # 향후 플래그 확장용으로 보존
         # 직전 호출의 token usage(WO#33). 미노출/파싱 실패면 None(날조 금지).
         self.last_usage: Usage | None = None
@@ -461,14 +567,20 @@ class CodexClient:
     # ── 테스트 seam: 실제 subprocess 실행은 공유 헬퍼로 격리 ────────────
     def _run(self, prompt: str) -> str:
         # 생성(읽기전용) 용도 → read-only sandbox. workdir 미지정이면 헬퍼가 격리.
-        text, usage = exec_codex_with_usage(
-            prompt,
-            sandbox="read-only",
-            cwd=self.workdir,
-            model=self.model,
-            idle_timeout=self.idle_timeout,
-            max_duration=self.max_duration,
-            stall_retries=self.stall_retries,
+        def call(on_event):
+            return exec_codex_with_usage(
+                prompt,
+                sandbox="read-only",
+                cwd=self.workdir,
+                model=self.model,
+                idle_timeout=self.idle_timeout,
+                max_duration=self.max_duration,
+                stall_retries=self.stall_retries,
+                on_event=on_event,
+            )
+
+        text, usage = heartbeat_wrapped(
+            self.heartbeat, self.default_call_kind, self.idle_timeout, call
         )
         self.last_usage = usage  # 읽기만 — sandbox 권한 불변
         return text
