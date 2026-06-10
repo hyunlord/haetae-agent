@@ -771,6 +771,79 @@ def test_dashboard_html_distinguishes_order_from_goal():
     assert "합성 goal과 별개" in html
 
 
+# ──────────────────── WO#58 이어가기(②a) + 계보 (read-only 표시 + launch 배선) ────────────────────
+
+
+def test_build_run_argv_continuation_adds_continue_from_and_skips_scaffold(tmp_path: Path):
+    """parent_run_dir 주어지면 --continue-from 부착 + scaffold 강제 OFF(opts 무시)."""
+    opts = validate_options({"scaffold": True})  # scaffold on이어도
+    parent = tmp_path / "runs" / "parent"
+    argv = build_run_argv("delta order", tmp_path / "runs" / "child", opts, parent_run_dir=parent)
+    assert "--continue-from" in argv
+    assert argv[argv.index("--continue-from") + 1] == str(parent)
+    assert "--no-scaffold" in argv      # 이어가기 = scaffold 스킵
+    assert "--scaffold" not in argv
+
+
+def test_launch_with_parent_records_lineage_and_argv(tmp_path: Path):
+    """launch(parent_run_id)가 meta에 계보 + argv에 --continue-from을 남긴다(spawn은 mock)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    # 부모 run 디렉터리(state.yaml 존재해야 유효).
+    pdir = rm.runs_dir / "20260610-090000-parent"
+    pdir.mkdir(parents=True)
+    (pdir / "state.yaml").write_text("spec_ref: x\nspec_version: 1\nstatus: done\n", encoding="utf-8")
+    with mock.patch("haetae.dashboard.subprocess.Popen") as mp:
+        mp.return_value = mock.Mock(pid=4321)
+        child_id = rm.launch("세일 모드 추가", {}, parent_run_id="20260610-090000-parent")
+    meta = json.loads((rm.runs_dir / child_id / "meta.json").read_text(encoding="utf-8"))
+    assert meta["parent_run_id"] == "20260610-090000-parent"
+    assert "--continue-from" in meta["argv"]
+
+
+def test_launch_parent_not_found_raises(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    with pytest.raises(ValueError, match="parent run not found"):
+        rm.launch("x", {}, parent_run_id="20260610-000000-ghost")
+
+
+def test_launch_parent_traversal_rejected(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    with pytest.raises(ValueError):
+        rm.launch("x", {}, parent_run_id="../../etc")
+
+
+def test_list_runs_exposes_parent_run_id(tmp_path: Path):
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    d = rm.runs_dir / "20260610-100000-child"
+    d.mkdir(parents=True)
+    (d / "meta.json").write_text(
+        json.dumps({"id": "20260610-100000-child", "order": "child", "status": "finished",
+                    "started_at": "2026-06-10T10:00:00Z", "parent_run_id": "20260610-090000-parent"}),
+        encoding="utf-8",
+    )
+    runs = {r["id"]: r for r in rm.list_runs()}
+    assert runs["20260610-100000-child"]["parent_run_id"] == "20260610-090000-parent"
+
+
+def test_spec_path_for_autodetects_sidecar(tmp_path: Path):
+    """spec.yaml 사이드카(WO#58)가 있으면 spec_path_for가 집고, 없으면 None."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    d = rm.runs_dir / "20260610-110000-r"
+    d.mkdir(parents=True)
+    assert rm.spec_path_for("20260610-110000-r") is None  # 사이드카 없음
+    (d / "spec.yaml").write_text("spec_id: x\n", encoding="utf-8")
+    assert rm.spec_path_for("20260610-110000-r") == d / "spec.yaml"
+
+
+def test_dashboard_html_has_lineage_and_continue():
+    """사이드바 계보 표기(↳ 이어감) + 이어가기 액션 + parent_run_id 전송 로직이 존재."""
+    html = _dashboard_html()
+    assert "function continueFrom" in html        # 이어가기 액션
+    assert "parent_run_id" in html                 # launch body에 부모 전송
+    assert "이어감" in html                         # 계보 표기(↳ 이어감)
+    assert "PARENT_FOR_NEW" in html                # 다음 launch 부모 추적
+
+
 # ──────────────────── 서버 엔드포인트 ────────────────────
 
 

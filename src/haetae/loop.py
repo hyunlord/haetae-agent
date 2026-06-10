@@ -274,6 +274,17 @@ def _save_state(state: State, state_path: str | Path) -> None:
     )
 
 
+def _save_spec(spec: ProjectSpec, state_path: str | Path) -> None:
+    """검증된 spec을 state.yaml *옆* spec.yaml에 기록(WO#58 사이드카 토대).
+
+    state.yaml 스키마는 불변 — spec은 별 파일. 이어가기(②a)의 부모 컨텍스트 원천이자,
+    대시보드 spec 보강(goal/done_when/유닛 desc)의 자동탐지 대상. 호출부에서 best-effort로 감싼다.
+    """
+    Path(Path(state_path).parent / "spec.yaml").write_text(
+        spec.to_yaml(), encoding="utf-8"
+    )
+
+
 # ──────────────────────────── graceful stop (WO#43) ────────────────────────────
 
 # 웹 stop(#37)이 보내는 SIGINT/Ctrl-C가 KeyboardInterrupt로 올라올 때 남기는 한 줄.
@@ -388,6 +399,8 @@ def run_loop(
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
+    synth_context: str | None = None,
+    seeded: bool = False,
     skills_dir: str | Path | None = None,
     pricing: dict | None = None,
     clock: Callable[[], str] | None = None,
@@ -467,6 +480,19 @@ def run_loop(
             _save_state(state, state_path)
         except Exception as e:  # noqa: BLE001 — 저장 실패는 run을 죽이면 안 된다
             emit(f"⚠ state 저장 실패: {state_path} ({e}) — run은 정상 완료됨")
+
+    def save_spec(spec_obj: ProjectSpec) -> None:
+        """검증된 spec을 spec.yaml 사이드카로 best-effort 기록(WO#58). 실패해도 run 진행.
+
+        합성 직후 + governed spec-change 후 호출 → 이어가기(②a) 부모 컨텍스트·대시보드
+        spec 보강의 원천. state_path 없으면 no-op(스키마/state 동작 불변).
+        """
+        if state_path is None:
+            return
+        try:
+            _save_spec(spec_obj, state_path)
+        except Exception as e:  # noqa: BLE001 — 사이드카 쓰기 실패는 run을 죽이지 않는다
+            emit(f"⚠ spec.yaml 사이드카 저장 실패 ({e}) — run은 정상 진행")
 
     # ── 계측 헬퍼(WO#33) — 전부 best-effort: 어떤 예외도 run을 죽이지 않는다 ──────
     def now() -> str | None:
@@ -608,12 +634,14 @@ def run_loop(
         try:
             if critic_client is not None:
                 # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
+                # synth_context(이어가기 ②a)는 *합성기에만* 주입 — critique_spec엔 안 감(적대 분리).
                 spec, critique = synthesize_with_critique(
                     order, m_client, m_critic,
+                    context=synth_context,
                     syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
                 )
             else:
-                spec = synthesize(order, m_client, prompt_path=syn_prompt)
+                spec = synthesize(order, m_client, context=synth_context, prompt_path=syn_prompt)
         except SynthesisError as e:
             state = _escalated_no_spec(
                 "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
@@ -632,9 +660,12 @@ def run_loop(
         # 피드백 채널로 *바운드 1회* 보정 → DAG 말단 직렬화 → 통합 시점 머지 충돌 근본 차단.
         # deps만 바꾸고 criteria/done_when 불변. best-effort(실패→원본 진행). 비용은 아래 drain.
         hb("합성")
-        spec = nudge_integration_deps(order, spec, m_client, prompt_path=syn_prompt)
+        spec = nudge_integration_deps(
+            order, spec, m_client, context=synth_context, prompt_path=syn_prompt
+        )
 
         state = _init_state(spec)
+        save_spec(spec)  # WO#58: 검증된 spec을 spec.yaml 사이드카로(이어가기·대시보드 보강 원천)
         record_transition(STAGE_SYNTHESIZE)
         # 합성/critic/통합-deps 넛지(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
         account(combine_costs(m_client.drain()))
@@ -708,6 +739,7 @@ def run_loop(
                 scaffold=scaffold,
                 install_deps=install_deps,
                 deps_runner=deps_runner,
+                seeded=seeded,
                 apply_skills=apply_skills,
                 pricing=pricing,
                 now=now,
@@ -735,6 +767,11 @@ def run_loop(
             if scaffold.install and install_deps:
                 res = ensure_deps(wd, runner=deps_runner)
                 emit(f"scaffold host-install: {res.manager} ok={res.ok}")
+        elif seeded and install_deps:
+            # 이어가기(②a): scaffold는 스킵하되 *시딩된 package.json*에 deps는 host-install
+            # (node_modules는 시딩 안 됨). #23 패턴 — sandbox 불변, non-fatal.
+            res = ensure_deps(Path(workdir or "."), runner=deps_runner)
+            emit(f"이어가기 host-install(시딩된 deps): {res.manager} ok={res.ok}")
 
         last_result = "(시작 — 아직 실행 없음)"
         # WO#25 Part A: 직전에 dispatch한 작업 유닛. brain이 다른 유닛으로 넘어가면(advance)
@@ -922,6 +959,7 @@ def run_loop(
                     )
                     emit(f"spec 변경 적용: {proposal.target} (v{spec.version})")
                     try_save()  # 증분: spec 변경도 즉시 보존(비치명적)
+                    save_spec(spec)  # WO#58: 갱신된 spec도 사이드카에 반영(라운드트립 최신 유지)
                     last_result = f"(spec-change applied — {outcome.reason})"
                 else:
                     account(replan_cost)
@@ -1003,6 +1041,7 @@ def _parallel_loop(
     scaffold: Scaffold | None = None,
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
+    seeded: bool = False,
     apply_skills: Callable[[NextOrder], NextOrder] = lambda o: o,
     pricing: dict | None = None,
     now: Callable[[], str | None] = lambda: None,
@@ -1335,9 +1374,10 @@ def _parallel_loop(
                         if order is None:  # escalate/stop/replan-소진 → terminal 세팅됨
                             break
                         wt = wm.create(u)
-                        # 선제 스캐폴드: executor dispatch *전에* node_modules를 worktree에 준비.
-                        # (gitignore라 git 상속 못 함 → main에서 symlink/copy, 없으면 host-install 폴백.)
-                        if scaffold is not None and scaffold.install and install_deps:
+                        # 선제 스캐폴드(또는 이어가기 시딩): executor dispatch *전에* node_modules를
+                        # worktree에 준비. (gitignore라 git 상속 못 함 → main에서 symlink/copy,
+                        # 없으면 host-install 폴백.) WO#58: seeded면 부모 package.json 기준 동일 준비.
+                        if ((scaffold is not None and scaffold.install) or seeded) and install_deps:
                             how = prepare_worktree_deps(
                                 wm.workdir, wt,
                                 ensure_deps_fn=lambda p: ensure_deps(p, runner=deps_runner),

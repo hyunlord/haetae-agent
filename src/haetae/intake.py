@@ -15,7 +15,7 @@ from typing import Any
 import yaml
 
 from haetae.llm import LLMClient
-from haetae.models import ProjectSpec
+from haetae.models import ProjectSpec, State
 from haetae.parsing import ParseError, parse_yaml_model
 
 DEFAULT_PROMPT_PATH = "prompts/synthesizer.md"
@@ -283,3 +283,72 @@ def nudge_integration_deps(
     except Exception:  # noqa: BLE001 — 넛지는 advisory: 어떤 실패도 run을 막지 않는다(원본 진행)
         return spec
     return _adopt_deps_only(spec, restructured)
+
+
+# ──────────────────── WO#58: 이어가기(②a) 증분 합성 context 빌더 ────────────────────
+#
+# 완료된 부모 run 위에서 *이어서* 새 run을 돌릴 때, 부모의 코드는 이미 workdir에
+# 시딩돼 있다. 합성기에게 "처음부터 다시 짓지 말고 delta만 계획하라"를 알리는 context를
+# 만든다. **이 context는 합성기/빌더에만 간다 — judge·run-judge·critic엔 절대 안 간다**
+# (적대적 분리: 부모 done을 맹신 않음, 최종 통합 gate가 합쳐진 결과를 그대로 판정).
+#
+# **anti-erosion**: 문구는 "확장하라"지 "완화하라"가 아니다. 부모 done_when/criteria를
+# 약화하지 말라고 *명시*한다. 새 spec은 기존 spec critic(#20)이 그대로 검증한다.
+
+
+def build_continuation_context(
+    parent_spec: ProjectSpec | None,
+    parent_state: State | None = None,
+    *,
+    parent_order: str | None = None,
+) -> str:
+    """부모 spec/완료상태 → 증분 합성 context 문자열(합성기 전용, judge 무주입).
+
+    parent_spec이 있으면 goal/constraints/done_when/decomposition 요약을 싣고, 없으면
+    (사이드카 없는 옛 부모 run) parent_order로 degrade한다. parent_state가 있으면 유닛별
+    완료상태와 종료 status를 덧붙인다. anti-erosion: 기준 *확장*만 허용을 명시한다.
+    """
+    lines: list[str] = [
+        "# 프로젝트 이어가기 (증분 — greenfield 아님)",
+        "이 프로젝트는 이미 작업 디렉터리에 존재한다(이전 run의 최종 결과가 시딩됨).",
+        "아래 새 주문이 요구하는 *delta(추가/변경)*만 계획·빌드하라 — 이미 만들어진 것을 "
+        "처음부터 다시 짓지 마라. 기존 파일을 헐지 말고 그 위에 기능을 더하라.",
+        "",
+        "## 이전(부모) 프로젝트 요약",
+    ]
+    if parent_spec is not None:
+        lines.append(f"- goal: {parent_spec.goal}")
+        lines.append(f"- done_when: {parent_spec.done_when}")
+        if parent_spec.constraints:
+            lines.append(f"- constraints: {'; '.join(parent_spec.constraints)}")
+        if parent_spec.non_goals:
+            lines.append(f"- non_goals: {'; '.join(parent_spec.non_goals)}")
+        if parent_spec.decomposition:
+            lines.append("- 이미 구현(또는 계획)된 유닛:")
+            for u in parent_spec.decomposition:
+                status = ""
+                if parent_state is not None:
+                    pi = next((p for p in parent_state.plan if p.unit == u.unit), None)
+                    if pi is not None:
+                        status = f" [{pi.state.value}]"
+                desc = (u.desc or "").strip()
+                lines.append(f"  - {u.unit}{(': ' + desc) if desc else ''}{status}")
+    elif parent_order:
+        # 사이드카(spec.yaml) 없는 옛 부모 — 원 주문으로 degrade(여전히 증분 신호 제공).
+        lines.append(f"- 이전 주문(원문): {parent_order}")
+    else:
+        lines.append("- (부모 spec 요약 없음 — 시딩된 코드가 현재 상태의 단일 근거다)")
+
+    if parent_state is not None:
+        lines.append(f"- 이전 run 종료 상태: {parent_state.status.value}")
+
+    lines += [
+        "",
+        "## 증분 규칙 (중요 · 위반 금지)",
+        "- 새 acceptance_criteria/done_when은 부모 기준을 *확장*하라 — **절대 약화/완화하지 마라**.",
+        "  (부모가 충족한 기준은 새 run에서도 계속 충족돼야 한다. 통합 gate가 합쳐진 결과를 판정한다.)",
+        "- 새 주문의 기능을 *추가*하는 방향으로만 분해하라(기존 동작 회귀 금지).",
+        "",
+        "# 새 주문(delta) — 아래가 이번에 추가/변경할 것이다",
+    ]
+    return "\n".join(lines)

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
@@ -53,6 +54,8 @@ def run(
     capability_registry_path: str | Path | None = None,
     capability_allowlist: list[str] | None = None,
     heartbeat=None,
+    synth_context: str | None = None,
+    seeded: bool = False,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -62,6 +65,8 @@ def run(
         gate,
         critic_client=critic_client,
         heartbeat=heartbeat,
+        synth_context=synth_context,
+        seeded=seeded,
         capabilities_on=capabilities_on,
         capability_registry_path=capability_registry_path,
         capability_allowlist=capability_allowlist,
@@ -104,6 +109,144 @@ def _load_pricing(path: str | None) -> dict | None:
     except Exception as e:  # noqa: BLE001 — 가격표 로드 실패는 계측만 비활성(run 진행)
         print(f"… 가격표 로드 실패({path}): {e} — usd 미계산으로 진행", file=sys.stderr)
         return None
+
+
+# ──────────────────── WO#58: 이어가기(②a) — 부모 해석·시딩·계보 ────────────────────
+
+
+class ContinuationError(RuntimeError):
+    """이어가기 부모 해석/시딩 실패. **명시적 요청이므로 조용한 폴백 아님** — 명확히 멈춘다."""
+
+
+def resolve_parent_dir(continue_from: str, runs_dir: str | Path = "runs") -> Path:
+    """`--continue-from` 값을 부모 run 디렉터리로 해석.
+
+    값이 (a) state.yaml을 가진 디렉터리면 그대로, (b) 아니면 runs_dir/<run-id>로 시도.
+    둘 다 아니면 ContinuationError(명확한 에러). 부모는 명시적 입력이라 폴백 없음.
+    """
+    cand = Path(continue_from)
+    if (cand / "state.yaml").exists():
+        return cand
+    by_id = Path(runs_dir) / continue_from
+    if (by_id / "state.yaml").exists():
+        return by_id
+    raise ContinuationError(
+        f"부모 run을 찾을 수 없음: {continue_from!r} "
+        f"(디렉터리도 runs-dir({runs_dir})/<run-id>도 state.yaml 없음)"
+    )
+
+
+def _git_tracked_files(repo: Path) -> list[str] | None:
+    """부모 workdir이 git repo면 *추적 파일*(node_modules 등 gitignore 제외) 목록, 아니면 None."""
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if top.returncode != 0:
+            return None
+        ls = subprocess.run(
+            ["git", "-C", str(repo), "ls-files"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if ls.returncode != 0:
+            return None
+        return [ln for ln in ls.stdout.splitlines() if ln.strip()]
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# git 미사용 폴백 복사 시 제외할 노이즈(시딩하면 안 되는 것들).
+_SEED_EXCLUDE = {".git", "node_modules", ".venv", "venv", "__pycache__",
+                 ".pytest_cache", "dist", "build", ".haetae-worktrees"}
+
+
+def seed_workdir_from_parent(parent_work: Path, new_work: Path) -> int:
+    """부모 최종 트리를 새 workdir에 시딩(추적 파일만, node_modules 등 제외). 복사한 파일 수 반환.
+
+    1순위: git ls-files(부모 main HEAD의 *committed/추적* 파일) — gitignore 자동 존중.
+    폴백: git 아니면 _SEED_EXCLUDE 제외 재귀 복사. 새 worktree refs/히스토리는 안 끌고 옴
+    (ensure_repo가 새 baseline 커밋을 판다). 시딩 실패는 ContinuationError(이어가기 핵심).
+    """
+    import shutil
+
+    parent_work = Path(parent_work)
+    new_work = Path(new_work)
+    if not parent_work.is_dir():
+        raise ContinuationError(f"부모 workdir 없음: {parent_work}")
+    new_work.mkdir(parents=True, exist_ok=True)
+
+    tracked = _git_tracked_files(parent_work)
+    copied = 0
+    if tracked is not None:
+        for rel in tracked:
+            src = parent_work / rel
+            if not src.is_file():
+                continue  # 삭제 대기/서브모듈 등은 스킵
+            dst = new_work / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+        return copied
+    # 폴백: 비-git 부모 — 노이즈 제외 재귀 복사.
+    for src in parent_work.rglob("*"):
+        if any(part in _SEED_EXCLUDE for part in src.relative_to(parent_work).parts):
+            continue
+        if src.is_file():
+            dst = new_work / src.relative_to(parent_work)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+    return copied
+
+
+def _write_lineage(state_path: str | Path, parent_run_id: str) -> None:
+    """계보(parent_run_id)를 state.yaml 옆 lineage.json 사이드카에 best-effort 기록(append-only 감사)."""
+    try:
+        import json
+        p = Path(state_path).parent / "lineage.json"
+        p.write_text(json.dumps({"parent_run_id": parent_run_id}, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — 계보 기록 실패가 run을 죽이지 않는다(best-effort 영속화)
+        pass
+
+
+def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str | Path):
+    """부모 해석 + 새 workdir 시딩 + 증분 context 구성. 반환 (synth_context, parent_dir, seeded_n).
+
+    부모 못 찾음/시딩 실패는 ContinuationError(명확). spec.yaml 없으면 meta order로 degrade.
+    judge·critic엔 절대 안 가는 context(합성기 전용)만 만든다 — 호출부가 run(synth_context=)로 전달.
+    """
+    from haetae.intake import build_continuation_context
+    from haetae.models import ProjectSpec, State as _State
+
+    parent_dir = resolve_parent_dir(continue_from, runs_dir)
+    parent_work = parent_dir / "work"
+    # 부모 workdir이 없으면(레이아웃 다름) 부모 디렉터리 자체를 시딩원으로 폴백.
+    seed_src = parent_work if parent_work.is_dir() else parent_dir
+    seeded_n = seed_workdir_from_parent(seed_src, Path(new_workdir))
+
+    parent_spec = None
+    sp = parent_dir / "spec.yaml"
+    if sp.exists():
+        try:
+            parent_spec = ProjectSpec.from_yaml(sp)
+        except Exception:  # noqa: BLE001 — 깨진 사이드카는 degrade(order로)
+            parent_spec = None
+    parent_state = None
+    try:
+        parent_state = _State.from_yaml(parent_dir / "state.yaml")
+    except Exception:  # noqa: BLE001
+        parent_state = None
+    parent_order = None
+    try:
+        import json
+        meta = json.loads((parent_dir / "meta.json").read_text(encoding="utf-8"))
+        parent_order = meta.get("order")
+    except Exception:  # noqa: BLE001
+        parent_order = None
+
+    ctx = build_continuation_context(parent_spec, parent_state, parent_order=parent_order)
+    return ctx, parent_dir, seeded_n
 
 
 def format_summary(state: State) -> str:
@@ -191,6 +334,22 @@ def main(argv: list[str] | None = None) -> int:
         help="실행자 (기본: human=사람 릴레이). codex=자율 쓰기 실행(opt-in)",
     )
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
+    parser.add_argument(
+        "--continue-from",
+        default=None,
+        metavar="RUN",
+        help=(
+            "이어가기(②a): 완료된 부모 run 위에서 *증분*으로 새 run을 돈다. 값은 부모 run "
+            "디렉터리 경로 또는 --runs-dir 아래 run-id. 부모 최종 코드를 workdir에 시딩 + "
+            "scaffold 스킵 + 부모 spec/완료요약을 합성기 context로 주입(delta 계획). "
+            "judge엔 부모 context 무주입(적대 분리)·기준 약화 금지(anti-erosion)."
+        ),
+    )
+    parser.add_argument(
+        "--runs-dir",
+        default="runs",
+        help="--continue-from을 run-id로 줄 때 부모를 찾을 베이스 디렉터리 (기본 runs/).",
+    )
     parser.add_argument("--max-iters", type=int, default=30, help="최대 루프 횟수 (기본 30)")
     parser.add_argument(
         "--unit-retries",
@@ -398,6 +557,28 @@ def main(argv: list[str] | None = None) -> int:
     # 골격을 내고 아니면 자동 스킵(auto). 호스트 install은 --install-deps 토글을 공유한다.
     scaffold_client = client if args.scaffold else None
 
+    # ── 이어가기(②a, WO#58): 부모 해석 + workdir 시딩 + 증분 context ──
+    # 명시적 요청이라 실패는 명확한 에러(조용한 폴백 아님). scaffold는 스킵(스택 이미 존재).
+    synth_context: str | None = None
+    seeded = False
+    if args.continue_from:
+        try:
+            ctx, parent_dir, seeded_n = load_continuation(
+                args.continue_from, args.runs_dir, args.workdir
+            )
+        except ContinuationError as e:
+            print(f"이어가기 실패: {e}", file=sys.stderr, flush=True)
+            return 2  # 명확한 에러(조용한 폴백 아님) — 부모는 명시적 입력
+        synth_context = ctx
+        seeded = True
+        scaffold_client = None  # 이어가기 = scaffold 스킵(스택 이미 시딩됨)
+        if args.state_path:
+            _write_lineage(args.state_path, parent_dir.name)  # 계보 사이드카(best-effort)
+        print(
+            f"… 이어가기: 부모 {parent_dir.name}에서 {seeded_n}개 파일 시딩 + scaffold 스킵 + 증분 합성",
+            file=sys.stderr, flush=True,
+        )
+
     # 스킬 주입(빌더 전용): --skills(기본 on)면 --skills-dir에서 로드. --no-skills면 None.
     skills_dir = args.skills_dir if args.skills else None
 
@@ -432,6 +613,8 @@ def main(argv: list[str] | None = None) -> int:
             skills_dir=skills_dir,
             pricing=pricing,
             heartbeat=heartbeat,
+            synth_context=synth_context,
+            seeded=seeded,
             capabilities_on=args.capabilities,
             # opt-in: --capabilities일 때만 레지스트리/allowlist를 넘긴다(OFF면 no-op).
             capability_registry_path=(args.capability_registry if args.capabilities else None),

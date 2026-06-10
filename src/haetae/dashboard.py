@@ -868,10 +868,15 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def build_run_argv(order: str, run_dir: Path, opts: dict[str, Any]) -> list[str]:
+def build_run_argv(
+    order: str, run_dir: Path, opts: dict[str, Any], parent_run_dir: Path | None = None
+) -> list[str]:
     """서브프로세스 argv 리스트 — shell 아님, order는 단일 argv 원소, 경로는 서버 생성.
 
     workdir/state-path를 runs/<id>/ 아래로 강제(사용자 입력 경로 안 받음 → traversal 차단).
+
+    parent_run_dir(WO#58 이어가기 ②a): 주어지면 `--continue-from <부모 dir>`를 부착하고
+    **scaffold를 강제 OFF**(스택은 시딩으로 이미 존재). 부모 경로는 서버가 해석한 절대 경로.
     """
     argv = [
         sys.executable, "-m", "haetae.run",
@@ -884,7 +889,11 @@ def build_run_argv(order: str, run_dir: Path, opts: dict[str, Any]) -> list[str]
         "--max-iters", str(opts["max_iters"]),
         "--unit-retries", str(opts["unit_retries"]),
     ]
-    argv.append("--scaffold" if opts["scaffold"] else "--no-scaffold")
+    if parent_run_dir is not None:
+        argv += ["--continue-from", str(parent_run_dir)]
+        argv.append("--no-scaffold")  # 이어가기: 스택 이미 시딩 → scaffold 스킵(opts 무시)
+    else:
+        argv.append("--scaffold" if opts["scaffold"] else "--no-scaffold")
     argv.append("--skills" if opts["skills"] else "--no-skills")
     if opts["critic_model"]:
         argv += ["--critic-model", opts["critic_model"]]
@@ -927,6 +936,13 @@ class RunManager:
         if not valid_run_id(run_id):
             return None
         return self.run_dir(run_id) / "state.yaml"
+
+    def spec_path_for(self, run_id: str) -> Path | None:
+        """spec.yaml 사이드카(WO#58) 자동탐지 → goal/done_when/유닛 desc 보강. 없으면 None."""
+        if not valid_run_id(run_id):
+            return None
+        sp = self.run_dir(run_id) / "spec.yaml"
+        return sp if sp.exists() else None
 
     # ── 라이브 작업 로그 tail (WO#42 C) — read-only, 경로 안전, bounded ──
     def read_log_tail(self, run_id: str, tail: int | str | None = None) -> dict[str, Any]:
@@ -1010,18 +1026,34 @@ class RunManager:
             n += 1
         return run_id
 
-    def launch(self, order: str | None, options: dict[str, Any] | None = None) -> str:
+    def launch(
+        self,
+        order: str | None,
+        options: dict[str, Any] | None = None,
+        parent_run_id: str | None = None,
+    ) -> str:
         """입력 검증 → run-id 생성 → runs/<id>/ 생성 → spawn. run-id 반환.
 
         order는 단일 argv 원소로 전달(shell 보간 없음). 옵션은 화이트리스트 통과만.
+
+        parent_run_id(WO#58 이어가기 ②a): 주어지면 부모 run-id를 검증(traversal 차단 +
+        존재 확인)하고 `--continue-from <부모 dir>`로 spawn(scaffold 강제 OFF), meta에 계보 기록.
+        부모 없음/잘못된 id는 ValueError(명확한 에러).
         """
         if not order or not isinstance(order, str) or not order.strip():
             raise ValueError("order must be a non-empty string")
         opts = validate_options(options)
+        parent_run_dir: Path | None = None
+        if parent_run_id:
+            if not valid_run_id(parent_run_id):  # traversal 차단(../ 등)
+                raise ValueError("parent_run_id has invalid characters")
+            parent_run_dir = self.run_dir(parent_run_id)
+            if not (parent_run_dir / "state.yaml").exists():
+                raise ValueError(f"parent run not found: {parent_run_id}")
         run_id = self._unique_run_id(order)
         rdir = self.run_dir(run_id)
         (rdir / "work").mkdir(parents=True, exist_ok=True)
-        argv = build_run_argv(order, rdir, opts)
+        argv = build_run_argv(order, rdir, opts, parent_run_dir=parent_run_dir)
         # stdout/stderr → runs/<id>/run.log (장수명 핸들 — 런 동안 유지, 종료 시 close).
         logf = open(rdir / "run.log", "wb")  # noqa: SIM115
         try:
@@ -1035,6 +1067,8 @@ class RunManager:
             "id": run_id, "order": order, "options": opts,
             "started_at": started_at, "status": "running", "argv": argv,
         }
+        if parent_run_id:
+            meta["parent_run_id"] = parent_run_id  # WO#58 계보(append-only 감사·대시보드 트리)
         self._write_meta(rdir, meta)
         with self._lock:
             self._runs[run_id] = {
@@ -1139,6 +1173,7 @@ class RunManager:
                 "options": meta.get("options"),
                 "started_at": meta.get("started_at"),
                 "status": self.status_of(d.name, meta),
+                "parent_run_id": meta.get("parent_run_id"),  # WO#58 계보(없으면 None)
             })
         out.sort(key=lambda r: r.get("started_at") or "", reverse=True)
         return out
@@ -1209,7 +1244,9 @@ def make_handler(
             if run:
                 sp = run_manager.state_path_for(run) if run_manager else None
                 err = None if sp is not None else "invalid run id"
-                return (sp, None, err)
+                # WO#58: spec.yaml 사이드카 자동탐지 → goal/done_when/유닛 desc 보강(없으면 기존 동작).
+                spec_p = run_manager.spec_path_for(run) if (run_manager and sp is not None) else None
+                return (sp, spec_p, err)
             return (state_path, spec_path, None)
 
         def _stream(
@@ -1314,7 +1351,10 @@ def make_handler(
                 self._send_json(400, {"error": "invalid JSON body"})
                 return
             try:
-                run_id = run_manager.launch(body.get("order"), body.get("options"))
+                run_id = run_manager.launch(
+                    body.get("order"), body.get("options"),
+                    parent_run_id=body.get("parent_run_id"),  # WO#58 이어가기(②a)
+                )
             except ValueError as e:
                 self._send_json(400, {"error": str(e)})  # 화이트리스트/범위/빈 order 거부
                 return

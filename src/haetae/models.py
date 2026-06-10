@@ -219,6 +219,17 @@ class ProjectSpec(BaseModel):
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.model_validate(data)
 
+    def to_yaml(self) -> str:
+        """검증된 spec을 YAML 문자열로 직렬화(사이드카 영속화·라운드트립용, WO#58).
+
+        스키마 추가가 아니라 단순 덤프 헬퍼. from_yaml과 라운드트립 가능.
+        """
+        return yaml.safe_dump(
+            self.model_dump(by_alias=True, mode="json"),
+            allow_unicode=True,
+            sort_keys=False,
+        )
+
 
 # ──────────────────────────── State 하위 모델 ────────────────────────────
 

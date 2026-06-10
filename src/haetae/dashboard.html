@@ -54,6 +54,13 @@
   .run-row.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
   .run-row .rid { font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:.01em; }
   .run-row .rorder { color:var(--mut); font-size:11px; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* WO#58 계보(이어가기) — 자식 row 들여쓰기 + ↳ 부모 점프 */
+  .run-row.child { margin-left:14px; border-left:2px solid var(--accent); }
+  .run-row .rlineage { width:100%; font-size:10.5px; color:var(--mut2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .run-row .rlineage a { color:var(--accent); text-decoration:none; cursor:pointer; }
+  .run-row .cont-btn { font-size:10px; padding:1px 6px; }
+  .continue-note { background:#10233a; border:1px solid #1d4e6a; color:#cfe6ff; border-radius:6px; padding:8px 10px; font-size:12px; }
+  .continue-note b { color:#eaf4ff; }
   .rbadge { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px; text-transform:uppercase; letter-spacing:.05em; }
   .r-running{background:#1e3a8a;color:#bfdbfe} .r-finished{background:#14532d;color:#bbf7d0}
   .r-stopped{background:#3f3f46;color:#e4e4e7} .r-failed{background:#7f1d1d;color:#fecaca} .r-unknown{background:#451a03;color:#fed7aa}
@@ -408,6 +415,8 @@
     </div>
     <div class="modal-body">
       <div id="run-form" class="run-form">
+        <!-- WO#58 이어가기: 부모가 설정되면 노출(증분 — 부모 코드 위에서 delta) -->
+        <div id="continue-note" class="continue-note" style="display:none"></div>
         <textarea id="f-order" placeholder="work order / 주문 원문 (예: '리테일 흐름 시뮬레이션을 만들어라 …')"></textarea>
         <div class="opts">
           <span class="opt"><label>executor</label>
@@ -441,6 +450,7 @@ const ALLOW_RUN = __ALLOW_RUN__;   // 제어 표면 활성 여부(--allow-run). 
 let SEL = null;       // 선택된 유닛 id
 let RUN = null;       // 뷰어가 타겟팅하는 run id (null = 기본 --state-path 뷰)
 let RUNS = [];        // 최근 /api/runs 목록 캐시(원 주문 매칭용 client-side join, WO#57)
+let PARENT_FOR_NEW = null;  // 다음 launch의 부모 run id(이어가기 ②a, WO#58). 평소 null.
 let VIEW = null;
 let es = null;        // 현재 EventSource(타겟 바뀌면 재연결)
 let sseConnected = false;
@@ -559,21 +569,36 @@ function renderRuns(payload){
     ? ($("ctl-state").textContent || "제어 활성 (+ 새 run / 정지 가능)")
     : "제어 비활성 (--allow-run으로 켜기 · 읽기 전용)";
   const list = $("runs-list");
+  const orderOf = (id)=>{ const p=findRun(id); return p && p.order; };  // 부모 주문(계보 표기)
   list.innerHTML = runs.length ? runs.map(r=>{
     const st = r.status||"unknown";
     const canStop = ALLOW_RUN && st==="running";
-    return '<div class="run-row'+(RUN===r.id?" sel":"")+'" data-id="'+esc(r.id)+'">'
+    const pid = r.parent_run_id;  // WO#58 계보 — 있으면 자식(이어가기) row
+    const lineage = pid
+      ? '<span class="rlineage" title="'+escA("부모 "+pid+": "+(orderOf(pid)||""))+'">↳ 이어감: '
+        + '<a data-parent="'+esc(pid)+'">'+esc(orderOf(pid) || pid)+'</a></span>'
+      : '';
+    return '<div class="run-row'+(RUN===r.id?" sel":"")+(pid?" child":"")+'" data-id="'+esc(r.id)+'">'
       + '<span class="rid">'+esc(r.id)+'</span>'
       + '<span class="rbadge r-'+esc(st)+'">'+esc(RSTAT_KO[st]||st)+'</span>'
       + (canStop ? '<button class="btn danger stop-btn" data-id="'+esc(r.id)+'">정지</button>' : '')
+      + (ALLOW_RUN ? '<button class="btn cont-btn" data-cont="'+esc(r.id)+'" title="이 run의 결과 위에서 이어서 새 run">이어가기</button>' : '')
       + '<span class="rorder" title="'+escA(r.order||"")+'">'+esc(r.order||"")+'</span>'  // 한 줄 truncate 유지 + hover로 전문(WO#57)
+      + lineage
       + '</div>';
   }).join("") : '<div class="empty" style="padding:8px 6px">아직 run 없음'+(ALLOW_RUN?' — "+ 새 run"으로 시작':'')+'</div>';
   list.querySelectorAll(".run-row").forEach(row=>{
-    row.onclick = (e)=>{ if (e.target.classList.contains("stop-btn")) return; selectRun(row.dataset.id); };
+    row.onclick = (e)=>{
+      if (e.target.classList.contains("stop-btn") || e.target.classList.contains("cont-btn")) return;
+      if (e.target.dataset && e.target.dataset.parent){ e.stopPropagation(); selectRun(e.target.dataset.parent); return; }  // ↳ 부모로 점프
+      selectRun(row.dataset.id);
+    };
   });
   list.querySelectorAll(".stop-btn").forEach(b=>{
     b.onclick = (e)=>{ e.stopPropagation(); stopRun(b.dataset.id, b); };
+  });
+  list.querySelectorAll(".cont-btn").forEach(b=>{
+    b.onclick = (e)=>{ e.stopPropagation(); continueFrom(b.dataset.cont); };  // 이어가기(②a) 모달
   });
   renderRunOrder();  // 캐시 갱신 후 원 주문 블록도 최신 order로(선택 run 매칭)
 }
@@ -591,9 +616,27 @@ async function stopRun(id, btn){
   loadRuns();
 }
 // 폼 = 모달 오버레이(WO#49 B). show 시 provider 옵션·critic 경고 갱신.
-function showForm(show){
+// fresh=true(기본 새 run)면 부모(이어가기) 컨텍스트를 초기화. continueFrom은 fresh=false로 연다.
+function showForm(show, fresh){
+  if (show && fresh !== false){ PARENT_FOR_NEW = null; }
+  renderContinueNote();
   $("modal-overlay").classList.toggle("show", !!show);
   if (show){ renderProviderOpts(); updateCriticWarn(); setTimeout(()=>$("f-order").focus(), 30); }
+}
+// WO#58 이어가기(②a): 부모 run을 설정하고 모달을 연다(scaffold 스킵·증분 합성은 서버가 처리).
+function continueFrom(parentId){
+  PARENT_FOR_NEW = parentId;
+  showForm(true, false);   // fresh=false → 부모 유지
+}
+function renderContinueNote(){
+  const el = $("continue-note"); if (!el) return;
+  if (!PARENT_FOR_NEW){ el.style.display="none"; el.innerHTML=""; return; }
+  const ord = (findRun(PARENT_FOR_NEW)||{}).order || "";
+  el.style.display = "block";
+  el.innerHTML = '↳ <b>이어가기</b>: 부모 <code>'+esc(PARENT_FOR_NEW)+'</code> 결과 위에서 '
+    + '<b>증분(delta)</b>으로 빌드합니다(부모 코드 시딩·scaffold 스킵). '
+    + (ord ? '<br><span class="mut small">부모 주문: '+esc(ord)+'</span>' : '')
+    + '<br><span class="mut small">아래엔 *추가/변경할 것*만 적으세요. 부모 기준은 약화되지 않습니다.</span>';
 }
 
 // ── provider 옵션 디스크립터(WO#45) — 폼이 provider 선언을 읽어 렌더 ──
@@ -654,12 +697,15 @@ async function launchRun(){
     const v = (el.value || "").trim();
     if (v) options[o.name] = v;
   }
+  const body = {order, options};
+  if (PARENT_FOR_NEW) body.parent_run_id = PARENT_FOR_NEW;  // WO#58 이어가기(②a)
   const btn = $("launch-btn"); btn.disabled=true; btn.textContent="실행 중…";
   try {
     const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({order, options})});
+      body: JSON.stringify(body)});
     const data = await r.json();
     if (!r.ok){ errEl.textContent = (data && data.error) || ("실패 ("+r.status+")"); return; }
+    PARENT_FOR_NEW = null;  // 다음 새 run은 fresh
     showForm(false); $("f-order").value="";
     await loadRuns();
     selectRun(data.run_id);   // 새 run 뷰로 자동 전환(SSE 라이브)
