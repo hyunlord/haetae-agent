@@ -132,6 +132,11 @@ class DecompositionUnit(BaseModel):
     # disjoint한 scope를 가지면 worktree 머지가 깨끗(통합 벽 예방, #51의 형제 버전).
     # optional·비파괴: 없으면 빈 리스트(기존 spec 무영향, deps/capability_requests 패턴).
     scope: list[str] = Field(default_factory=list)
+    # WO#64: 반응형 tier 사다리의 *시작* 칸 힌트(예: "gpt-5.5:high"). 합성기가 "명백히
+    # 어려운" 유닛(복잡 알고리즘 등)을 싼 tier 대신 더 센 tier에서 *probe*하게 한다.
+    # 없으면 base=0(사다리 맨 앞=싼 tier). optional·비파괴(scope 패턴). 사다리 미지정이면
+    # 무시된다(단일 tier). bar는 불변 — 시작 강도만 바꾼다(anti-erosion).
+    start_tier: str = ""
 
 
 # ──────────────────── 능력 획득 거버넌스 (WO#53 Phase F.1) ────────────────────

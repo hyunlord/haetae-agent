@@ -17,6 +17,7 @@ import yaml
 from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_critic as critic_mod
 from haetae.capability import PocRunner, governed_capability_preflight
 from haetae.deps import Runner as DepsRunner, ensure_deps
+from haetae.executors import Tier, tier_label
 from haetae.intake import (
     SynthesisError,
     nudge_disjoint_scope,
@@ -93,8 +94,66 @@ from haetae.worktree import WorktreeError, WorktreeManager
 
 # 병렬 모드에서 worktree 경로를 받아 그 경로에 묶인 Executor/Gate를 만드는 팩토리.
 # (Executor/Gate는 생성 시 workdir이 고정되므로 unit마다 worktree로 다시 묶어야 한다.)
-ExecutorFactory = Callable[[Path], "Executor"]
+#
+# WO#64: executor_factory는 *선택적으로* tier 인자를 받는다 — `(wt)` 또는 `(wt, tier)`.
+# 2-arg 팩토리면 루프가 그 시도의 Tier(model/effort)를 넘겨 그 강도의 executor를 만든다.
+# 1-arg 팩토리(기존 전부)면 wt만 받는다(단일 tier·후방호환 — 661 무회귀). _build_executor가
+# 팩토리 arity를 보고 알아서 분기하므로 호출부는 항상 tier를 *제공만* 하면 된다.
+ExecutorFactory = Callable[..., "Executor"]
 GateFactory = Callable[[Path], "Gate"]
+
+
+def _factory_accepts_tier(factory: ExecutorFactory) -> bool:
+    """팩토리가 tier(2번째 위치 인자)를 받는지 시그니처로 판정(best-effort).
+
+    `(wt, tier)`/`*args`면 True, `(wt)`면 False. 시그니처를 못 읽으면(빌트인 등) False로
+    안전 폴백(기존 1-arg 경로). 이 덕에 기존 1-arg 팩토리(661 테스트)는 그대로 동작한다.
+    """
+    import inspect
+
+    try:
+        params = list(inspect.signature(factory).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+    positional = [
+        p for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 2
+
+
+def _build_executor(factory: ExecutorFactory, wt: Path, tier: Tier | None) -> "Executor":
+    """팩토리로 executor를 만든다. tier-aware(2-arg)면 tier를 넘기고, 아니면 wt만(후방호환).
+
+    tier=None(사다리 미지정)이거나 1-arg 팩토리면 항상 `factory(wt)` — 기존 동작 그대로.
+    """
+    if tier is not None and _factory_accepts_tier(factory):
+        return factory(wt, tier)
+    return factory(wt)
+
+
+def resolve_start_tier(start_tier: str, ladder: list[Tier]) -> int:
+    """유닛의 start_tier 힌트를 사다리 *시작 인덱스*로 해석한다(WO#64).
+
+    매칭 규칙(관대): start_tier 문자열이 어떤 tier의 'model:effort' / 'model/effort' /
+    'model'과 같으면 그 인덱스. 못 맞추거나 비어있으면 0(맨 앞=싼 tier — 비파괴).
+    cap = len(ladder)-1(상한 초과 금지). 사다리가 단일이면 항상 0.
+    """
+    s = (start_tier or "").strip()
+    if not s or len(ladder) <= 1:
+        return 0
+    for i, t in enumerate(ladder):
+        labels = {
+            f"{t.model}:{t.reasoning_effort}",
+            f"{t.model or '-'}/{t.reasoning_effort or '-'}",
+        }
+        if t.model:
+            labels.add(t.model)
+        if s in labels:
+            return min(i, len(ladder) - 1)
+    return 0
 
 
 # ──────────────────────────── 주입 인터페이스 ────────────────────────────
@@ -237,7 +296,7 @@ def _executor_cost(executor: "Executor", pricing) -> Cost | None:
 
 def _exec_and_gate(
     executor: "Executor", gate: "Gate", order: NextOrder, spec: ProjectSpec,
-    pricing=None, heartbeat=None,
+    pricing=None, heartbeat=None, build_kind: str = "빌드",
 ) -> tuple[str, GateResult, Cost | None]:
     """ThreadPoolExecutor 워커 — 느린 부분(executor 실행 + unit gate)만 병렬화한다.
 
@@ -255,7 +314,7 @@ def _exec_and_gate(
     # 워커별 executor/gate 인스턴스라 스레드당 한 번에 한 호출 → 컨텍스트 race 없음.
     if heartbeat is not None:
         try:
-            heartbeat.set_context("빌드", order.unit)
+            heartbeat.set_context(build_kind, order.unit)  # WO#64: tier 라벨이 실린 build_kind
         except Exception:  # noqa: BLE001
             pass
     result = executor.run(order)
@@ -400,6 +459,7 @@ def run_loop(
     executor_factory: ExecutorFactory | None = None,
     gate_factory: GateFactory | None = None,
     unit_retries: int = 1,
+    tier_ladder: list[Tier] | None = None,
     worktree_manager: WorktreeManager | None = None,
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
@@ -748,6 +808,7 @@ def run_loop(
                 max_iters=max_iters,
                 replan_retries=replan_retries,
                 unit_retries=unit_retries,
+                tier_ladder=tier_ladder,
                 rep_prompt=rep_prompt,
                 emit=emit,
                 try_save=try_save,
@@ -1051,6 +1112,7 @@ def _parallel_loop(
     replan_retries: int,
     unit_retries: int,
     rep_prompt: str | Path,
+    tier_ladder: list[Tier] | None = None,
     emit: Callable[[str], None],
     try_save: Callable[[], None],
     scaffold: Scaffold | None = None,
@@ -1109,6 +1171,22 @@ def _parallel_loop(
     # WO#48: 유닛별 머지 충돌 → *통합 적응 재빌드* 시도 이력(정직한 escalation 첨부용).
     # 각 항목 {attempt, conflict_files, merged_siblings} — 재빌드 경로가 무엇을 시도했는지.
     integ_adapt: dict[str, list[dict]] = {}
+    # ── 반응형 tier 사다리(WO#64) 봉투 ─────────────────────────────────────
+    # ladder: 사다리(미지정/빈 리스트면 단일 tier 1칸 = 후방호환). escalation_of: 유닛별
+    # *지금까지 한 escalation 수*(gate 실패/머지 충돌/OR 대안 재dispatch마다 ++, 단조 비감소).
+    # start_base_of: 유닛별 시작 인덱스(start_tier 힌트). 시도 tier = ladder[min(base+esc, top)].
+    ladder: list[Tier] = list(tier_ladder) if tier_ladder else [Tier()]
+    tier_top = len(ladder) - 1
+    escalation_of: dict[str, int] = {u.unit: 0 for u in spec.decomposition}
+    start_base_of: dict[str, int] = {
+        u.unit: resolve_start_tier(getattr(u, "start_tier", "") or "", ladder)
+        for u in spec.decomposition
+    }
+
+    def tier_for(unit: str) -> Tier:
+        """이 유닛의 *이번 시도* tier — base(시작 힌트) + escalation, top에서 cap(bounded)."""
+        idx = min(start_base_of.get(unit, 0) + escalation_of.get(unit, 0), tier_top)
+        return ladder[idx]
 
     def record(unit: str, goal: str | None, result: str, verdict: Verdict,
                checks: list[CheckReport], cost: Cost | None = None,
@@ -1270,6 +1348,7 @@ def _parallel_loop(
             wm.discard(unit)
             if attempts_of[unit] < unit_retries:
                 attempts_of[unit] += 1
+                escalation_of[unit] += 1  # WO#64: 충돌 재빌드 = 한 tier 상향(다음 dispatch가 읽음)
                 account(event_cost)  # 폐기된 시도도 비용은 정직하게 budget에 누적
                 # 통합 피드백을 기존 feedback 채널(alt_feedback)로 주입 — replan 프롬프트 무변경.
                 # gen_order가 다음 dispatch에서 pop해 replan feedback으로 태운다(#41과 동일 채널).
@@ -1302,6 +1381,7 @@ def _parallel_loop(
         wm.discard(unit)  # 백트래킹: 실패 접근 worktree 정리(#21 보장 cleanup)
         if attempts_of[unit] < unit_retries:
             attempts_of[unit] += 1
+            escalation_of[unit] += 1  # WO#64: gate 실패 재시도 = 한 tier 상향(top에서 cap)
             account(event_cost)  # 폐기된 시도 비용도 누적
             emit(f"unit gate 실패({verdict.value}) → 재시도: {unit} ({attempts_of[unit]})")
             _set_plan_state(state, unit, PlanState.pending)
@@ -1318,6 +1398,7 @@ def _parallel_loop(
             alt_feedback[unit] = build_alternative_feedback(
                 last_approach.get(unit) or order.goal, evidence, scope="unit")
             attempts_of[unit] = 0  # 새 접근엔 재시도 카운터 리셋(worktree는 이미 discard됨)
+            escalation_of[unit] += 1  # WO#64: 다른 접근도 재dispatch → tier 상향(단조, 안 내림)
             record_transition(STAGE_OR_ALTERNATIVE, unit)
             emit(f"OR 대안 접근: {unit} (대안 {alt_count[unit]}/{or_alternatives}) — bar 불변")
             _set_plan_state(state, unit, PlanState.pending)
@@ -1403,11 +1484,21 @@ def _parallel_loop(
                         # WO#33: dispatch=build 단계 → 라이브 activity + 전이 이력(main 스레드).
                         activity_start(u, STAGE_BUILD)
                         record_transition(STAGE_BUILD, u)
+                        # WO#64: 이 시도의 tier(base+escalation, top cap)를 *빌더 팩토리에만* 넘긴다.
+                        # gate_factory엔 tier 미전달(_build_executor는 executor 전용) → judge/critic
+                        # 모델 불변(적대 분리). 사다리 미지정/1-arg 팩토리면 tier 무시(후방호환).
+                        tier = tier_for(u)
+                        build_kind = "빌드"
+                        if tier_top > 0:  # 다중 tier일 때만 하트비트/이벤트에 tier 표면화
+                            label = tier_label(tier)
+                            build_kind = f"빌드(재시도 {escalation_of.get(u, 0)} · tier={label})"
+                            emit(f"{u} 빌드 dispatch (재시도 {escalation_of.get(u, 0)} · tier={label})")
                         # 스킬 주입은 executor로 가는 order에만. gate는 order.unit만 읽으므로
                         # 증강 order를 _exec_and_gate에 줘도 gate엔 스킬이 새지 않는다(분리 보존).
                         fut = pool.submit(
-                            _exec_and_gate, executor_factory(wt), gate_factory(wt),
-                            apply_skills(order), spec, pricing, heartbeat)
+                            _exec_and_gate, _build_executor(executor_factory, wt, tier),
+                            gate_factory(wt),
+                            apply_skills(order), spec, pricing, heartbeat, build_kind)
                         futures[fut] = (u, order, wt)
 
                 dispatch_ready()

@@ -40,6 +40,10 @@
 - `decomposition[]` 항목의 키는 **`unit`**(절대 `id` 아님), `desc`, 선택 `deps`(`list[str]`),
   선택 `scope`(`list[str]` — 그 유닛이 *소유*하는 파일/모듈 경로·glob). `scope`는 병렬 형제
   유닛이 서로 다른 파일을 갖게 해 머지 충돌을 예방한다(아래 1d).
+- 선택 `start_tier`(`str`) — **명백히 어려운** 유닛(복잡한 알고리즘·정밀한 동시성·까다로운
+  수치/파싱 등)만 시작 tier 힌트를 적어라(예: `start_tier: "gpt-5.5:high"`). 시작을 더 센
+  모델/effort로 *probe*하게 한다. 대부분의 유닛은 **비워둬라** — 싼 tier로 시작해 실패하면
+  엔진이 한 칸씩 자동으로 올린다(첫 시도가 probe). 시작 강도만 바꿀 뿐 *기준은 불변*이다.
 - `acceptance_criteria[]`는 `id`, `desc`, `check`, 선택 `unit`(str). `check`의 명령 키는
   **`cmd`**(절대 `command` 아님), 그리고 `type`(enum), 선택 `pass`. `check`에 다른
   키(`command`, `desc` 등)를 **추가하지 마라**.

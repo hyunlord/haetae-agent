@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from haetae.executors import CodexExecutor, HumanRelayExecutor
+from haetae.executors import CodexExecutor, HumanRelayExecutor, Tier
 from haetae.gate import CompositeGate
 from haetae.heartbeat import HeartbeatWriter
 from haetae.llm import CodexClient
@@ -46,6 +46,7 @@ def run(
     executor_factory: Callable | None = None,
     gate_factory: Callable | None = None,
     unit_retries: int = 2,
+    tier_ladder: list[Tier] | None = None,
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
     skills_dir: str | Path | None = None,
@@ -84,6 +85,7 @@ def run(
         executor_factory=executor_factory,
         gate_factory=gate_factory,
         unit_retries=unit_retries,
+        tier_ladder=tier_ladder,
         scaffold_client=scaffold_client,
         install_deps=install_deps,
         skills_dir=skills_dir,
@@ -111,6 +113,30 @@ def _load_pricing(path: str | None) -> dict | None:
     except Exception as e:  # noqa: BLE001 — 가격표 로드 실패는 계측만 비활성(run 진행)
         print(f"… 가격표 로드 실패({path}): {e} — usd 미계산으로 진행", file=sys.stderr)
         return None
+
+
+def parse_tier_ladder(
+    spec: str | None, default_model: str | None, default_effort: str | None
+) -> list[Tier]:
+    """`--tier-ladder` 문자열을 Tier 사다리로 파싱한다(WO#64).
+
+    형식: "model:effort,model:effort,..." (effort 생략 가능 → None). 예:
+      "gpt-5-mini:medium,gpt-5.5:high,gpt-5.5:xhigh".
+    미지정(None/빈)이면 **단일 tier**[(--model, --reasoning-effort)] = 기존 동작 그대로
+    (후방호환 — 661 무회귀). 빈 칸/빈 모델("":effort, ":high")은 model=None으로 둔다.
+    """
+    s = (spec or "").strip()
+    if not s:
+        return [Tier(model=default_model, reasoning_effort=default_effort)]
+    ladder: list[Tier] = []
+    for raw in s.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        model, _, effort = item.partition(":")
+        ladder.append(Tier(model=(model.strip() or None), reasoning_effort=(effort.strip() or None)))
+    # 전부 빈 칸이면 단일 tier 폴백(파싱 실패가 빈 사다리=cap 오류로 안 새게).
+    return ladder or [Tier(model=default_model, reasoning_effort=default_effort)]
 
 
 # ──────────────────── WO#58: 이어가기(②a) — 부모 해석·시딩·계보 ────────────────────
@@ -363,6 +389,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--tier-ladder",
+        default=None,
+        metavar="TIERS",
+        help=(
+            "반응형 tier 사다리(opt-in, 병렬 경로). 형식 'model:effort,...' "
+            "(예: 'gpt-5-mini:medium,gpt-5.5:high,gpt-5.5:xhigh'). 유닛은 싼 tier로 *시작*하고 "
+            "gate 실패/머지 충돌로 재dispatch될 때마다 한 칸 위로 올라간다(첫 시도가 probe, "
+            "top에서 cap). **빌더(executor)만 라우팅** — judge/critic 모델은 불변(적대 분리), "
+            "spec bar도 불변(anti-erosion). 미지정이면 단일 tier(--model/--reasoning-effort) = "
+            "기존 동작 그대로(후방호환)."
+        ),
+    )
+    parser.add_argument(
         "--run-timeout",
         type=float,
         default=120.0,
@@ -538,14 +577,19 @@ def main(argv: list[str] | None = None) -> int:
     else:
         executor = HumanRelayExecutor()
 
+    # WO#64: tier 사다리 — 미지정이면 단일 tier[(--model, --reasoning-effort)] = 기존 동작.
+    # 다중 tier면 빌더 팩토리가 *tier 인자*(model/effort)로 그 강도의 executor를 만든다.
+    tier_ladder = parse_tier_ladder(args.tier_ladder, args.model, args.reasoning_effort)
+
     # 병렬 모드(>1): unit마다 worktree 경로에 묶인 executor/gate를 만든다.
     # 통합 gate(머지된 main 1회)는 위 gate(=main workdir)를 그대로 쓴다.
     executor_factory = None
     gate_factory = None
     if args.max_parallel > 1:
         if args.executor == "codex":
-            executor_factory = lambda wt: CodexExecutor(
-                model=args.model, workdir=wt, reasoning_effort=args.reasoning_effort,
+            # tier-aware(2-arg): 루프가 그 시도의 Tier를 넘긴다(단일 tier면 사다리 0번 = 기존값).
+            executor_factory = lambda wt, tier: CodexExecutor(
+                model=tier.model, workdir=wt, reasoning_effort=tier.reasoning_effort,
                 idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
                 heartbeat=heartbeat,
             )
@@ -633,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory=executor_factory,
             gate_factory=gate_factory,
             unit_retries=args.unit_retries,
+            tier_ladder=tier_ladder,
             scaffold_client=scaffold_client,
             install_deps=args.install_deps,
             skills_dir=skills_dir,

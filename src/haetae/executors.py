@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from haetae.metering import Usage
 from haetae.models import NextOrder
@@ -17,6 +17,30 @@ from haetae.providers.codex import CodexError, exec_codex_with_usage, heartbeat_
 
 # 사람이 결과 입력을 끝낼 때 쓰는 센티넬 라인
 SENTINEL = "---END---"
+
+
+# ──────────────────────────── 반응형 tier 사다리 (WO#64) ────────────────────────────
+
+
+class Tier(NamedTuple):
+    """빌더 실행 강도의 한 칸 = (model, reasoning_effort). 사다리 = 순서 있는 Tier 리스트.
+
+    유닛은 싼 tier(사다리 앞)로 시작하고, gate 실패/머지 충돌로 재dispatch될 때마다 한 칸
+    위(더 센 모델/effort)로 올라간다(cap = 사다리 top). **첫 시도 자체가 probe** —
+    별도 throwaway probe 없이 진짜 gate verdict가 escalation 신호다.
+
+    model/effort 둘 다 None = codex 기본(단일 tier 미지정과 동일, 후방호환). tier는
+    *executor(빌더)*만 바꾼다 — judge/critic 모델은 불변(적대 분리)이고 spec bar도 불변
+    (anti-erosion). 비용은 기존 per-call 계측(#33)이 모델이 바뀌어도 그대로 집계한다.
+    """
+
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
+def tier_label(tier: Tier) -> str:
+    """하트비트/이벤트/로그에 보일 사람용 한 줄 라벨: 'model/effort'. None은 '-'."""
+    return f"{tier.model or '-'}/{tier.reasoning_effort or '-'}"
 
 
 def _stdin_collect() -> str:
