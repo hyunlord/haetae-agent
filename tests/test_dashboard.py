@@ -1662,3 +1662,158 @@ def test_html_responsive_single_column():
     assert "grid-template-columns:1fr" in src                   # 메인 단일 컬럼
     # 좁아지면 사이드바 자동 접힘(리사이즈 핸들러).
     assert "innerWidth <= 900" in src or "innerWidth<=900" in src
+
+
+# ════════════════════ WO#66: 대시보드 관측성/가독성 폴리시 ════════════════════
+
+
+def _write_heartbeat(state_path: Path, activities: list[dict]) -> Path:
+    """state.yaml 옆 heartbeat.json 사이드카를 쓴다(테스트 헬퍼)."""
+    hb = Path(state_path).parent / "heartbeat.json"
+    hb.write_text(
+        json.dumps({"updated_at": "2026-06-11T10:00:00Z", "activities": activities}),
+        encoding="utf-8",
+    )
+    return hb
+
+
+# ──────────────────── ① 합성 단계 가시성: 정상 부재 vs 진짜 에러 ────────────────────
+
+
+def test_load_view_synthesizing_when_state_absent_but_heartbeat_active(tmp_path: Path):
+    """state.yaml 부재 + 하트비트에 활성 합성 활동 → {synthesizing}(에러 아님)."""
+    sp = tmp_path / "state.yaml"  # 아직 없음(합성 전)
+    _write_heartbeat(sp, [{"call_kind": "합성", "unit": None, "elapsed_s": 3.0,
+                           "idle_seconds": 1.0, "last_event_summary": "decomposing"}])
+    v = load_view(sp)
+    assert v.get("synthesizing") is True
+    assert "error" not in v
+    assert v["heartbeat"]["activities"][0]["call_kind"] == "합성"  # 라이브 활동 동봉
+
+
+def test_load_view_real_dead_run_no_heartbeat_is_error(tmp_path: Path):
+    """진짜 죽은 run(state·heartbeat 둘 다 없음) → {error}(합성 부재와 구분)."""
+    sp = tmp_path / "state.yaml"  # 부재 + 하트비트도 없음
+    v = load_view(sp)
+    assert "error" in v
+    assert not v.get("synthesizing")
+
+
+def test_load_view_empty_heartbeat_is_error_not_synthesizing(tmp_path: Path):
+    """하트비트는 있지만 활동이 비었으면(살아있다는 증거 없음) → 에러(합성 부재 아님)."""
+    sp = tmp_path / "state.yaml"
+    _write_heartbeat(sp, [])  # activities 비어있음
+    v = load_view(sp)
+    assert "error" in v
+    assert not v.get("synthesizing")
+
+
+def test_load_view_parse_error_is_error_even_with_active_heartbeat(tmp_path: Path):
+    """파일은 존재하나 깨짐(파싱 에러) + 하트비트 활성 → 그래도 에러(부재 아님)."""
+    sp = tmp_path / "state.yaml"
+    sp.write_text("status: not_a_valid_enum\nplan: [\n", encoding="utf-8")  # 깨진 YAML
+    _write_heartbeat(sp, [{"call_kind": "빌드", "unit": "u1"}])
+    v = load_view(sp)
+    assert "error" in v
+    assert not v.get("synthesizing")  # 파일 존재 → 합성 정상 부재 아님
+
+
+def test_server_synthesis_absence_is_not_red_error(tmp_path: Path):
+    """스모크: state.yaml 없고 heartbeat에 합성 활동 → /api/state 200 + synthesizing(에러 아님)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    rid = "20260611-100000-syn"
+    d = rm.runs_dir / rid
+    d.mkdir(parents=True)  # state.yaml 없음(합성 중)
+    (d / "heartbeat.json").write_text(
+        json.dumps({"updated_at": "2026-06-11T10:00:00Z",
+                    "activities": [{"call_kind": "합성", "unit": None, "elapsed_s": 2.0,
+                                    "idle_seconds": 0.5}]}),
+        encoding="utf-8",
+    )
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, f"/api/state?run={rid}")
+        assert code == 200
+        v = json.loads(body)
+        assert v.get("synthesizing") is True
+        assert "error" not in v  # 빨간 에러 아님
+    finally:
+        httpd.shutdown()
+
+
+def test_server_dead_run_no_heartbeat_is_error(tmp_path: Path):
+    """스모크: state도 heartbeat도 없는 죽은 run → /api/state 200 + {error}(별도 표시)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    rid = "20260611-110000-dead"
+    (rm.runs_dir / rid).mkdir(parents=True)  # state·heartbeat 둘 다 없음
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, f"/api/state?run={rid}")
+        assert code == 200
+        v = json.loads(body)
+        assert "error" in v
+        assert not v.get("synthesizing")  # 합성 부재 아닌 진짜 에러
+    finally:
+        httpd.shutdown()
+
+
+def test_html_synthesis_panel_not_error():
+    """HTML: 합성 정상 부재용 차분한 패널(빨간 에러 아님) 분기·문구가 존재."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "v.synthesizing" in src                    # 렌더 분기
+    assert "합성 (state 생성 전)" in src               # 차분한 패널 문구
+    assert "에러가 아닙니다" in src                     # 정상 부재임을 명시
+
+
+# ──────────────────── ② live↔확정 화해: 라이브 배지 + 구분 라벨 ────────────────────
+
+
+def test_html_live_badge_reconciliation():
+    """HTML: heartbeat(라이브)가 state(확정)보다 앞설 때 유닛에 라이브 배지 오버레이."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "live-badge" in src                          # 배지 요소/클래스
+    assert "라이브, 확정 대기" in src                    # 배지 문구
+    assert "function _hbByUnit" in src                  # heartbeat→unit 인덱싱(배지 판정)
+    # 확정(state) vs 라이브(heartbeat) 구분 라벨.
+    assert "현재 활동 (라이브" in src                    # 라이브 배너 라벨
+    assert "확정 단계 (state" in src                     # 단계 스텝퍼 라벨
+
+
+# ──────────────────── ③ sticky 현재활동 배너 ────────────────────
+
+
+def test_html_sticky_current_activity_banner():
+    """HTML: 현재활동(하트비트) 배너가 sticky로 메인 상단 고정(스크롤해도 보임)."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="hb-banner"' in src
+    assert "position:sticky; top:49px" in src           # 배너 sticky(topbar 아래 오프셋)
+    assert "hb-label" in src                             # 라이브 라벨
+
+
+# ──────────────────── ④ DAG 엣지 가독성: 화살촉 + focus+context ────────────────────
+
+
+def test_html_dag_edges_arrowhead_and_focus_context():
+    """HTML: 엣지 화살촉(marker) + hover focus+context(상류·하류 경로 강조) JS."""
+    src = HTML.read_text(encoding="utf-8")
+    assert 'id="ah"' in src and "marker-end=" in src    # 화살촉 marker
+    assert "function dagFocus" in src                    # focus+context 핸들러
+    assert "function clearDagFocus" in src
+    assert "dag-focusing" in src and "dag-foc" in src    # dim/강조 클래스
+    assert "data-from=" in src and "data-to=" in src     # 엣지 양끝 식별(강조 타겟)
+    assert "onmouseenter" in src                         # hover 트리거
+
+
+# ──────────────────── ⑤ 렌더 안정: in-place patch + 스크롤 보존 ────────────────────
+
+
+def test_html_stable_inplace_render():
+    """HTML: SSE 갱신 시 노드 재생성 대신 키 안정 in-place patch + 스크롤 위치 보존."""
+    src = HTML.read_text(encoding="utf-8")
+    # 유닛 리스트: data-id로 .urow 재사용 + 정적부 시그니처(_sig)로만 patch(전체 innerHTML 교체 X).
+    assert "_sig" in src
+    assert "el._sig !== staticHtml" in src               # 변화 시에만 innerHTML 재작성
+    # DAG: 구조 시그니처로 변화 없으면 재생성 안 함.
+    assert "DAG_SIG" in src
+    # 스크롤 위치 보존(applyView가 main scrollTop 복원).
+    assert "scrollTop" in src and "scrollLeft" in src

@@ -103,7 +103,14 @@
                         line-height:1.5; max-height:180px; overflow:auto; }
   #run-order .ro-empty { font-size:12px; color:var(--mut); font-style:italic; }
   /* WO#55 라이브 하트비트 배너 — 진행 중 codex 호출(director-side 포함) */
-  #hb-banner { margin:14px 22px 0; display:flex; flex-direction:column; gap:6px; }
+  /* WO#66 ③ sticky: 메인 상단(topbar 아래)에 고정 → DAG/critique/로그 어디로 스크롤해도
+     "지금 뭐 하나"가 늘 시야에. top은 topbar 높이만큼 오프셋 + 차분한 backdrop. */
+  #hb-banner { margin:0; padding:11px 22px 8px; display:flex; flex-direction:column; gap:6px;
+    position:sticky; top:49px; z-index:5; background:rgba(14,16,20,.93); backdrop-filter:blur(7px);
+    border-bottom:1px solid var(--bd2); }
+  .hb-label { font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut);
+    display:flex; align-items:center; gap:6px; }
+  .hb-label::before { content:"●"; color:var(--done); font-size:8px; }
   .hb-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; font-size:12px;
             background:#10233a; border:1px solid #1d4e6a; color:#cfe6ff;
             padding:8px 12px; border-radius:8px; }
@@ -194,6 +201,12 @@
   .ulist .ubadge.re { background:#1c1917; color:#fcd34d; }
   .ulist .ubadge.or { background:#042f2e; color:#99f6e4; }
   .ulist .ubadge.dr { background:#450a0a; color:#fecaca; }
+  /* WO#66 ② 라이브 배지 — heartbeat(라이브)가 state(확정)보다 앞설 때 유닛에 오버레이.
+     "확정은 아직 PENDING인데 지금 빌드 중"을 모순 아닌 '라이브가 앞섬'으로 읽히게. */
+  .live-badge { font-size:10px; font-weight:700; padding:1px 7px; border-radius:5px; flex:none;
+    background:#10233a; color:#cfe6ff; border:1px solid #1d4e6a; display:inline-flex; align-items:center; gap:4px; }
+  .live-badge::before { content:"●"; color:#3b82f6; font-size:8px; animation:hbpulse 1.1s ease-in-out infinite; }
+  .node .live-badge { margin-top:5px; }
 
   /* stage badge */
   .stage { font-size:10px; font-weight:700; padding:1px 7px; border-radius:5px; text-transform:uppercase; letter-spacing:.04em; }
@@ -220,7 +233,13 @@
   .b-done{border-left-color:var(--done)} .b-failed{border-left-color:var(--fail)}
   .t-pending{color:var(--pend)} .t-in_progress{color:var(--prog)} .t-done{color:var(--done)} .t-failed{color:var(--fail)}
   .blk { font-size:11px; color:#fca5a5; margin-top:5px; }
-  #edges .edge { fill:none; stroke:#333a4a; stroke-width:1.4; }
+  #edges .edge { fill:none; stroke:#333a4a; stroke-width:1.4; transition:stroke .12s, opacity .12s; }
+  /* WO#66 ④ focus+context: 노드 hover/선택 시 그 노드의 의존(상류)·차단(하류) 경로만 강조,
+     관련 노드만 밝게·나머지 dim. 평상시 엣지는 옅게(보조), 강조는 on-demand. */
+  #dagwrap.dag-focusing .node { opacity:.3; transition:opacity .12s; }
+  #dagwrap.dag-focusing .node.dag-foc { opacity:1; }
+  #dagwrap.dag-focusing #edges .edge { opacity:.1; }
+  #dagwrap.dag-focusing #edges .edge.dag-foc { opacity:1; stroke:#7aa2f7; stroke-width:2.3; }
   .dag-legend { font-size:11.5px; color:var(--mut); margin:0 0 10px;
     padding:6px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent);
     border-radius:6px; background:var(--panel2); }
@@ -375,7 +394,7 @@
     <div id="main-cols" class="main-cols">
       <!-- 주 패널: 생애주기 스텝퍼(빌드에 유닛 리스트 중첩) + 로그 + DAG/transitions(강등) -->
       <div class="main-left">
-        <div class="card stepper-card"><h2>생애주기 · 단계 (phases)</h2><div id="phases" class="phases"></div></div>
+        <div class="card stepper-card"><h2>생애주기 · 단계 <span class="sec-demote">— 확정 단계 (state · 단계 경계 갱신)</span></h2><div id="phases" class="phases"></div></div>
         <div class="card" id="worklog-card" style="display:none">
           <h2><button id="wl-toggle" class="sectoggle" title="펼치기/접기">▾</button>작업 로그 (라이브 tail)</h2>
           <div id="wl-body"><div id="worklog" class="worklog"></div></div>
@@ -474,7 +493,13 @@ function setLive(state, txt){
 
 // ── 라이브: SSE 우선, 폴링 폴백 (RUN 타겟이 있으면 ?run=<id>) ──
 const runQS = () => (RUN ? "?run="+encodeURIComponent(RUN) : "");
-function applyView(v){ VIEW=v; render(v); lastMsg=Date.now(); $("tick").textContent="갱신 "+new Date().toLocaleTimeString(); }
+function applyView(v){
+  // WO#66 ⑤: SSE 갱신마다 스크롤 위치를 보존 — 사용자가 보던 위치/스크롤이 매 틱에 안 튐.
+  const main=$("main"); const sx=main?main.scrollLeft:0, sy=main?main.scrollTop:0;
+  VIEW=v; render(v);
+  if(main){ main.scrollLeft=sx; main.scrollTop=sy; }
+  lastMsg=Date.now(); $("tick").textContent="갱신 "+new Date().toLocaleTimeString();
+}
 
 function startSSE(){
   if (es) { try{ es.close(); }catch(_){} es=null; }
@@ -751,6 +776,24 @@ function render(v) {
     clearViewer();
     return;
   }
+  if (v && v.synthesizing) {
+    // WO#66 ①: state.yaml 생성 전(합성 중) — 빨간 에러가 아니라 차분한 "준비 중 · 합성" 패널.
+    // 하트비트(현재활동·라이브)가 합성 진행을 보여준다(call_kind/경과/최근이벤트).
+    empty.style.display = "block";
+    empty.innerHTML = '<span class="eh-mark">◵</span>'
+      + '<b>준비 중 · 합성 (state 생성 전)</b><br>'
+      + '명세를 합성하는 중입니다. <code>state.yaml</code>은 합성이 끝난 뒤 생성됩니다 — <b>에러가 아닙니다.</b><br>'
+      + '<span class="mut small">진행 상황은 위의 <b>현재 활동(라이브)</b> 배너에서 실시간으로 보입니다.</span>';
+    cols.style.display = "none";
+    $("summary").style.display = "none"; $("summary").innerHTML = "";
+    $("banner-slot").innerHTML = "";
+    const st = $("status"); st.textContent = "합성 중"; st.className = "pill s-running";
+    $("specref").textContent = "";
+    renderHeartbeat(v);  // 라이브 합성 활동(현재활동 배너)
+    renderRunOrder();    // 무엇을 시켰는지(원 주문)는 meta 기반 — state 무관
+    clearViewer();
+    return;
+  }
   if (v.error) {
     // 메인 뷰어 영역에만 에러 표시(사이드바 runs 목록은 유지).
     empty.style.display = "none";
@@ -845,7 +888,9 @@ function renderHeartbeat(v){
   const acts = (hb && hb.activities) || [];
   if (!acts.length){ host.style.display="none"; host.innerHTML=""; return; }
   host.style.display = "flex";
-  host.innerHTML = acts.map(a=>{
+  // WO#66 ②: 라벨로 "현재 활동(라이브 · heartbeat)"임을 명시 — 확정 단계(state) 패널과 구분.
+  host.innerHTML = '<div class="hb-label">현재 활동 (라이브 · heartbeat) — 확정(state)보다 앞설 수 있음</div>'
+    + acts.map(a=>{
     const age = _liveBase(a.idle_seconds), ela = _liveBase(a.elapsed_s);
     const to = a.idle_timeout;
     // idle가 kill 임계(idle-timeout)로 차오르면 amber→red(멈춤 징조가 kill 전에 보이게).
@@ -898,40 +943,82 @@ function renderSummary(v) {
   box.innerHTML = h;
 }
 
+// 라이브(heartbeat) 활동을 유닛별로 인덱싱 — 라이브 배지(확정보다 앞섬) 판정에 사용(WO#66 ②).
+function _hbByUnit(){
+  const acts = (VIEW && VIEW.heartbeat && VIEW.heartbeat.activities) || [];
+  const m = {};
+  acts.forEach(a=>{ if (a && a.unit) m[a.unit]=a; });
+  return m;
+}
 // DW식 밀도 라이브 리스트: 유닛 한 줄씩(정렬=plan 순서). in-flight는 ▸커서+스핀+경과로 강조.
+// WO#66 ⑤ 렌더 안정: 키(data-id) 안정 in-place 갱신 — .urow를 재사용하고 값만 patch(전체
+// innerHTML 교체 X). 정적부(스핀 포함)는 시그니처가 바뀔 때만 재작성하고, 경과(.el)는 별도
+// span에 textContent로만 써 매초 틱에도 flicker/스크롤 점프/스핀 재시작이 없게 한다.
 function renderUnitList(v) {
   const rows = v.unit_rows||[];
-  if (!rows.length) { $("unitlist").innerHTML = '<div class="empty">유닛 없음</div>'; return; }
-  $("unitlist").innerHTML = rows.map(r=>{
+  const host = $("unitlist"); if (!host) return;
+  if (!rows.length) { host.innerHTML = '<div class="empty">유닛 없음</div>'; return; }
+  const hbByUnit = _hbByUnit();
+  const existing = {};
+  host.querySelectorAll(".urow").forEach(el=>{ existing[el.dataset.id]=el; });
+  const seen = {};
+  rows.forEach(r=>{
     const active = !!r.active;
+    // WO#66 ②: 라이브가 확정보다 앞섬 — heartbeat가 이 유닛을 돌리는 중인데 state는 아직
+    // in_progress/done이 아님(예: 확정 PENDING). 모순처럼 안 보이게 라이브 배지를 오버레이.
+    const hbA = hbByUnit[r.unit];
+    const liveAhead = !!hbA && !active && r.state!=="in_progress" && r.state!=="done";
     // 단계 배지(in-flight) 또는 상태 미니배지(정적).
     const mid = r.stage ? stageBadge(r.stage)
       : '<span class="st-mini t-'+esc(r.state)+'">'+esc(r.state)+'</span>';
+    const liveBadge = liveAhead
+      ? '<span class="live-badge" title="라이브(heartbeat)가 확정(state)보다 앞섬 — 확정 대기">'
+        + esc((hbA.call_kind||"빌드")+" 중 — 라이브, 확정 대기")+'</span>'
+      : '';
     const chk = r.checks_total
       ? '<span class="ck"><span class="ev-good">'+r.checks_pass+'✓</span>'
         + (r.checks_fail? ' <span class="ev-bad">'+r.checks_fail+'✗</span>':'')+'</span>'
       : '';
     const tok = r.tokens!=null ? '<span class="tk">'+num(r.tokens)+' tok</span>' : '';
-    const el = active ? '<span class="el">'+dur(liveElapsed(r))+'</span>' : '';
     // WO#44 C: 재시도(↻) / OR 대안(OR) / 분해 reject(⊘) 배지 — 있을 때만.
     const badges = (r.retries ? '<span class="ubadge re" title="재dispatch 횟수">↻'+r.retries+'</span>' : '')
       + (r.or_attempts>0 ? '<span class="ubadge or" title="OR 접근 시도">OR '+r.or_attempts+'</span>' : '')
       + (r.decomp_rejects>0 ? '<span class="ubadge dr" title="분해 critic reject">⊘'+r.decomp_rejects+'</span>' : '');
-    return '<div class="urow'+(active?' active':'')+(SEL===r.unit?' sel':'')+'" data-id="'+esc(r.unit)+'">'
-      + '<span class="cur">'+(active?'▸':'')+'</span>'
+    // 정적부(경과 .el 값 제외) — 시그니처가 바뀔 때만 innerHTML 재작성.
+    const staticHtml = '<span class="cur">'+(active?'▸':'')+'</span>'
       + (active?'<span class="spin"></span>':'')
-      + '<span class="u">'+esc(r.unit)+'</span>'+mid+badges
-      + '<span class="sp"></span>'+chk+tok+el+'</div>';
-  }).join("");
-  $("unitlist").querySelectorAll(".urow").forEach(row=>{
-    row.onclick = ()=>{ SEL=row.dataset.id; renderDetail(SEL);
-      document.querySelectorAll(".node,.urow").forEach(x=>x.classList.toggle("sel", x.dataset.id===SEL)); };
+      + '<span class="u">'+esc(r.unit)+'</span>'+mid+liveBadge+badges
+      + '<span class="sp"></span>'+chk+tok+'<span class="el"></span>';
+    let el = existing[r.unit];
+    if (!el){
+      el = document.createElement("div"); el.className="urow"; el.dataset.id=r.unit;
+      el.onclick = ()=>{ SEL=el.dataset.id; renderDetail(SEL);
+        document.querySelectorAll(".node,.urow").forEach(x=>x.classList.toggle("sel", x.dataset.id===SEL)); };
+    }
+    if (el._sig !== staticHtml){ el.innerHTML = staticHtml; el._sig = staticHtml; }
+    el.className = "urow"+(active?" active":"")+(SEL===r.unit?" sel":"");
+    const elEl = el.querySelector(".el");
+    if (elEl) elEl.textContent = active ? dur(liveElapsed(r)) : "";
+    host.appendChild(el);   // 순서대로 재배치(기존 노드 이동 — 재생성 아님)
+    seen[r.unit]=1;
   });
+  Object.keys(existing).forEach(id=>{ if(!seen[id]) existing[id].remove(); });   // 사라진 유닛 제거
 }
 
+let DAG_SIG = null;   // 마지막으로 그린 DAG 구조 시그니처 — 변화 없으면 재생성 안 함(WO#66 ⑤)
 function renderDag(v) {
   const wrap = $("levels");
   const blockedMap = {}; (v.blocking||[]).forEach(b => blockedMap[b.unit]=b.blocked_by);
+  // WO#66 ⑤: 구조(층/노드 상태·단계·goal/blocking)가 그대로면 노드를 재생성하지 않는다 —
+  // 매 SSE 틱마다 전체 노드 churn + 엣지 재계산으로 인한 flicker/레이아웃 점프를 막는다.
+  // 선택(.sel)은 클릭 핸들러가 imperatively 토글하므로 시그니처에 넣지 않는다.
+  const sig = JSON.stringify({
+    lv: v.dag.levels,
+    n: (v.dag.nodes||[]).map(n=>[n.id,n.state,n.stage,n.goal]),
+    bl: v.blocking,
+  });
+  if (sig === DAG_SIG && wrap.children.length) { return; }
+  DAG_SIG = sig;
   wrap.innerHTML = "";
   (v.dag.levels||[]).forEach(level => {
     const row = document.createElement("div"); row.className="level";
@@ -945,11 +1032,40 @@ function renderDag(v) {
         + '<div class="goal">'+esc(n.goal||"")+'</div>'
         + '<div class="st t-'+n.state+'">'+esc(n.state)+'</div>'+blk;
       d.onclick = () => { SEL=uid; renderDetail(uid); document.querySelectorAll(".node,.urow").forEach(x=>x.classList.toggle("sel", x.dataset.id===uid)); };
+      // WO#66 ④ focus+context: hover로 그 노드의 상류(의존)·하류(차단) 경로만 강조, 나머지 dim.
+      d.onmouseenter = ()=>dagFocus(uid);
+      d.onmouseleave = clearDagFocus;
       row.appendChild(d);
     });
     wrap.appendChild(row);
   });
   requestAnimationFrame(()=>drawEdges(v));
+}
+
+// WO#66 ④ focus+context: uid의 상류(의존, 부모 방향)·하류(차단, 자식 방향) 노드/엣지만 강조.
+// 카드의 'blocked by uX' 텍스트가 권위 — 엣지 강조는 on-demand 보조(평상시 옅음).
+function dagFocus(uid){
+  const wrap = $("dagwrap"); if (!wrap || !VIEW || !VIEW.dag) return;
+  const edges = VIEW.dag.edges||[];
+  const parents={}, children={};
+  edges.forEach(e=>{ (children[e.from]=children[e.from]||[]).push(e.to); (parents[e.to]=parents[e.to]||[]).push(e.from); });
+  const walk = (u,map,acc)=>{ (map[u]||[]).forEach(n=>{ if(!acc.has(n)){ acc.add(n); walk(n,map,acc); } }); };
+  const up=new Set(), down=new Set();
+  walk(uid,parents,up); walk(uid,children,down);
+  const keep = new Set([uid]); up.forEach(x=>keep.add(x)); down.forEach(x=>keep.add(x));
+  wrap.classList.add("dag-focusing");
+  wrap.querySelectorAll(".node").forEach(el=>el.classList.toggle("dag-foc", keep.has(el.dataset.id)));
+  const svg = $("edges");
+  if (svg) svg.querySelectorAll(".edge").forEach(p=>{
+    p.classList.toggle("dag-foc", keep.has(p.dataset.from) && keep.has(p.dataset.to));
+  });
+}
+function clearDagFocus(){
+  const wrap = $("dagwrap"); if (!wrap) return;
+  wrap.classList.remove("dag-focusing");
+  wrap.querySelectorAll(".node.dag-foc").forEach(el=>el.classList.remove("dag-foc"));
+  const svg = $("edges");
+  if (svg) svg.querySelectorAll(".edge.dag-foc").forEach(p=>p.classList.remove("dag-foc"));
 }
 
 // v3(WO#42 B): 층 레이아웃은 유지, 엣지만 정리한다 —
@@ -987,13 +1103,15 @@ function drawEdges(v) {
     const x1=anchorX(e.from, outs[e.from], e.to), y1=a.bot;
     const x2=anchorX(e.to, ins[e.to], e.from), y2=b.top;
     const my=(y1+y2)/2;
+    // data-from/data-to: hover focus+context가 이 엣지의 양끝을 식별(WO#66 ④).
+    const da = `data-from="${esc(e.from)}" data-to="${esc(e.to)}"`;
     if (Math.abs(x2-x1) < 1) {
-      p += `<path class="edge" d="M${x1},${y1} L${x2},${y2-1}" marker-end="url(#ah)"/>`;
+      p += `<path class="edge" ${da} d="M${x1},${y1} L${x2},${y2-1}" marker-end="url(#ah)"/>`;
     } else {
       const dir = x2>x1 ? 1 : -1;
       const r = Math.max(0, Math.min(8, Math.abs(x2-x1)/2, (y2-y1)/2));
       // 세로↓ → (둥근 코너) 가로 → (둥근 코너) 세로↓: 직교 라우팅으로 교차를 단정하게.
-      p += `<path class="edge" d="M${x1},${y1} L${x1},${my-r} Q${x1},${my} ${x1+dir*r},${my} `
+      p += `<path class="edge" ${da} d="M${x1},${y1} L${x1},${my-r} Q${x1},${my} ${x1+dir*r},${my} `
         + `L${x2-dir*r},${my} Q${x2},${my} ${x2},${my+r} L${x2},${y2-1}" marker-end="url(#ah)"/>`;
     }
   });
@@ -1195,7 +1313,7 @@ function makeCollapse(toggleEl, bodyEl, key, defCollapsed, onExpand){
 // raw transitions: 기본 숨김. 작업 로그: 기본 펼침(라이브 피드).
 const RUNS_COL = makeCollapse($("runs-toggle"), $("runs-body"), "haetae.runs.collapsed", true, null);
 makeCollapse($("dag-toggle"), $("dag-body"), "haetae.dag.collapsed", true,
-  ()=>{ if (VIEW && !VIEW.error) renderDag(VIEW); });   // 숨김 중엔 0폭 → 펼칠 때 재계산
+  ()=>{ if (VIEW && !VIEW.error && !VIEW.empty && !VIEW.synthesizing) { DAG_SIG=null; renderDag(VIEW); } });   // 숨김 중엔 0폭 → 펼칠 때 강제 재계산(엣지 재배치)
 makeCollapse($("tr-toggle"), $("tr-body"), "haetae.transitions.hidden", true, null);
 makeCollapse($("wl-toggle"), $("wl-body"), "haetae.worklog.collapsed", false, null);
 $("runs-h").onclick = ()=>RUNS_COL.toggle();

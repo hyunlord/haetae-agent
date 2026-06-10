@@ -701,16 +701,43 @@ def load_heartbeat(state_path: str | Path | None) -> dict[str, Any] | None:
     return data
 
 
+def _heartbeat_active(heartbeat: dict[str, Any] | None) -> bool:
+    """하트비트에 진행 중인 활동이 하나라도 있나(WO#66 ①: 합성/초기 활동 = 살아있음)."""
+    if not heartbeat:
+        return False
+    acts = heartbeat.get("activities")
+    return isinstance(acts, list) and len(acts) > 0
+
+
 def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> dict[str, Any]:
     """state(+옵션 spec) 재로드 → view. 실패는 {error}로 흡수(서버 안 죽음).
 
     WO#55: 라이브 하트비트(heartbeat.json 사이드카)가 있으면 view["heartbeat"]로 동봉한다.
     state 로드 실패({error})에도 하트비트는 별도라 — 멈춤 진단을 위해 가능하면 같이 싣는다.
+
+    WO#66 ①: state.yaml은 *합성 후* 생성된다. 합성 중엔 state가 아직 없어 FileNotFoundError가
+    나는데, 그걸 빨간 에러로 보이면 "정상 부재"가 "고장"처럼 읽힌다. 그래서 **state.yaml이 아직
+    없고(파일 부재) 하트비트에 활성 활동이 있으면** 에러가 아니라 `{synthesizing}` 정상 부재로
+    구분한다(프런트가 차분한 "합성/준비 중" 패널을 띄움). 진짜 죽은 run(하트비트도 없고 state도
+    없음)이나 파싱 에러(파일은 있는데 깨짐)는 그대로 {error}.
     """
     heartbeat = load_heartbeat(state_path)
+    state_exists = False
+    try:
+        state_exists = Path(state_path).exists()
+    except OSError:
+        state_exists = False
     try:
         state = State.from_yaml(state_path)
     except Exception as e:  # noqa: BLE001 — 파일없음/파싱에러 전부 흡수
+        # 합성 중 정상 부재(파일 자체가 아직 없음 + 하트비트 활성) → 에러 아님.
+        if not state_exists and _heartbeat_active(heartbeat):
+            return {
+                "synthesizing": True,
+                "reason": "state.yaml 생성 전 (합성/준비 중)",
+                "state_path": str(state_path),
+                "heartbeat": heartbeat,
+            }
         err: dict[str, Any] = {"error": f"{type(e).__name__}: {e}", "state_path": str(state_path)}
         if heartbeat is not None:
             err["heartbeat"] = heartbeat
@@ -1275,17 +1302,20 @@ def make_handler(
             hb_path = _heartbeat_path(sp)
             try:
                 while True:
+                    # WO#55: state.yaml + heartbeat.json mtime 둘 다 감시 → 라이브 하트비트가
+                    #   단계 경계 사이(state 미변경)에도 배너를 갱신(멈춤 차오름이 보이게).
+                    # WO#66 ①: 둘을 *독립적으로* 본다 — state가 아직 없어도(합성 중) heartbeat
+                    #   mtime 변화가 push를 트리거해 "합성/준비 중" 패널이 라이브로 갱신되게.
+                    #   (이전엔 state getmtime이 OSError면 hb_m을 못 잡아 합성 중 SSE가 한 번 뒤 침묵)
                     try:
-                        # WO#55: state.yaml + heartbeat.json mtime 둘 다 감시 → 라이브 하트비트가
-                        #   단계 경계 사이(state 미변경)에도 배너를 갱신(멈춤 차오름이 보이게).
                         st_m = os.path.getmtime(sp) if sp is not None else None
-                        try:
-                            hb_m = os.path.getmtime(hb_path) if hb_path is not None else None
-                        except OSError:
-                            hb_m = None
-                        sig = (st_m, hb_m)
                     except OSError:
-                        sig = None  # 파일 부재 → load_view가 {error}를 내고 그대로 push
+                        st_m = None  # state 아직 없음(합성 전) — 에러 아님
+                    try:
+                        hb_m = os.path.getmtime(hb_path) if hb_path is not None else None
+                    except OSError:
+                        hb_m = None
+                    sig = (st_m, hb_m)
                     if sig != last_sig:
                         last_sig = sig
                         self.wfile.write(b"data: " + _view_payload(sp, spec, err) + b"\n\n")
