@@ -418,7 +418,12 @@
         <!-- WO#58 이어가기: 부모가 설정되면 노출(증분 — 부모 코드 위에서 delta) -->
         <div id="continue-note" class="continue-note" style="display:none"></div>
         <textarea id="f-order" placeholder="work order / 주문 원문 (예: '리테일 흐름 시뮬레이션을 만들어라 …')"></textarea>
-        <div class="opts">
+        <!-- WO#65: auto 모드(기본 ON) — order만으로 운영 옵션 자동 해석. 고급 옵션은 접힘(펼치면 오버라이드). -->
+        <div class="opts" style="margin-bottom:6px">
+          <span class="opt"><input id="f-auto" type="checkbox" checked><label>auto 모드 (운영 옵션 자동 — 사다리·critic·scaffold)</label></span>
+          <button id="adv-toggle" class="sectoggle" type="button">고급 옵션 ▸</button>
+        </div>
+        <div id="adv-opts" class="opts" style="display:none">
           <span class="opt"><label>executor</label>
             <select id="f-executor"><option value="codex" selected>codex</option><option value="human">human</option></select></span>
           <span class="opt"><label>max-parallel</label><input id="f-max-parallel" type="number" min="1" max="16" value="4"></span>
@@ -674,6 +679,18 @@ function updateCriticWarn(){
   const empty = !$("f-critic-model").value.trim();
   w.style.display = empty ? "block" : "none";
 }
+// WO#65: 고급 옵션 접힘 토글 — auto 모드면 운영 옵션이 자동 해석되므로 기본 접힘(펼치면 오버라이드).
+function setAdvOpts(show){
+  const box = $("adv-opts"), btn = $("adv-toggle");
+  if (box) box.style.display = show ? "flex" : "none";
+  if (btn) btn.textContent = show ? "고급 옵션 ▾" : "고급 옵션 ▸";
+}
+(function wireAdvToggle(){
+  const btn = $("adv-toggle"), auto = $("f-auto");
+  if (btn) btn.onclick = ()=> setAdvOpts($("adv-opts").style.display === "none");
+  // auto 켜면 접힘(자동), 끄면 펼침(수동 제어 의도).
+  if (auto) auto.addEventListener("change", ()=> setAdvOpts(!auto.checked));
+})();
 async function launchRun(){
   const order = $("f-order").value.trim();
   const errEl = $("form-err"); errEl.textContent="";
@@ -688,6 +705,7 @@ async function launchRun(){
     unit_retries: parseInt($("f-unit-retries").value,10),
     scaffold: $("f-scaffold").checked,
     skills: $("f-skills").checked,
+    auto: $("f-auto").checked,   // WO#65: auto면 서버가 --auto 부착 → 미설정 운영 knob 자동 해석.
   };
   if (cm) options.critic_model = cm;
   // provider 디스크립터 필드를 일반적으로 수집(미입력=빈값이면 안 붙임 → provider 기본).

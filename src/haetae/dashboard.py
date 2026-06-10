@@ -789,6 +789,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
     allowed = {
         "executor", "max_parallel", "run_timeout", "scaffold", "skills",
         "critic_model", "max_iters", "unit_retries", "reasoning_effort", "model",
+        "auto",  # WO#65: 제로-config auto 모드(미설정 운영 knob 자동 해석). 기본 False(back-compat).
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -865,6 +866,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
         "unit_retries": _int("unit_retries", 2, 0, 10),
         "reasoning_effort": reasoning_effort,
         "model": model,
+        "auto": _bool("auto", False),  # WO#65: 기본 OFF(back-compat). 켜면 run.py가 운영 knob 자동 해석.
     }
 
 
@@ -889,6 +891,9 @@ def build_run_argv(
         "--max-iters", str(opts["max_iters"]),
         "--unit-retries", str(opts["unit_retries"]),
     ]
+    # WO#65: auto 모드면 --auto 부착 → run.py가 미설정 운영 knob 자동 해석(명시 옵션은 그대로 오버라이드).
+    if opts.get("auto"):
+        argv.append("--auto")
     if parent_run_dir is not None:
         argv += ["--continue-from", str(parent_run_dir)]
         argv.append("--no-scaffold")  # 이어가기: 스택 이미 시딩 → scaffold 스킵(opts 무시)

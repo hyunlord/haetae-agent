@@ -74,6 +74,7 @@ STAGE_DONE = "done"
 STAGE_ESCALATE = "escalate"
 STAGE_DECOMP_REJECT = "decomp-reject"  # WO#40: 분해 critic이 무진전 work order를 reject→재replan
 STAGE_OR_ALTERNATIVE = "or-alternative"  # WO#41: gate 실패 소진 → 다른 접근으로 백트래킹·재시도
+STAGE_AUTO_CONFIG = "auto-config"  # WO#65: --auto가 해석한 운영 config(사다리·critic·scaffold 등) 기록
 from haetae.decomp_critic import (
     DEFAULT_DECOMP_CRITIC_PROMPT_PATH,
     build_decomp_feedback,
@@ -460,6 +461,7 @@ def run_loop(
     gate_factory: GateFactory | None = None,
     unit_retries: int = 1,
     tier_ladder: list[Tier] | None = None,
+    auto_config_note: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
@@ -694,6 +696,11 @@ def run_loop(
     #   state를 먼저 둔다(정상 경로에서 _init_state/_escalated_no_spec가 덮어쓴다).
     state = State(spec_ref="(interrupted)", spec_version=0, status=Status.running)
     try:
+        # WO#65: --auto가 해석한 운영 config를 한 줄 이벤트(emit)로 즉시 노출. state transition
+        # 기록은 진짜 state(_init_state) 생성 후에 한다(placeholder는 곧 교체되므로). 거버넌스
+        # 게이트는 여기서 안 건드린다(운영 knob 가시화만).
+        if auto_config_note:
+            emit(auto_config_note)
         emit("합성 중…")
         hb("합성")
         critique: SpecCritique | None = None
@@ -740,6 +747,9 @@ def run_loop(
 
         state = _init_state(spec)
         save_spec(spec)  # WO#58: 검증된 spec을 spec.yaml 사이드카로(이어가기·대시보드 보강 원천)
+        # WO#65: auto 해석 config를 진짜 state에 transition으로 기록(투명성 — 대시보드/감사).
+        if auto_config_note:
+            record_transition(STAGE_AUTO_CONFIG)
         record_transition(STAGE_SYNTHESIZE)
         # 합성/critic/통합-deps 넛지(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
         account(combine_costs(m_client.drain()))

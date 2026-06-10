@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from haetae.executors import CodexExecutor, HumanRelayExecutor, Tier
+from haetae.executors import CodexExecutor, HumanRelayExecutor, Tier, tier_label
+from haetae.providers.launch_options import read_codex_config
 from haetae.gate import CompositeGate
 from haetae.heartbeat import HeartbeatWriter
 from haetae.llm import CodexClient
@@ -47,6 +49,7 @@ def run(
     gate_factory: Callable | None = None,
     unit_retries: int = 2,
     tier_ladder: list[Tier] | None = None,
+    auto_config_note: str | None = None,
     scaffold_client: LLMClient | None = None,
     install_deps: bool = True,
     skills_dir: str | Path | None = None,
@@ -86,6 +89,7 @@ def run(
         gate_factory=gate_factory,
         unit_retries=unit_retries,
         tier_ladder=tier_ladder,
+        auto_config_note=auto_config_note,
         scaffold_client=scaffold_client,
         install_deps=install_deps,
         skills_dir=skills_dir,
@@ -137,6 +141,84 @@ def parse_tier_ladder(
         ladder.append(Tier(model=(model.strip() or None), reasoning_effort=(effort.strip() or None)))
     # 전부 빈 칸이면 단일 tier 폴백(파싱 실패가 빈 사다리=cap 오류로 안 새게).
     return ladder or [Tier(model=default_model, reasoning_effort=default_effort)]
+
+
+# ──────────────────── WO#65: 제로-config auto 모드 (운영 knob 자동 해석) ────────────────────
+
+
+@dataclass
+class AutoConfig:
+    """`--auto`가 해석한 *운영 knob* 묶음 + 투명성 노출 텍스트.
+
+    **운영 knob만** 담는다(model·effort 사다리·critic·scaffold·parallel 등 — 가역·저비용).
+    거버넌스 게이트(능력 채택 allowlist·capability-search 네트워크·executor 네트워크·bar)는
+    여기 *전혀* 없다 — 그건 사람이 명시 opt-in해야 한다(자동 미활성). summary/warnings는
+    사람이 "무엇이 자동 선택됐는지" 보도록 이벤트/state로 노출된다.
+    """
+
+    tier_ladder: list[Tier]
+    critic_model: str | None          # 해석된 critic 모델(None=codex 기본 — critic은 여전히 ON)
+    critic_on: bool                   # auto는 항상 True(critic 절대 OFF 아님 — decomp critic/OR 살림)
+    critic_independent: bool          # 빌더 model과 분리됐는지(단일 provider면 보통 False → 경고)
+    warnings: list[str] = field(default_factory=list)
+    summary: str = ""
+
+
+def resolve_auto_config(args, config_path: str | Path | None = None) -> AutoConfig:
+    """`--auto`: *미설정* 운영 옵션을 sensible 기본으로 채운다. 명시 플래그가 auto를 이긴다.
+
+    출처/규칙:
+      - tier 사다리(#64): `--tier-ladder` 명시 > `--reasoning-effort` 명시(단일 tier) >
+        자동 effort 사다리(medium→high→xhigh). 빌더 model = `--model` 또는 codex config
+        pre-fill(#45, 엔진-free read). 멀티-provider epic에서 모델별 사다리로 확장.
+      - critic-model: `--critic-model` 명시 우선. 미지정이면 단일 codex 세계라 빌더 model로
+        설정(critic ON 유지) + **독립성 경고**(조용한 독립성 붕괴 금지). critic은 절대 OFF 아님.
+      - scaffold/skills/parallel/timeout/iters: argparse 기본이 이미 sensible(auto가 새로
+        바꿀 것 없음) — summary에 가시화만.
+    **거버넌스(능력 채택·네트워크·bar)는 절대 자동으로 안 켠다** — 명시 opt-in 전용.
+    launch_options는 엔진-free 메타데이터만 — 사다리 조립(executors.Tier)은 여기(run.py)서.
+    """
+    cfg = read_codex_config(config_path)  # best-effort, 엔진-free, 실패 시 {}
+    explicit_model = (args.model or "").strip() if args.model else ""
+    builder_model = explicit_model or cfg.get("model")  # None=codex 기본(최신) 자동
+    warnings: list[str] = []
+
+    # 1) tier 사다리 — 명시 우선(오버라이드), 아니면 자동 effort 사다리.
+    if args.tier_ladder:
+        ladder = parse_tier_ladder(args.tier_ladder, builder_model, args.reasoning_effort)
+    elif args.reasoning_effort:
+        ladder = [Tier(builder_model, args.reasoning_effort)]  # 명시 effort = 단일 tier
+    else:
+        ladder = [Tier(builder_model, e) for e in ("medium", "high", "xhigh")]
+
+    # 2) critic — 절대 OFF 아님. 명시 우선; 미지정이면 빌더 model(단일 provider) + 독립성 경고.
+    critic_model = args.critic_model if args.critic_model else builder_model
+    critic_independent = bool(critic_model and builder_model and critic_model != builder_model)
+    if not critic_independent:
+        warnings.append(
+            "critic-model이 빌더 model과 동일(단일 provider) — 적대 독립성 약화. "
+            "멀티-provider에서 분리 가능."
+        )
+
+    # 3) 투명성 summary — 사람이 자동 선택을 한눈에.
+    ladder_str = ",".join(tier_label(t) for t in ladder)
+    critic_str = (critic_model or "codex-default") + (
+        "(indep)" if critic_independent else "(non-indep)"
+    )
+    summary = (
+        f"auto-config: ladder=[{ladder_str}] · critic={critic_str} · "
+        f"scaffold={'on' if args.scaffold else 'off'} · parallel={args.max_parallel} · "
+        f"skills={'on' if args.skills else 'off'} · "
+        f"governance=manual(capabilities/network 자동 미활성)"
+    )
+    return AutoConfig(
+        tier_ladder=ladder,
+        critic_model=critic_model,
+        critic_on=True,
+        critic_independent=critic_independent,
+        warnings=warnings,
+        summary=summary,
+    )
 
 
 # ──────────────────── WO#58: 이어가기(②a) — 부모 해석·시딩·계보 ────────────────────
@@ -299,6 +381,18 @@ def main(argv: list[str] | None = None) -> int:
         description="order 한 줄에서 시작해 haetae 루프를 돈다 (사람이 executor).",
     )
     parser.add_argument("--order", required=True, help="주문 원문")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        default=False,
+        help=(
+            "제로-config auto 모드(기본 OFF). order만으로 *미설정* 운영 옵션을 자동 해석한다: "
+            "기본 tier 사다리(effort medium→high→xhigh, #64)·자동 critic-model(독립 시도, "
+            "불가하면 경고)·scaffold/skills on·sensible parallel/timeout/iters. **명시 플래그가 "
+            "auto를 오버라이드**. **거버넌스(능력 채택·capability-search 네트워크·executor "
+            "네트워크·bar)는 자동으로 안 켠다(사람 게이트 유지)**. 해석된 config는 이벤트/state에 노출."
+        ),
+    )
     parser.add_argument(
         "--workdir", default=".", help="check 실행 + codex executor의 cwd (gate/executor 공유, 기본: .)"
     )
@@ -524,6 +618,18 @@ def main(argv: list[str] | None = None) -> int:
 
     pricing = _load_pricing(args.pricing)
 
+    # WO#65: --auto → 미설정 운영 knob 자동 해석(거버넌스 게이트는 비-자동). 명시 플래그는 그대로.
+    #   auto_cfg가 tier 사다리/critic-model을 결정하고, summary/warnings를 투명하게 노출한다.
+    auto_cfg = resolve_auto_config(args) if args.auto else None
+    auto_config_note = None
+    if auto_cfg is not None:
+        auto_config_note = " | ".join([auto_cfg.summary, *(f"⚠ {w}" for w in auto_cfg.warnings)])
+        for w in auto_cfg.warnings:
+            print(f"… ⚠ {w}", file=sys.stderr, flush=True)
+    # critic 배선: auto면 강제 ON(critic 절대 OFF 아님), 아니면 --critic-model 게이트(기존 동작).
+    effective_critic_model = auto_cfg.critic_model if auto_cfg is not None else args.critic_model
+    critic_on = bool(auto_cfg is not None) or bool(args.critic_model)
+
     # WO#54: idle(무진행) timeout을 모든 codex 클라이언트에 건다. brain(합성/replan/scaffold)과
     #   executor(빌드)는 *필수* → stall_retries=1(bounded 재시도 후 escalate). judge/critic은
     #   *best-effort* → stall_retries=0(degrade 빠르게). 멈춰도 무한 hang 없이 종료.
@@ -579,7 +685,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # WO#64: tier 사다리 — 미지정이면 단일 tier[(--model, --reasoning-effort)] = 기존 동작.
     # 다중 tier면 빌더 팩토리가 *tier 인자*(model/effort)로 그 강도의 executor를 만든다.
-    tier_ladder = parse_tier_ladder(args.tier_ladder, args.model, args.reasoning_effort)
+    # WO#65: --auto면 해석된 사다리(자동 effort 사다리/명시 오버라이드)를 쓴다.
+    tier_ladder = (
+        auto_cfg.tier_ladder if auto_cfg is not None
+        else parse_tier_ladder(args.tier_ladder, args.model, args.reasoning_effort)
+    )
 
     # 병렬 모드(>1): unit마다 worktree 경로에 묶인 executor/gate를 만든다.
     # 통합 gate(머지된 main 1회)는 위 gate(=main workdir)를 그대로 쓴다.
@@ -603,13 +713,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # spec critic: --critic-model 줄 때만 ON(read-only, 합성기와 다른 모델 권장 = 독립성).
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
+    # WO#65: --auto면 critic 강제 ON(절대 OFF 아님 — decomp critic/OR 살림). effective_critic_model이
+    #   None이면 codex 기본(최신)으로 돈다. 빌더 model과 분리 못 하면 위에서 독립성 경고를 냈다.
     critic_client = (
         CodexClient(
-            model=args.critic_model, idle_timeout=idle_to, max_duration=max_dur,
+            model=effective_critic_model, idle_timeout=idle_to, max_duration=max_dur,
             stall_retries=0,  # best-effort: 멈추면 진행(critic은 advisory)
             heartbeat=heartbeat, default_call_kind="critic",
         )
-        if args.critic_model else None
+        if critic_on else None
     )
 
     # 선제 스캐폴드(WO#27): --scaffold(기본 on)면 brain client를 scaffold 생성에 재사용.
@@ -678,6 +790,7 @@ def main(argv: list[str] | None = None) -> int:
             gate_factory=gate_factory,
             unit_retries=args.unit_retries,
             tier_ladder=tier_ladder,
+            auto_config_note=auto_config_note,
             scaffold_client=scaffold_client,
             install_deps=args.install_deps,
             skills_dir=skills_dir,

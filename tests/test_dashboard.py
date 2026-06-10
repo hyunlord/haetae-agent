@@ -567,6 +567,20 @@ def test_build_run_argv_reasoning_effort():
     assert "--reasoning-effort" not in argv2
 
 
+def test_validate_options_auto_default_false():
+    """WO#65: auto 기본 False(back-compat — 기존 API 호출은 --auto 안 붙음)."""
+    assert validate_options({})["auto"] is False
+    assert validate_options({"auto": True})["auto"] is True
+
+
+def test_build_run_argv_auto():
+    """WO#65: auto=True면 `--auto` 부착, 기본(False)이면 미부착(기존 동작 불변)."""
+    on = validate_options({"auto": True})
+    assert "--auto" in build_run_argv("o", Path("/abs/runs/r"), on)
+    off = validate_options({})
+    assert "--auto" not in build_run_argv("o", Path("/abs/runs/r"), off)
+
+
 def test_build_run_argv_is_arglist_not_shell():
     """argv 리스트(shell 아님) · order는 단일 argv 원소 · 경로는 runs/<id>/ 아래 서버 생성."""
     opts = validate_options({"max_parallel": 2, "scaffold": False, "skills": False})
