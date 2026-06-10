@@ -17,7 +17,12 @@ import yaml
 from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_critic as critic_mod
 from haetae.capability import PocRunner, governed_capability_preflight
 from haetae.deps import Runner as DepsRunner, ensure_deps
-from haetae.intake import SynthesisError, nudge_integration_deps, synthesize
+from haetae.intake import (
+    SynthesisError,
+    nudge_disjoint_scope,
+    nudge_integration_deps,
+    synthesize,
+)
 from haetae.llm import CodexStalled, LLMClient
 from haetae.metering import (
     MeteredClient,
@@ -661,6 +666,14 @@ def run_loop(
         # deps만 바꾸고 criteria/done_when 불변. best-effort(실패→원본 진행). 비용은 아래 drain.
         hb("합성")
         spec = nudge_integration_deps(
+            order, spec, m_client, context=synth_context, prompt_path=syn_prompt
+        )
+
+        # WO#59: disjoint-scope 넛지(#51의 형제) — 병렬 형제 유닛이 *같은 파일 scope*를 공유하면
+        # bounded 1회 재합성으로 disjoint하게 재배치(머지 충돌 선제 예방). bar 불변 가드로 채택
+        # (criteria 변경이면 reject·원본 유지). 겹침/미선언 없으면 no-op(추가 호출 0). advisory.
+        hb("합성")
+        spec = nudge_disjoint_scope(
             order, spec, m_client, context=synth_context, prompt_path=syn_prompt
         )
 

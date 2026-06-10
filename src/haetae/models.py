@@ -128,6 +128,10 @@ class DecompositionUnit(BaseModel):
     unit: str
     desc: str
     deps: list[str] = Field(default_factory=list)
+    # WO#59: 이 유닛이 *소유*하는 파일/모듈 영역(경로·glob 힌트). 병렬 형제 유닛이 서로
+    # disjoint한 scope를 가지면 worktree 머지가 깨끗(통합 벽 예방, #51의 형제 버전).
+    # optional·비파괴: 없으면 빈 리스트(기존 spec 무영향, deps/capability_requests 패턴).
+    scope: list[str] = Field(default_factory=list)
 
 
 # ──────────────────── 능력 획득 거버넌스 (WO#53 Phase F.1) ────────────────────

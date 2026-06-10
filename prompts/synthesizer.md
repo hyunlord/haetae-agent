@@ -37,7 +37,9 @@
   `order_raw`(str), `goal`(str), `task_type`(enum), `verifiability`(enum), `mode`(enum),
   `acceptance_criteria`(list), `non_goals`(list), `done_when`(str).
 - `constraints`, `non_goals`는 **문자열의 리스트**(`list[str]`). `{id, desc}` 같은 객체 리스트 **금지**.
-- `decomposition[]` 항목의 키는 **`unit`**(절대 `id` 아님), `desc`, 선택 `deps`(`list[str]`).
+- `decomposition[]` 항목의 키는 **`unit`**(절대 `id` 아님), `desc`, 선택 `deps`(`list[str]`),
+  선택 `scope`(`list[str]` — 그 유닛이 *소유*하는 파일/모듈 경로·glob). `scope`는 병렬 형제
+  유닛이 서로 다른 파일을 갖게 해 머지 충돌을 예방한다(아래 1d).
 - `acceptance_criteria[]`는 `id`, `desc`, `check`, 선택 `unit`(str). `check`의 명령 키는
   **`cmd`**(절대 `command` 아님), 그리고 `type`(enum), 선택 `pass`. `check`에 다른
   키(`command`, `desc` 등)를 **추가하지 마라**.
@@ -76,8 +78,8 @@ non_goals:
   - "마감일·우선순위·태그 등 확장 메타데이터"
 done_when: "모든 acceptance_criteria 통과 AND 기존 테스트 무회귀"
 decomposition:
-  - { unit: u1, desc: "저장 모델과 JSON 입출력 구현", deps: [] }
-  - { unit: u2, desc: "add/list/complete CLI 구현", deps: [u1] }
+  - { unit: u1, desc: "저장 모델과 JSON 입출력 구현", deps: [], scope: ["src/store.py"] }
+  - { unit: u2, desc: "add/list/complete CLI 구현", deps: [u1], scope: ["src/cli.py"] }
 open_questions: []
 ```
 
@@ -148,6 +150,17 @@ e2e 테스트·`sim:trace` 트레이스 진입점·"실제 엔진을 import"하�
 - **과직렬화 금지**: 통합 유닛은 *자기가 실제로 엮는* 유닛에만 의존하라. 서로 독립인
   빌더 유닛들끼리는 의존을 만들지 마라(병렬성 보존). 전부를 한 줄로 직렬화하는 게 아니다.
 - 비통합(순수 빌더) 유닛은 자기 *구현* 의존(예: API 모델 → 그걸 쓰는 로직)만 deps에 둔다.
+
+### 1d. 병렬 형제 유닛은 서로 다른 파일/모듈을 소유하라 (disjoint scope — 머지 충돌 예방)
+**쪼개기는 유닛별로 *다른 파일/모듈을 소유*할 때만 이득이다.** 서로 dep로 안 엮인 *병렬 형제*
+유닛이 같은 파일을 건드리면, 동시에 빌드돼 worktree 머지에서 충돌한다(빌더는 코드를 *통합*해야
+하므로 — 무작정 쪼개면 통합 벽을 더 세게 친다).
+
+- 가능하면 각 유닛에 **`scope`로 소유 파일 영역을 선언**하라(예: `scope: ["src/engine/store.ts"]`).
+- 형제 유닛끼리 *같은 파일*을 쓰게 되면: 한 유닛이 그 파일을 **소유**하고 나머지는 그 산출물에
+  **의존(`deps`)**하게 하라(→ 직렬화되어 순차 머지). 또는 *엮기*는 **통합 유닛**으로 미뤄라(1c).
+- **분해 품질이 레버다 — 유닛 개수가 아니다.** 더 잘게 쪼개는 게 목표가 아니라, *겹치지 않게*
+  쪼개는 게 목표다. scope가 겹칠 수밖에 없으면 차라리 한 유닛으로 합쳐라.
 
 ### 2. 묻지 말고 가정하라 (assume-don't-ask)
 주문에서 비어 있는 부분은 **네가 가장 합리적인 방향을 골라 채우고**,

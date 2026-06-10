@@ -352,3 +352,151 @@ def build_continuation_context(
         "# 새 주문(delta) — 아래가 이번에 추가/변경할 것이다",
     ]
     return "\n".join(lines)
+
+
+# ──────────────────── WO#59: disjoint-scope 분해 유도 (#51의 형제) ────────────────────
+#
+# "쪼개기"는 *유닛별로 다른 파일/모듈을 소유*할 때만 이득이다(병렬 worktree 머지가 깨끗).
+# 형제 유닛이 같은 파일을 건드리면 통합 벽(머지 충돌)을 더 세게 친다. #51이 *통합 유닛*의
+# 루트 충돌을 예방한다면, ③는 그 **형제 버전** — *병렬 형제 유닛*이 disjoint scope를 갖게 유도.
+#
+# 설계(#51 nudge_integration_deps와 동형):
+#   - **선제적 합성 경로에만**: 프롬프트 유도 + 결정적 탐지 → bounded 1회 재합성. decomp
+#     critic(#40)은 *무변경*(progress-only 유지 — scope-overlap을 weak 트리거로 넣지 않음).
+#   - **anti-erosion(bar 불변)**: 재구성이 bar(goal/done_when/acceptance_criteria/constraints/
+#     non_goals)를 하나라도 바꾸면 reject·원본 유지. scope/deps(=decomposition)만 채택.
+#   - **advisory·bounded**: 정확히 1회. 실패/예외 흡수→원본. scope 미선언/겹침 없음 → no-op(호출 0).
+
+
+def _transitive_deps(spec: ProjectSpec) -> dict[str, set[str]]:
+    """유닛별 *전이적* 의존 집합. 사이클은 visited 가드로 방어(무한루프 금지)."""
+    direct = {u.unit: set(u.deps or []) for u in spec.decomposition}
+    out: dict[str, set[str]] = {}
+    for unit in direct:
+        seen: set[str] = set()
+        stack = list(direct.get(unit, ()))
+        while stack:
+            d = stack.pop()
+            if d in seen:
+                continue
+            seen.add(d)
+            stack.extend(direct.get(d, ()))
+        out[unit] = seen
+    return out
+
+
+def _are_parallel(a: str, b: str, tdeps: dict[str, set[str]]) -> bool:
+    """a·b가 *병렬 형제*인가 — 서로 전이 의존으로 안 엮였으면 True(동시 빌드 → 머지 동시).
+
+    dep 경로로 엮였으면(직렬) 같은 파일을 건드려도 순차 머지라 충돌 위험 작음 → 형제 아님.
+    """
+    return b not in tdeps.get(a, set()) and a not in tdeps.get(b, set())
+
+
+def _scope_overlaps(spec: ProjectSpec) -> list[tuple[str, str, list[str]]]:
+    """병렬 형제 + 양쪽 scope 선언 + scope 겹침인 쌍을 결정적으로 탐지(보수적).
+
+    반환: [(unitA, unitB, 겹친_경로들)] (unit-id 정렬). 겹침은 *정확 문자열 일치*(퍼지 매칭
+    없음 → 오탐 회피, #51 보수성과 동형). 한쪽이라도 scope 미선언이면 그 쌍은 스킵(no-op).
+    """
+    units = spec.decomposition
+    if len(units) < 2:
+        return []
+    tdeps = _transitive_deps(spec)
+    scope_of = {u.unit: set(u.scope or []) for u in units}
+    overlaps: list[tuple[str, str, list[str]]] = []
+    ids = [u.unit for u in units]
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            sa, sb = scope_of.get(a) or set(), scope_of.get(b) or set()
+            if not sa or not sb:
+                continue  # 한쪽만/미선언 → no-op(보수적)
+            if not _are_parallel(a, b, tdeps):
+                continue  # 직렬(dep로 엮임) → 순차 머지, 충돌 위험 작음 → 스킵
+            shared = sa & sb
+            if shared:
+                lo, hi = sorted((a, b))
+                overlaps.append((lo, hi, sorted(shared)))
+    overlaps.sort(key=lambda x: (x[0], x[1]))
+    return overlaps
+
+
+def disjoint_scope_feedback(spec: ProjectSpec) -> str | None:
+    """병렬 형제 scope가 겹치면 #31 재합성 채널에 줄 disjoint 유도 피드백, 없으면 None."""
+    overlaps = _scope_overlaps(spec)
+    if not overlaps:
+        return None
+    lines = [
+        "병렬 형제 유닛(서로 dep로 안 엮인 유닛)이 *같은 파일/모듈 scope*를 공유한다 — "
+        "동시 빌드 시 같은 파일을 건드려 worktree 머지 충돌을 일으킨다.",
+        "각 파일/모듈은 *한 유닛만 소유*하게 분해를 재배치하라:",
+        "  · 한 유닛이 그 파일을 소유하고 나머지는 그 산출물에 의존(deps)하거나,",
+        "  · 엮기(여러 산출물 연결)는 *통합 유닛*으로 미뤄라(#51).",
+        "겹친 부분(고칠 대상):",
+    ]
+    for a, b, shared in overlaps:
+        lines.append(f"- [{a}] ↔ [{b}] 공유 scope: {', '.join(shared)}")
+    lines.append(
+        "**중요(불변)**: goal·done_when·acceptance_criteria·constraints·non_goals(성공 기준=bar)는 "
+        "한 글자도 바꾸지 마라. **decomposition의 scope/deps만** disjoint하게 고쳐라(기준 변경 금지)."
+    )
+    return "\n".join(lines)
+
+
+# bar(성공 기준) — 재구성이 이걸 하나라도 바꾸면 reject(anti-erosion). decomposition은 mutable.
+_BAR_FIELDS = ("goal", "done_when", "acceptance_criteria", "constraints", "non_goals")
+
+
+def _adopt_decomposition_only(
+    original: ProjectSpec, restructured: ProjectSpec
+) -> ProjectSpec:
+    """재구성에서 *decomposition(units/deps/scope)만* 채택 — bar가 byte-동일일 때만(anti-erosion).
+
+    bar(goal/done_when/acceptance_criteria/constraints/non_goals) 중 하나라도 바뀌면
+    disjoint nudge가 criteria 변경으로 둔갑한 것 → **reject·원본 유지**. 또한 재구성된
+    acceptance_criteria의 unit 태그가 새 unit 집합에서 dangling이면(bar 동일이어도) reject.
+    """
+    od = original.model_dump(by_alias=True, mode="json")
+    rd = restructured.model_dump(by_alias=True, mode="json")
+    if any(od.get(k) != rd.get(k) for k in _BAR_FIELDS):
+        return original  # bar 변경 → reject(anti-erosion)
+    # dangling 가드: ac.unit 태그가 새 decomposition에 없으면 reject(검증 불가 구조).
+    new_units = {u.unit for u in restructured.decomposition}
+    for ac in restructured.acceptance_criteria:
+        tag = ac.unit
+        if tag is not None and tag != "integration" and tag not in new_units:
+            return original
+    merged = original.model_copy(deep=True)
+    merged.decomposition = [d.model_copy(deep=True) for d in restructured.decomposition]
+    return merged
+
+
+def nudge_disjoint_scope(
+    order: str,
+    spec: ProjectSpec,
+    client: LLMClient,
+    *,
+    context: str | None = None,
+    prompt_path: str | Path = DEFAULT_PROMPT_PATH,
+    synth_retries: int = DEFAULT_SYNTH_RETRIES,
+) -> ProjectSpec:
+    """병렬 형제 scope가 겹치면 #31 채널로 *바운드 1회* 재합성해 disjoint하게 재배치한 spec 반환.
+
+    겹침 없음/미선언이면 no-op으로 원본(추가 LLM 호출 0·비용 불변). 넛지가 필요해도:
+      - 정확히 1회 재합성(bounded).
+      - 실패(SynthesisError/예외) 흡수 → 원본 진행(advisory).
+      - 성공해도 *decomposition만* 채택, bar 변경이면 reject·원본 유지(anti-erosion 가드).
+    적대 분리: feedback/context는 *합성기에만* — critic/judge 미수신(#58 패턴 유지).
+    """
+    feedback = disjoint_scope_feedback(spec)
+    if feedback is None:
+        return spec  # 형제 scope 겹침 없음 — no-op
+    try:
+        restructured = synthesize(
+            order, client, context=context, prompt_path=prompt_path,
+            feedback=feedback, synth_retries=synth_retries,
+        )
+    except Exception:  # noqa: BLE001 — 넛지는 advisory: 어떤 실패도 run을 막지 않는다(원본 진행)
+        return spec
+    return _adopt_decomposition_only(spec, restructured)
