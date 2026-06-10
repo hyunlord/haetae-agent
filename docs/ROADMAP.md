@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-10 · WO#1–55 · 577 tests · main @be64e44 · 핵심 로드맵 A–E 완료 · 통합 벽 3종 방어(예방·치료·되감기) · 신뢰성/가시성 보강**
+> **최종 갱신: 2026-06-10 · WO#1–59 · 628 tests · main @98de476 · 핵심 로드맵 A–E 완료 · 통합 벽 3종 방어 · 신뢰성/가시성 · 사용자 로드맵 ①②③ 완료**
 
 ---
 
@@ -16,7 +16,7 @@
 
 ---
 
-## 1. 완료 (WO#1–55, 577 tests)
+## 1. 완료 (WO#1–59, 628 tests)
 
 | 영역 | WO | 내용 |
 |---|---|---|
@@ -32,7 +32,7 @@
 | 합성 하드닝 | 31 | 재합성 YAML 파싱 실패 시 에러-피드백 재시도(critic 강화 유실 방지) |
 | 스킬 주입 (Phase B) | 32 | 로컬 스킬 레지스트리+키워드 매처 → 작업지시서 패턴 주입(**빌더 전용**, judge 무접촉, =LeanSearch). 시드: frontend-build·simulation-behavior |
 | 계측 | 33–34 | 토큰/코스트(codex `--json`) → budget.spent + event별 cost, 단계 전이 + 라이브 activity |
-| 문서 | 36·39·50 | docs/ROADMAP.md repo 단일출처 확립·갱신 |
+| 문서 | 36·39·50·56·60 | docs/ROADMAP.md repo 단일출처 확립·갱신 |
 | 웹 제어 (Phase E) | 37 | read-only 대시보드 → 제어 표면(`--allow-run` launch/stop/runs, 서브프로세스 격리, opt-in) |
 | 폴리시 | 38 | codex reasoning-effort(minimal..xhigh) 레버 |
 | 분해 critic (Phase C) | 40 | 매 replan마다 무진전 분해(goal 재진술·헛돎·실패반복) reject → 재계획. 독립 client·스킬 미주입(적대 분리), soft·bounded |
@@ -44,36 +44,40 @@
 | **통합 벽: 되감기** | 52 | 통합 OR 대안 사이에 checkpoint + main을 깨끗한 all-merged 상태로 git-reset(run workdir·기록 ref만, bounded, best-effort fallback). #41 통합 OR의 진짜 되감기 |
 | **능력 획득 (Phase F.1)** | 53 | governed 능력 획득 토대: 큐레이션 발견 + POC + **사람 승인(escalate)** + provenance. auto-adopt 없음·opt-in·executor sandbox 불변 |
 | **신뢰성: idle-timeout** | 54 | 모든 codex 호출에 *무진행* timeout(총-시간 cap 아님). `--json` 이벤트 스트리밍 읽기 → "마지막 이벤트 이후 N초 침묵"만 잼 → 멈춘 프로세스그룹 kill. 필수=재시도→escalate / best-effort=degrade. **진행 중인 긴 호출은 안 죽임**, judge stall=degrade(가짜 pass 아님) |
-| **가시성: 하트비트** | 55 | 라이브 현재활동 사이드카 `heartbeat.json`(state.yaml 무접촉). #54 스트림에서 in-flight codex 호출(합성·replan·빌드·critic·judge·통합 — director-side 포함) emit → 대시보드 라이브 배너(종류·유닛·경과·최근이벤트초·액션). idle 차오르면 amber/red(kill 전 멈춤 가시). 순수 텔레메트리·best-effort |
+| **가시성: 하트비트** | 55 | 라이브 현재활동 사이드카 `heartbeat.json`(state.yaml 무접촉). #54 스트림에서 in-flight codex 호출(director-side 포함) emit → 대시보드 라이브 배너(종류·유닛·경과·최근이벤트초·액션). idle 차오르면 amber/red(kill 전 멈춤 가시). 순수 텔레메트리·best-effort |
+| **주문 뷰 (사용자①)** | 57 | run 히스토리에서 *원 주문 전문*을 상세 헤더(합성 goal과 구분)+사이드바 hover로 표면화. `/api/runs`의 meta order client-join(새 엔드포인트 0). read-only·엔진 무접촉 |
+| **이어가기/계보 (사용자②a)** | 58 | `--continue-from`: 부모 최종 main 시딩 + scaffold 스킵 + 부모 spec/완료를 `context`로 증분 합성 + 계보(parent_run_id) 트리. **spec.yaml 사이드카 영속**(토대·대시보드 goal 보강). **judge에 부모 context 무주입(적대 분리)**·anti-erosion·state.yaml 스키마 불변 |
+| **disjoint-scope 유도 (사용자③)** | 59 | 병렬 형제 유닛이 서로 다른 파일 소유하게 선제 유도(#51 형제). optional `scope` 필드 + bounded nudge(**bar 불변 가드**). decomp critic 무변경(progress-only 유지). 효과 측정은 캡스톤 의존 |
 | 대시보드 v3~앱셸 | 42·44·46·47·49 | dense 라이브 리스트·DW식 요약 헤더·생애주기 phase 섹션+유닛 라운드 드릴다운·정리·**앱 셸(좌측 사이드바 RUNS + 새 run 모달 + 메인 위계)**. 전부 read-only 위성(엔진 무접촉) |
 
-**현재 상태**: 의뢰 하나로 *실행되는 React/Canvas 앱*이 나옴. 적대 게이트가 거친 동선·머지충돌·통합 크래시를 *가짜 done으로 안 덮고 정직하게 escalate*. **통합 벽에 3종 방어 완비** — 예방(#51 통합유닛 마지막 직렬화)·치료(#48 충돌 적응 재빌드)·되감기(#52 OR main-reset). medium 캡스톤서 **#48 실전 작동 확인**(u4 머지 충돌 → escalate 아니라 최신 main 재분기 + 형제 피드백 → 재빌드 → gate pass). **그러나** 같은 run의 u5 replan에서 codex 호출이 ~2시간 hang → 호출 timeout 부재 노출 → #54(idle-timeout)·#55(하트비트)로 fix. 동선 품질은 **여전히 미관측**(이번엔 통합 검증 도달 전 hang으로 정지) — 신뢰성·가시성 보강 후 재시도 대상.
+**현재 상태**: 의뢰 하나로 *실행되는 React/Canvas 앱*이 나옴. 적대 게이트가 거친 동선·머지충돌·통합 크래시를 *가짜 done으로 안 덮고 정직하게 escalate*. **통합 벽 3종 방어**(예방#51·치료#48·되감기#52) + **신뢰성**(#54 idle-timeout)·**가시성**(#55 하트비트) + **사용자 로드맵 ①②③ 완료**(원 주문 뷰#57·이어가기/계보#58·disjoint-scope#59). medium 캡스톤서 **#48 실전 작동 확인** 후 u5 replan codex hang → #54/#55로 fix. **단, 이번 일괄 변경(#48/#54/#55/#58/#59)은 유닛 레벨 검증만 — *실제 동선*에서의 작동·동선 품질은 여전히 미관측**(통합 검증 도달 = 다음 캡스톤의 일).
 
 ---
 
-## 2. 로드맵 (Phase A–E 완료, F 진행)
+## 2. 로드맵 (Phase A–E 완료, F 진행 · 사용자 ①②③ 완료)
 
-- **A — 웹 대시보드** ✅ #28 v1 + #35 v2 라이브 + v3~앱셸 #42/#44/#46/#47/#49 + 스마트폼 #45 + 하트비트 배너 #55. read-only state.yaml 뷰(엔진 위험 0).
-- **B — 스킬/지식 검색 주입** ✅ #32 (= LEAP LeanSearch). 로컬 레지스트리·키워드 매칭·빌더 전용(적대 분리 유지).
-- **C — 분해 critic at replan** ✅ #40 (= LEAP LLM 리뷰어). 무진전 분해 차단.
-- **D — OR 노드 + 백트래킹** ✅ #41 (= LEAP AND-OR DAG) + 통합 되감기 #52. bar 불변·bounded.
-- **E — 웹에서 run 실행/제어** ✅ #37. read-only 뷰 → 제어 표면(`--allow-run`, opt-in 가드).
-- **F — governed 능력 획득** ⏳ F.1 토대 #53(발견+POC+사람승인+provenance, opt-in). **F.1b**(라이브 POC/install)·**F.2**(인터넷 검색 = director-side 리서치)·**F.3**(강격리) 보류 — 채택은 항상 사람 승인, sandbox 철학 일관.
+- **A — 웹 대시보드** ✅ #28 v1 + #35 v2 + v3~앱셸 #42/#44/#46/#47/#49 + 스마트폼 #45 + 하트비트 배너 #55 + 주문 뷰/계보 트리 #57/#58. read-only(엔진 위험 0).
+- **B — 스킬/지식 검색 주입** ✅ #32 (= LEAP LeanSearch). 빌더 전용(적대 분리).
+- **C — 분해 critic at replan** ✅ #40. 무진전 분해 차단(progress-only, #59에서도 무변경 유지).
+- **D — OR 노드 + 백트래킹** ✅ #41 + 통합 되감기 #52. bar 불변·bounded.
+- **E — 웹에서 run 실행/제어** ✅ #37. `--allow-run` opt-in.
+- **F — governed 능력 획득** ⏳ F.1 토대 #53. F.1b/F.2/F.3 보류 — 채택은 항상 사람 승인.
+- **사용자 ①②③** — ① 주문 뷰 ✅#57 · ②a 이어가기/계보 ✅#58(②b 깊은 증분 보류) · ③ disjoint-scope ✅#59(측정 캡스톤 의존).
 
 ---
 
 ## 3. 백로그 (우선순위 ~순)
 
-- **신뢰성·가시성 확인 캡스톤** — #54/#55 적용 상태로 medium 재실행 → 드디어 통합 검증 도달 + **동선 품질 첫 관측** 시도. (north star 직전 관문.)
-- **run 히스토리 전체 주문 뷰** (사용자 1) — run 리스트/상세에서 원 주문(spec) 표시. 작은 대시보드 추가(state에 spec 있음).
-- **run 이어가기 / 계보** (사용자 2) — 완료된 run에서 이어서 새 run: parent/child 계보, 증분 합성(greenfield 아님), 사이드바 계보 트리. medium 설계 WO.
-- **disjoint-scope 분해 유도** — 쪼개기는 *유닛별 다른 파일 소유*일 때만 이득(머지 깨끗). 무작정 쪼개면 통합 벽 악화(builder는 코드 통합 必 ≠ DW read-only 리서치). 합성/분해 critic을 disjoint scope 쪽으로 튜닝. (개수 아닌 분해 품질이 레버.)
-- **능력 획득 F.1b/F.2/F.3** — 라이브 POC·install / 인터넷 검색(director-side, 사용자 3 리서치 단계와 연결) / 강격리. 채택은 사람 승인 유지.
-- **stale-status 대조** — 죽은 run이 `running`+가짜 경과로 뜸. state-status vs 실제 프로세스 생존 대조 → "stale" 표시(#55 last-event-age가 부분 완화 — kill 전 amber/red). + **stopped_interrupted** 전용 상태(현재 stopped_stuck 재사용, "막힘"↔"사용자 중단" 미구분).
-- **per-source 비용 세분** — event.cost가 mixed(orchestration+executor+judge) → by_source 뭉뚱그려짐. source별 sub-cost 분리(데이터 모델 변경). total ≥ Σby_source 정직 표기 중.
+- **신뢰성·가시성 확인 캡스톤** — #54/#55/#58/#59 적용 상태로 medium 재실행 → 통합 검증 도달 + **동선 품질 첫 관측** + #48 외 일괄 변경 end-to-end 검증. (north star 직전 관문.)
+- **②b — 깊은 증분(이어가기)** — 검증된 유닛의 *명시적 재사용*(현재 #58은 context "다시 짓지 마라" 권고만), done 유닛을 새 state에 done으로 시드해 스케줄러 skip, delta DAG. 통합 벽 재사용 로직 동반.
+- **disjoint 전용 feedback 채널** — ③(#59) nudge가 #20/#51의 "criteria 강화" preamble 채널을 공유 → bar-불변 가드와 상충해 *nudge가 reject로 no-op되기 쉬움*. "scope/deps만 고쳐라" 전용 채널 분리. 캡스톤서 ③가 자주 reject되면 우선순위↑.
+- **능력 획득 F.1b/F.2/F.3** — 라이브 POC·install / 인터넷 검색(director-side, north star 리서치 단계와 연결) / 강격리. 채택은 사람 승인 유지.
+- **stale-status 대조** — 죽은 run이 `running`+가짜 경과로 뜸. state-status vs 실제 프로세스 생존 대조 → "stale" 표시(#55 last-event-age가 부분 완화). + **stopped_interrupted** 전용 상태(현재 stopped_stuck 재사용).
+- **CLI run 주문 영속화** — `haetae.run`(CLI)은 meta.json 미생성 → CLI run은 #57 주문 뷰서 폴백 안내만. CLI도 order 사이드카 남기면 완전 커버.
+- **per-source 비용 세분** — event.cost가 mixed → by_source 뭉뚱그려짐. source별 sub-cost 분리(데이터 모델 변경). total ≥ Σby_source 정직 표기 중.
 - **환경 노이즈 정리** — oh-my-codex 툴링(`.omx/logs/*`·`.omx/state/*`)이 run workdir에 로그 흘려 머지 충돌 유발. worktree gitignore/정리.
 - deps-요청 채널(B.2): executor가 필요 dep 선언 → director 선설치. 스킬 매칭 word-boundary/의미·LLM 매칭(현재 substring). DAG memoization·검증 컴포넌트 재사용·direct-first then decompose·pnpm/yarn/container 샌드박스·judge==executor 독립성 경고·infer-but-confirm.
-- **north star (사용자 3)**: *매우 복잡한 의뢰를 끝까지 완성*(예: 고품질 Mario류). 조각 — 리서치 단계(F.2 director-side 네트워크) + 끝까지(루프·게이트 bounded 상한 ↑) + 통합 벽이 현재 천장 + IP(원작 고품질, 복제 X). 여러 WO 여정.
+- **north star (사용자 ③ 최종)**: *매우 복잡한 의뢰를 끝까지 완성*(예: 고품질 Mario류). 조각 — 리서치 단계(F.2 director-side 네트워크) + 끝까지(루프·게이트 bounded 상한 ↑) + 통합 벽이 현재 천장 + IP(원작 고품질, 복제 X). 여러 WO 여정.
 - **행동 품질 경계**: "자연스러우냐"는 비전/Playwright OUT → 부분적으로 사람 눈 영역. run-judge는 "입증 안 됨"까지 자동.
 
 ---
@@ -81,10 +85,11 @@
 ## 4. 운영 메모
 
 - **프로토콜**: director(Claude)가 work order를 .md로 작성 → 사람이 CC에 전달 → CC 구현/commit/push → director가 repo clone+pytest로 *직접* 검증.
-- **검증**: `PYTHONPATH=src python3 -m pytest -q` (또는 `uv run pytest -q`). 현재 **577 passed, 2 skipped**(codex opt-in).
-- **캡스톤 (웹)**: 대시보드 `--allow-run`으로 띄우고 `+ 새 run` 폼. **reasoning-effort=medium 권장**(xhigh는 토큰 ~10배·반복엔 과함, 핀포인트만). **critic-model 필수**(비면 분해 critic·OR노드 OFF). max-parallel>1(OR은 병렬 경로).
-- **캡스톤 (CLI)**: `uv run python -m haetae.run --order "..." --workdir ... --state-path ... --executor codex --critic-model gpt-5.5 --max-parallel 4 --run-timeout 120 --reasoning-effort medium --scaffold [--codex-idle-timeout 300]`. (paste: 백슬래시 줄바꿈 금지, 실값, state-path는 mkdir 금지.)
+- **검증**: `PYTHONPATH=src python3 -m pytest -q` (또는 `uv run pytest -q`). 현재 **628 passed, 2 skipped**(codex opt-in).
+- **캡스톤 (웹)**: 대시보드 `--allow-run`으로 띄우고 `+ 새 run` 폼(이어가기는 run의 "이어가기" 버튼 → 부모 컨텍스트 배너). **reasoning-effort=medium 권장**(xhigh는 토큰 ~10배). **critic-model 필수**(비면 분해 critic·OR OFF). max-parallel>1.
+- **캡스톤 (CLI)**: `uv run python -m haetae.run --order "..." --workdir ... --state-path ... --executor codex --critic-model gpt-5.5 --max-parallel 4 --run-timeout 120 --reasoning-effort medium --scaffold [--codex-idle-timeout 300] [--continue-from <부모 run-id|state-dir>]`. (paste: 백슬래시 줄바꿈 금지, 실값, state-path는 mkdir 금지.)
+- **이어가기**: `--continue-from`이 부모 최종 main 시딩 + scaffold 스킵 + 부모 spec/완료를 증분 context로 주입. spec은 `spec.yaml` 사이드카(state.yaml 옆)로 영속 — 대시보드 goal/done_when 보강에도 사용.
 - **신뢰성**: 모든 codex 호출에 idle-timeout(#54, 기본 300s 무음 → kill). 진행 중인 긴 호출은 안 죽음. `--codex-idle-timeout`로 조정.
-- **대시보드**: `uv run python -m haetae.dashboard [--allow-run] --runs-dir <dir> --port 8000` → `localhost:8000`(SSE 라이브). **라이브 하트비트 배너**(#55, heartbeat.json)로 in-flight 호출·last-event-age 가시. 제어는 `--allow-run` opt-in.
+- **대시보드**: `uv run python -m haetae.dashboard [--allow-run] --runs-dir <dir> --port 8000` → `localhost:8000`(SSE 라이브). **라이브 하트비트 배너**(#55)·**원 주문/계보 트리**(#57/#58). 제어는 `--allow-run` opt-in.
 - **비용**: tokens 항상 집계. usd는 `--pricing` 주입 시(구독 codex는 usd 본질 N/A — tokens가 신호). No Fake Metrics.
-- **안전 불변**: `providers/codex.py ALLOWED_SANDBOXES=("read-only","workspace-write")` — executor에 네트워크 안 줌. deps/스캐폴드는 host에서만. 대시보드는 read-only 위성(엔진 무접촉, 무import 가드).
+- **안전 불변**: `providers/codex.py ALLOWED_SANDBOXES=("read-only","workspace-write")` — executor에 네트워크 안 줌. deps/스캐폴드/이어가기 시딩은 host에서만. 대시보드는 read-only 위성(엔진 무접촉). 적대 분리: 부모 context·스킬·disjoint feedback은 *합성기/빌더*만, judge/critic 무주입.
