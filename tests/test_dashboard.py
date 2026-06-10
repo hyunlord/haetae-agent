@@ -693,6 +693,84 @@ def test_list_runs_skips_bad_dir_names(tmp_path: Path):
     assert rm.list_runs() == []
 
 
+# ──────────────────── WO#57 원 주문 전체 뷰 (read-only · dashboard-only) ────────────────────
+
+_LONG_ORDER = (
+    "리테일 체크아웃 흐름을 시뮬레이션하는 React/Canvas 앱을 만들어라.\n"
+    "- 손님 도착 → 카트 담기 → 계산대 줄서기 → 결제 → 퇴장\n"
+    "- 줄이 길어지면 새 계산대 오픈, 대기시간/처리량 라이브 차트\n"
+    'colon: 포함 "따옴표"도 그대로 보존되어야 한다(truncate 금지).'
+)
+
+
+def test_api_runs_returns_full_untruncated_order(tmp_path: Path):
+    """/api/runs는 긴/여러 줄 주문을 *전문 그대로*(truncate 없이) 반환한다 — 원 주문 뷰의 데이터원."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    _write_run(rm.runs_dir, "20260610-100000-x", "finished", order=_LONG_ORDER)
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/runs")
+        assert code == 200
+        runs = json.loads(body)["runs"]
+        assert runs[0]["order"] == _LONG_ORDER  # 줄바꿈·콜론·따옴표 전부 보존, 잘림 없음
+    finally:
+        httpd.shutdown()
+
+
+def test_list_runs_order_not_truncated(tmp_path: Path):
+    """list_runs도 full order(표시-데이터 정확성: 어떤 경로로도 안 잘림)."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    _write_run(rm.runs_dir, "20260610-110000-y", "finished", order=_LONG_ORDER)
+    assert rm.list_runs()[0]["order"] == _LONG_ORDER
+
+
+def test_meta_less_run_does_not_break_runs_or_state(tmp_path: Path):
+    """meta 없는 run 디렉터리가 섞여도 /api/runs·/api/state 정상 200(에러 아님, 폴백 경로 보장)."""
+    rm = RunManager(tmp_path / "runs", allow_run=False)
+    _write_run(rm.runs_dir, "20260610-120000-ok", "finished", order="정상 주문")
+    (rm.runs_dir / "20260610-130000-cli").mkdir()  # meta.json 없는 CLI/스크래치 run
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, "/api/runs")
+        assert code == 200
+        ids = {r["id"] for r in json.loads(body)["runs"]}
+        assert "20260610-120000-ok" in ids
+        assert "20260610-130000-cli" not in ids  # meta 없으면 목록 부재 → 프런트가 폴백 표시
+        # state 기본 뷰도 200(빈 상태, 에러 아님).
+        code2, _ = _get(port, "/api/state")
+        assert code2 == 200
+    finally:
+        httpd.shutdown()
+
+
+def _dashboard_html() -> str:
+    from haetae.dashboard import INDEX_HTML_PATH
+    return INDEX_HTML_PATH.read_text(encoding="utf-8")
+
+
+def test_dashboard_html_has_run_order_element_and_render():
+    """원 주문 표시 요소(#run-order) + 렌더 함수 + 선택 run 매칭 로직이 dashboard.html에 존재."""
+    html = _dashboard_html()
+    assert 'id="run-order"' in html              # 표시 요소
+    assert "function renderRunOrder" in html      # 렌더 함수
+    assert "function findRun" in html             # 선택 run id로 /api/runs order 매칭(client join)
+    assert "renderRunOrder()" in html             # render/selectRun 등에서 호출됨
+
+
+def test_dashboard_html_sidebar_title_tooltip_and_fallback():
+    """사이드바 .rorder에 title(전체 주문 hover) + meta 없는 run 폴백 문구 존재."""
+    html = _dashboard_html()
+    assert 'class="rorder" title="' in html       # hover 툴팁에 전체 주문
+    assert "원 주문 기록 없음" in html              # meta 없는 run 폴백(에러 아님)
+
+
+def test_dashboard_html_distinguishes_order_from_goal():
+    """원 주문(원문)을 합성 goal과 명확히 구분하는 레이블이 있다."""
+    html = _dashboard_html()
+    assert "주문(원문)" in html
+    assert "합성 goal과 별개" in html
+
+
 # ──────────────────── 서버 엔드포인트 ────────────────────
 
 

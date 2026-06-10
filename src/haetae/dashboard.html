@@ -88,6 +88,13 @@
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
 
   .banner { background:#7c2d12; border:1px solid #b45309; color:#fed7aa; padding:10px 14px; border-radius:8px; margin:14px 22px 0; }
+  /* WO#57 원 주문(원문) 블록 — 합성 goal과 구분, truncate 금지(스크롤 박스) */
+  #run-order { margin:14px 22px 0; background:var(--panel); border:1px solid var(--bd); border-radius:8px; padding:10px 14px; }
+  #run-order .ro-h { font-size:10px; text-transform:uppercase; letter-spacing:.07em; color:var(--mut); margin-bottom:6px; }
+  #run-order .ro-sub { text-transform:none; letter-spacing:0; color:var(--mut2); }
+  #run-order .ro-body { font-size:13px; color:var(--tx); white-space:pre-wrap; word-break:break-word;
+                        line-height:1.5; max-height:180px; overflow:auto; }
+  #run-order .ro-empty { font-size:12px; color:var(--mut); font-style:italic; }
   /* WO#55 라이브 하트비트 배너 — 진행 중 codex 호출(director-side 포함) */
   #hb-banner { margin:14px 22px 0; display:flex; flex-direction:column; gap:6px; }
   .hb-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; font-size:12px;
@@ -355,6 +362,8 @@
     <div id="hb-banner" style="display:none"></div>
     <div id="main-empty" class="empty-hint" style="display:none"></div>
     <div id="summary" class="summary" style="display:none"></div>
+    <!-- WO#57: 선택된 run의 원 주문(내가 친 의뢰문) 전문 — /api/runs의 order를 client-side 매칭 -->
+    <div id="run-order" style="display:none"></div>
 
     <div id="main-cols" class="main-cols">
       <!-- 주 패널: 생애주기 스텝퍼(빌드에 유닛 리스트 중첩) + 로그 + DAG/transitions(강등) -->
@@ -431,12 +440,15 @@ const POLL_MS = __POLL_MS__;
 const ALLOW_RUN = __ALLOW_RUN__;   // 제어 표면 활성 여부(--allow-run). off면 폼/stop 숨김.
 let SEL = null;       // 선택된 유닛 id
 let RUN = null;       // 뷰어가 타겟팅하는 run id (null = 기본 --state-path 뷰)
+let RUNS = [];        // 최근 /api/runs 목록 캐시(원 주문 매칭용 client-side join, WO#57)
 let VIEW = null;
 let es = null;        // 현재 EventSource(타겟 바뀌면 재연결)
 let sseConnected = false;
 let lastMsg = 0;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s==null?"":String(s)).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// 속성값용 이스케이프(따옴표까지 + 줄바꿈→공백) — title 툴팁 등 attribute 컨텍스트.
+const escA = (s) => esc(s).replace(/"/g,'&quot;').replace(/[\r\n]+/g,' ');
 const num = (n) => (n==null? "—" : Number(n).toLocaleString());
 const usd = (n) => (n==null? "—" : "$"+Number(n).toFixed(4));
 const dur = (s) => { if(s==null) return "—"; s=Math.round(s); if(s<60) return s+"s"; const m=Math.floor(s/60); return m+"m"+(s%60)+"s"; };
@@ -479,6 +491,7 @@ function clearViewer(){
 function selectRun(id){
   RUN = id; SEL = null; VIEW = null;
   document.querySelectorAll(".run-row").forEach(x=>x.classList.toggle("sel", x.dataset.id===id));
+  renderRunOrder();  // 즉시 원 주문 갱신(뷰 로드 전에도 캐시로 표시 — WO#57)
   // 접힌 RUNS 헤더에 "· 보는 중: <id>" 한 줄(선택 run 항상 노출).
   $("runs-headsel").textContent = id ? ("· 보는 중: "+id) : "";
   startSSE(); pollOnce(); loadLog();
@@ -519,8 +532,28 @@ function unitLogLines(uid){
   return LOG_LINES.filter(l => re ? re.test(l) : l.includes(uid));
 }
 const RSTAT_KO = {running:"도는 중", finished:"완료", stopped:"정지됨", failed:"실패", unknown:"미상"};
+// WO#57: 선택 run id로 /api/runs 캐시에서 원 주문 매칭(client-side join, 새 엔드포인트 없음).
+function findRun(id){ return (RUNS||[]).find(r => r && r.id === id) || null; }
+function renderRunOrder(){
+  const box = $("run-order"); if (!box) return;
+  if (!RUN){ box.style.display="none"; box.innerHTML=""; return; }  // 기본(--state-path) 뷰 — run 미타겟
+  const r = findRun(RUN);
+  const order = r && r.order;
+  if (!order){
+    // meta 없는 run(CLI/스크래치) — 에러 아님, 차분한 폴백(#44 빈-상태 패턴 일관).
+    box.style.display = "block";
+    box.innerHTML = '<div class="ro-h">주문(원문)</div>'
+      + '<div class="ro-empty">원 주문 기록 없음 (CLI 실행)</div>';
+    return;
+  }
+  // 원 주문 전문 — 합성 goal과 명확히 구분, truncate 금지(스크롤 박스로 전부 보임).
+  box.style.display = "block";
+  box.innerHTML = '<div class="ro-h">주문(원문)<span class="ro-sub"> — 내가 친 의뢰문 전문 (합성 goal과 별개)</span></div>'
+    + '<div class="ro-body">'+esc(order)+'</div>';
+}
 function renderRuns(payload){
   const runs = (payload && payload.runs) || [];
+  RUNS = runs;  // 캐시(원 주문 매칭·새로고침 시 최신 order 반영)
   $("new-run-btn").style.display = ALLOW_RUN ? "inline-flex" : "none";
   $("ctl-state").textContent = ALLOW_RUN
     ? ($("ctl-state").textContent || "제어 활성 (+ 새 run / 정지 가능)")
@@ -533,7 +566,7 @@ function renderRuns(payload){
       + '<span class="rid">'+esc(r.id)+'</span>'
       + '<span class="rbadge r-'+esc(st)+'">'+esc(RSTAT_KO[st]||st)+'</span>'
       + (canStop ? '<button class="btn danger stop-btn" data-id="'+esc(r.id)+'">정지</button>' : '')
-      + '<span class="rorder">'+esc(r.order||"")+'</span>'
+      + '<span class="rorder" title="'+escA(r.order||"")+'">'+esc(r.order||"")+'</span>'  // 한 줄 truncate 유지 + hover로 전문(WO#57)
       + '</div>';
   }).join("") : '<div class="empty" style="padding:8px 6px">아직 run 없음'+(ALLOW_RUN?' — "+ 새 run"으로 시작':'')+'</div>';
   list.querySelectorAll(".run-row").forEach(row=>{
@@ -542,6 +575,7 @@ function renderRuns(payload){
   list.querySelectorAll(".stop-btn").forEach(b=>{
     b.onclick = (e)=>{ e.stopPropagation(); stopRun(b.dataset.id, b); };
   });
+  renderRunOrder();  // 캐시 갱신 후 원 주문 블록도 최신 order로(선택 run 매칭)
 }
 async function loadRuns(){
   try {
@@ -647,6 +681,7 @@ function render(v) {
     $("summary").style.display = "none"; $("summary").innerHTML = "";
     $("banner-slot").innerHTML = "";
     $("hb-banner").style.display = "none"; $("hb-banner").innerHTML = "";
+    $("run-order").style.display = "none"; $("run-order").innerHTML = "";
     $("specref").textContent = "";
     $("status").textContent = "—"; $("status").className = "pill mut";
     clearViewer();
@@ -661,6 +696,7 @@ function render(v) {
     $("summary").style.display = "none"; $("summary").innerHTML = "";
     $("status").textContent = "—"; $("status").className = "pill mut";
     renderHeartbeat(v);  // WO#55: state 로드 실패에도 하트비트는 별도 — 멈춤 진단 위해 표시
+    renderRunOrder();    // WO#57: 원 주문은 meta 기반(state 무관) — 로드 실패에도 무엇을 시켰는지 표시
     clearViewer();
     return;
   }
@@ -673,6 +709,7 @@ function render(v) {
     bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
   } else bs.innerHTML = "";
   renderHeartbeat(v);  // WO#55: 진행 중 codex 호출 라이브 배너(director-side 포함)
+  renderRunOrder();    // WO#57: 선택 run의 원 주문 전문(합성 goal과 구분)
   renderSummary(v);
   renderPhases(v);     // 단계 섹션 먼저(빌드 섹션 안에 #unitlist 생성)
   renderUnitList(v);   // 그 #unitlist에 유닛 dense 리스트 채움
