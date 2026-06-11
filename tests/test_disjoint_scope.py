@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 from haetae.intake import (
-    _adopt_decomposition_only,
+    _adopt_scope_only,
     _are_parallel,
     _scope_overlaps,
     _transitive_deps,
@@ -239,45 +239,48 @@ def test_nudge_absorbs_resynthesis_exception_returns_original():
 
 
 @pytest.mark.parametrize("field", ["goal", "done_when", "criteria", "constraints", "non_goals"])
-def test_bar_change_is_rejected_original_kept(field):
-    """재구성이 bar(goal/done_when/criteria/constraints/non_goals) 중 하나라도 바꾸면 reject·원본 유지."""
+def test_bar_change_ignored_scope_still_adopted(field):
+    """WO#72 no-op 해소 + 구성적 anti-erosion: 모델이 scope를 바꾸며 bar도 건드려도 →
+    scope 변경은 *적용*되고(형제 disjoint), bar는 *원본과 byte-동일*(모델 변경 무시). reject로 안 날아감."""
     client = MockClient([_restructured_yaml(disjoint=True, bar_change=field)])
     orig = _overlapping_spec()
     out = nudge_disjoint_scope("주문", orig, client, prompt_path=PROMPT_PATH)
-    # bar 변경 → 통째 reject → 원본(겹친 scope 그대로, disjoint 재배치도 안 됨).
+    # scope 변경이 *실제로* 적용됨(no-op 아님) — 형제가 disjoint해짐.
     assert {u.unit: u.scope for u in out.decomposition} == {
-        "u1": ["src/shared.ts"], "u2": ["src/shared.ts"]
+        "u1": ["src/a.ts"], "u2": ["src/b.ts"]
     }
-    assert out.goal == orig.goal and out.done_when == orig.done_when
+    # 바는 모델이 건드려도 무시 — 원본과 byte-동일(anti-erosion 구성적).
+    od = orig.model_dump(by_alias=True, mode="json")
+    nd = out.model_dump(by_alias=True, mode="json")
+    for k in ("goal", "done_when", "acceptance_criteria", "constraints", "non_goals"):
+        assert nd[k] == od[k], f"바 필드 {k}가 원본과 달라짐(anti-erosion 위반)"
 
 
-def test_scope_deps_only_change_is_adopted():
-    """scope/deps만 바뀐 재구성(bar 동일)은 채택."""
-    spec = _spec([("u1", "a", [], ["src/shared.ts"]), ("u2", "b", [], ["src/shared.ts"])])
-    out = _adopt_decomposition_only(
-        spec,
-        _spec([("u1", "a", [], ["src/a.ts"]), ("u2", "b", ["u1"], ["src/b.ts"])]),
+def test_adopt_scope_only_keeps_bar_from_original():
+    """`_adopt_scope_only`: scope/deps만 떼어 원본에 splice — bar는 모델이 바꿔도 원본 그대로."""
+    orig = _spec(
+        [("u1", "a", [], ["src/shared.ts"]), ("u2", "b", [], ["src/shared.ts"])],
+        goal="원본 goal", done_when="원본 done_when",
     )
+    restructured = _spec(
+        [("u1", "a", [], ["src/a.ts"]), ("u2", "b", ["u1"], ["src/b.ts"])],
+        goal="모델이 바꾼 goal", done_when="모델이 완화한 done_when",
+    )
+    out = _adopt_scope_only(orig, restructured)
+    # scope/deps는 재구성에서 채택
     assert {u.unit: (u.deps, u.scope) for u in out.decomposition} == {
         "u1": ([], ["src/a.ts"]), "u2": (["u1"], ["src/b.ts"]),
     }
+    # bar는 원본(모델 변경 무시)
+    assert out.goal == "원본 goal" and out.done_when == "원본 done_when"
 
 
-def test_dangling_ac_unit_tag_rejected():
-    """재구성이 ac.unit 태그가 dangling되게 unit을 바꾸면(bar 동일이어도) reject."""
-    orig = _spec(
-        [("u1", "a", [], ["src/shared.ts"]), ("u2", "b", [], ["src/shared.ts"])],
-        criteria=[AcceptanceCriterion(id="ac1", desc="기준", unit="u1",
-                                       check=Check(type="test", cmd="pytest"))],
-    )
-    # 재구성이 u1을 ux로 개명 → ac1.unit=u1이 dangling. bar(criteria 포함)는 동일.
-    restructured = _spec(
-        [("ux", "a", [], ["src/a.ts"]), ("u2", "b", [], ["src/b.ts"])],
-        criteria=[AcceptanceCriterion(id="ac1", desc="기준", unit="u1",
-                                       check=Check(type="test", cmd="pytest"))],
-    )
-    out = _adopt_decomposition_only(orig, restructured)
-    assert out is orig  # dangling → reject
+def test_adopt_scope_only_structural_change_returns_original():
+    """재구성이 unit 집합을 바꾸면(개명/추가) scope-only splice 불가 → 보수적으로 원본(dangling 방지)."""
+    orig = _spec([("u1", "a", [], ["src/shared.ts"]), ("u2", "b", [], ["src/shared.ts"])])
+    restructured = _spec([("ux", "a", [], ["src/a.ts"]), ("u2", "b", [], ["src/b.ts"])])
+    out = _adopt_scope_only(orig, restructured)
+    assert out is orig  # 구조 변형 → 원본(데드락/dangling 방지)
 
 
 # ──────────────────────────── decomp critic 불변(적대 분리) ────────────────────────────

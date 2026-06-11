@@ -108,12 +108,19 @@ def synthesize(
     prompt_path: str | Path = DEFAULT_PROMPT_PATH,
     *,
     feedback: str | None = None,
+    feedback_mode: str = "criteria_strengthen",
     synth_retries: int = DEFAULT_SYNTH_RETRIES,
 ) -> ProjectSpec:
     """주문을 합성기에 태워 검증된 ProjectSpec을 반환한다.
 
-    feedback: 직전 합성된 spec에 대한 적대적 비평. 주어지면 user 메시지에 얹어
-              모델이 *기준을 강화한* spec을 다시 내도록 유도한다(critic 재합성 경로).
+    feedback: 직전 합성된 spec에 대한 재합성 피드백. 주어지면 user 메시지에 얹는다.
+    feedback_mode: 그 피드백의 *성격*에 맞춰 preamble을 고른다 (WO#72).
+      - "criteria_strengthen"(기본, #20 spec critic 재합성): acceptance_criteria/done_when을
+        *더 엄격하게 강화*하라고 유도한다(바를 *조이는* 정당한 경로).
+      - "scope_only"(#59 disjoint 등): **바(criteria/done_when/goal/constraints/non_goals)는
+        그대로 두고 decomposition의 scope/deps만 조정**하라고 유도한다. 바 강화 preamble이
+        scope 넛지에 섞여 모델이 바를 건드리던 버그(#72)를 끊는다 — 채택부의 splice가
+        scope/deps만 떼므로 모델이 바를 건드려도 무시되지만, preamble부터 신호를 맞춘다.
 
     synth_retries: 출력 YAML이 *파싱 실패*할 때 에러를 되먹여 다시 시킬 횟수
                    (기본 2 → 총 3시도). 파싱 실패에 한정 — 비-매핑/스키마 검증 실패는
@@ -127,12 +134,21 @@ def synthesize(
     if context:
         base_user += f"\n\n# 프로젝트 컨텍스트(project_context)\n{context}"
     if feedback:
-        base_user += (
-            "\n\n# ⚠️ 직전 합성된 spec이 적대적 비평에서 '물렁하다'고 지적됨 — "
-            "아래 지적을 반영해 acceptance_criteria/done_when을 *더 엄격하게* 강화한 "
-            "ProjectSpec을 다시(그리고 그것만) 출력하라\n"
-            f"{feedback}"
-        )
+        if feedback_mode == "scope_only":
+            base_user += (
+                "\n\n# ⚠️ 분해 재배치 요청 — **바(성공 기준)는 한 글자도 바꾸지 마라**\n"
+                "acceptance_criteria·done_when·goal·constraints·non_goals는 *그대로 두고*, "
+                "아래 지적에 따라 **decomposition의 scope/deps만** 조정한 ProjectSpec을 "
+                "다시(그리고 그것만) 출력하라\n"
+                f"{feedback}"
+            )
+        else:  # "criteria_strengthen" (기본)
+            base_user += (
+                "\n\n# ⚠️ 직전 합성된 spec이 적대적 비평에서 '물렁하다'고 지적됨 — "
+                "아래 지적을 반영해 acceptance_criteria/done_when을 *더 엄격하게* 강화한 "
+                "ProjectSpec을 다시(그리고 그것만) 출력하라\n"
+                f"{feedback}"
+            )
 
     repair_note = ""
     last_err: SynthesisError | None = None
@@ -472,31 +488,26 @@ def disjoint_scope_feedback(spec: ProjectSpec) -> str | None:
     return "\n".join(lines)
 
 
-# bar(성공 기준) — 재구성이 이걸 하나라도 바꾸면 reject(anti-erosion). decomposition은 mutable.
-_BAR_FIELDS = ("goal", "done_when", "acceptance_criteria", "constraints", "non_goals")
+def _adopt_scope_only(original: ProjectSpec, restructured: ProjectSpec) -> ProjectSpec:
+    """재구성에서 **scope(+deps)만** 떼어 원본 유닛에 splice — bar는 *언제나 원본*(WO#72).
 
+    `_adopt_deps_only`(#51)의 미러 + scope. **anti-erosion을 *구성적으로* 보장**한다: 바
+    (criteria/done_when/goal/constraints/non_goals)는 원본에서만 복사하므로, 모델이 재합성에서
+    바를 건드려도 *애초에 안 가져온다* → reject가 아니라 무시. 덕분에 #59 disjoint 넛지의
+    scope 변경이 "바 변경의 collateral"로 통째 reject되던 no-op이 사라진다(scope는 항상 적용).
 
-def _adopt_decomposition_only(
-    original: ProjectSpec, restructured: ProjectSpec
-) -> ProjectSpec:
-    """재구성에서 *decomposition(units/deps/scope)만* 채택 — bar가 byte-동일일 때만(anti-erosion).
-
-    bar(goal/done_when/acceptance_criteria/constraints/non_goals) 중 하나라도 바뀌면
-    disjoint nudge가 criteria 변경으로 둔갑한 것 → **reject·원본 유지**. 또한 재구성된
-    acceptance_criteria의 unit 태그가 새 unit 집합에서 dangling이면(bar 동일이어도) reject.
+    unit 집합이 다르면(재합성이 분해 구조를 갈아엎음) scope/deps를 안전히 떼올 수 없으므로
+    보수적으로 원본 그대로(데드락/dangling 방지 — `_adopt_deps_only`와 동일 가드).
     """
-    od = original.model_dump(by_alias=True, mode="json")
-    rd = restructured.model_dump(by_alias=True, mode="json")
-    if any(od.get(k) != rd.get(k) for k in _BAR_FIELDS):
-        return original  # bar 변경 → reject(anti-erosion)
-    # dangling 가드: ac.unit 태그가 새 decomposition에 없으면 reject(검증 불가 구조).
-    new_units = {u.unit for u in restructured.decomposition}
-    for ac in restructured.acceptance_criteria:
-        tag = ac.unit
-        if tag is not None and tag != "integration" and tag not in new_units:
-            return original
+    orig_units = {u.unit for u in original.decomposition}
+    new = {u.unit: u for u in restructured.decomposition}
+    if orig_units != set(new):
+        return original  # 분해 구조가 바뀜 → scope-only splice 불가, 보수적으로 원본
     merged = original.model_copy(deep=True)
-    merged.decomposition = [d.model_copy(deep=True) for d in restructured.decomposition]
+    for u in merged.decomposition:
+        ru = new[u.unit]  # 집합 동일 보장 → 항상 존재
+        u.deps = list(ru.deps or [])
+        u.scope = list(ru.scope or [])
     return merged
 
 
@@ -512,9 +523,10 @@ def nudge_disjoint_scope(
     """병렬 형제 scope가 겹치면 #31 채널로 *바운드 1회* 재합성해 disjoint하게 재배치한 spec 반환.
 
     겹침 없음/미선언이면 no-op으로 원본(추가 LLM 호출 0·비용 불변). 넛지가 필요해도:
-      - 정확히 1회 재합성(bounded).
+      - 정확히 1회 재합성(bounded). scope_only preamble로 바 강화 신호 없이 scope/deps만 유도.
       - 실패(SynthesisError/예외) 흡수 → 원본 진행(advisory).
-      - 성공해도 *decomposition만* 채택, bar 변경이면 reject·원본 유지(anti-erosion 가드).
+      - 성공하면 *scope(+deps)만* 채택(`_adopt_scope_only`) — bar는 항상 원본(anti-erosion 구성적).
+        모델이 바를 건드려도 무시되므로 scope 변경이 collateral reject로 날아가지 않는다(WO#72).
     적대 분리: feedback/context는 *합성기에만* — critic/judge 미수신(#58 패턴 유지).
     """
     feedback = disjoint_scope_feedback(spec)
@@ -523,8 +535,8 @@ def nudge_disjoint_scope(
     try:
         restructured = synthesize(
             order, client, context=context, prompt_path=prompt_path,
-            feedback=feedback, synth_retries=synth_retries,
+            feedback=feedback, feedback_mode="scope_only", synth_retries=synth_retries,
         )
     except Exception:  # noqa: BLE001 — 넛지는 advisory: 어떤 실패도 run을 막지 않는다(원본 진행)
         return spec
-    return _adopt_decomposition_only(spec, restructured)
+    return _adopt_scope_only(spec, restructured)
