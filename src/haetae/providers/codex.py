@@ -66,6 +66,39 @@ class CodexError(RuntimeError):
         super().__init__(message + detail)
 
 
+# codex가 사용량/크레딧/쿼터 소진 시 내는 메시지의 알려진 마커(소문자 비교, best-effort).
+# codex는 이 조건에서 turn.failed + exit 1로 끝난다 — "진짜 버그"가 아니라 *외부 조건*이라
+# 재시도 가치가 없고, 루프가 graceful stop으로 라우팅해야 한다(WO#68).
+_USAGE_LIMIT_MARKERS = (
+    "usage limit",
+    "usage-limit",
+    "you've hit your usage",
+    "out of credits",
+    "insufficient credit",
+    "credit balance",
+    "quota",
+    "billing",
+    "rate limit",
+    "too many requests",
+)
+
+
+def _looks_like_usage_limit(stdout: str, stderr: str) -> bool:
+    """codex 출력에서 사용량/크레딧/쿼터 소진 마커를 best-effort로 탐지(WO#68). 순수 분류."""
+    blob = ((stdout or "") + "\n" + (stderr or "")).lower()
+    return any(m in blob for m in _USAGE_LIMIT_MARKERS)
+
+
+class CodexUsageLimitError(CodexError):
+    """codex 사용량/크레딧/쿼터 소진으로 인한 비정상 종료(WO#68).
+
+    **CodexError의 하위**라 일반 처리에 폴백되지만, 루프는 이 타입을 따로 잡아 *graceful stop*
+    (state seal·정리·재개 가능)으로 라우팅한다 — 진짜 버그(일반 CodexError)와 달리 재시도/replan
+    가치가 없는 *알려진 외부 조건*이다. CodexExecutor는 이 타입을 CodexExecutorError로 감싸지
+    않고 그대로 전파한다(타입 보존). 사유: 충전 후 `--continue-from`으로 재개.
+    """
+
+
 class CodexStalled(RuntimeError):
     """codex 호출이 *무진행(idle)* 으로 멈춤 — idle_timeout초 동안 새 `--json` 이벤트가
     하나도 안 옴(무음). hung 프로세스(+자식)를 정리한 뒤 던진다.
@@ -509,6 +542,14 @@ def exec_codex_with_usage(
             returncode, stdout_text, stderr_text = proc.returncode, proc.stdout, proc.stderr
 
         if returncode != 0:
+            # WO#68: 사용량/크레딧/쿼터 소진(알려진 외부 조건)이면 타입드 예외로 분류 →
+            # 루프가 graceful stop으로 라우팅(재시도 가치 없음, 일반 버그 CodexError와 구분).
+            if _looks_like_usage_limit(stdout_text, stderr_text):
+                raise CodexUsageLimitError(
+                    f"codex 사용량/크레딧 소진 (usage limit, exit {returncode}) — 충전 후 재개",
+                    stdout_text,
+                    stderr_text,
+                )
             raise CodexError(
                 f"codex exec 비정상 종료 (exit {returncode})",
                 stdout_text,

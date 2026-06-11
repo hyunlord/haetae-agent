@@ -56,6 +56,8 @@ class Status(str, Enum):
     done = "done"
     stopped_budget = "stopped_budget"
     stopped_stuck = "stopped_stuck"
+    # WO#68: codex 사용량/크레딧 소진으로 인한 graceful stop(외부 조건 — 크래시 아님, 재개 가능).
+    stopped_credit = "stopped_credit"
 
 
 class PlanState(str, Enum):

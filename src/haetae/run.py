@@ -474,6 +474,38 @@ def main(argv: list[str] | None = None) -> int:
         help="--continue-from을 run-id로 줄 때 부모를 찾을 베이스 디렉터리 (기본 runs/).",
     )
     parser.add_argument("--max-iters", type=int, default=30, help="최대 루프 횟수 (기본 30)")
+    # ── WO#68 비용 거버넌스(전부 opt-in, 미지정=무제한·기존 동작 불변) ──
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "전역 예산 cap(B): 누적 토큰이 N 초과면 다음 호출 전 clean stop(외부 크레딧 컷오프 "
+            "전에 의도적). 미지정이면 무제한(기존 동작). 충전/상한 조정 후 --continue-from으로 재개."
+        ),
+    )
+    parser.add_argument(
+        "--unit-attempt-budget",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "유닛 수렴 ceiling(C): 한 유닛의 *누적* 재dispatch(재시도+OR 대안+통합OR 층 합산)가 "
+            "N 도달하고도 미통과면 그 유닛을 사람에게 escalate(다음 OR로 안 던짐). 바는 자동으로 "
+            "안 낮춘다(anti-erosion) — 사람이 governed로 결정. 미지정이면 층별 bound만(기존)."
+        ),
+    )
+    parser.add_argument(
+        "--unit-token-budget",
+        type=int,
+        default=None,
+        metavar="T",
+        help=(
+            "유닛 수렴 ceiling(C, 토큰 기준): 한 유닛의 누적 귀속 토큰이 T 초과하고 미통과면 "
+            "사람에게 escalate(바 자동 미완화). --unit-attempt-budget과 OR로 작동. 미지정=off."
+        ),
+    )
     parser.add_argument(
         "--unit-retries",
         type=int,
@@ -791,6 +823,9 @@ def main(argv: list[str] | None = None) -> int:
             decomp_critic=args.decomp_critic,
             decomp_retries=args.decomp_retries,
             or_alternatives=args.or_alternatives,
+            max_tokens=args.max_tokens,                      # WO#68 (B)
+            unit_attempt_budget=args.unit_attempt_budget,    # WO#68 (C)
+            unit_token_budget=args.unit_token_budget,        # WO#68 (C)
             state_path=args.state_path,
             progress=progress,
             max_parallel=args.max_parallel,

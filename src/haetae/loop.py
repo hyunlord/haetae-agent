@@ -24,7 +24,7 @@ from haetae.intake import (
     nudge_integration_deps,
     synthesize,
 )
-from haetae.llm import CodexStalled, LLMClient
+from haetae.llm import CodexStalled, CodexUsageLimitError, LLMClient
 from haetae.metering import (
     MeteredClient,
     accumulate,
@@ -478,6 +478,9 @@ def run_loop(
     capability_allowlist: list[str] | None = None,
     capability_poc_runner: PocRunner | None = None,
     capability_searcher=None,
+    max_tokens: int | None = None,
+    unit_attempt_budget: int | None = None,
+    unit_token_budget: int | None = None,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -575,6 +578,18 @@ def run_loop(
             accumulate(state.budget.spent, cost)
         except Exception:  # noqa: BLE001
             pass
+
+    def over_global_budget() -> bool:
+        """WO#68 (B): 누적 토큰(#33 계측)이 --max-tokens를 넘었나(opt-in, 미설정=무제한·무회귀).
+
+        외부(codex) 컷오프 전에 *의도적*으로 멈추기 위한 안전 그물. best-effort(읽기 실패=미초과).
+        """
+        if max_tokens is None:
+            return False
+        try:
+            return (state.budget.spent.tokens or 0) > max_tokens
+        except Exception:  # noqa: BLE001
+            return False
 
     def record_transition(stage: str, unit: str | None = None) -> None:
         try:
@@ -842,6 +857,9 @@ def run_loop(
                     else (lambda: None)
                 ),
                 or_alternatives=or_alternatives,
+                max_tokens=max_tokens,
+                unit_attempt_budget=unit_attempt_budget,
+                unit_token_budget=unit_token_budget,
             )
 
         # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
@@ -867,6 +885,19 @@ def run_loop(
         iters = 0
         while iters < max_iters and state.status == Status.running:
             iters += 1
+
+            # WO#68 (B): 전역 예산 cap — 다음(replan/빌드) 호출 *전*에 누적 토큰이 --max-tokens
+            #   초과면 clean stop(외부 codex 컷오프 전에 의도적). 미설정=무제한(무회귀).
+            #   anti-erosion 무관 — 바 불변, 그냥 돈을 그만 쓴다. #58로 재개 가능.
+            if over_global_budget():
+                state.status = Status.stopped_budget
+                state.pending_escalations.append({
+                    "reason": (
+                        f"예산 초과 — 누적 토큰 {state.budget.spent.tokens} > "
+                        f"--max-tokens {max_tokens}. 충전/상한 조정 후 --continue-from으로 재개"
+                    ),
+                })
+                break
 
             # replan(비결정 LLM 출력 → 검증 실패 흡수) + 분해 critic(WO#40).
             # 바깥 루프 = 분해 critic 재계획(bounded decomp_retries), 안쪽 = replan 파싱 재시도.
@@ -1073,6 +1104,30 @@ def run_loop(
         try_save()
 
         return state
+    except CodexUsageLimitError as e:
+        # WO#68 (A): codex 사용량/크레딧 소진(알려진 외부 조건) — 어떤 codex 경로(합성·replan·
+        #   빌드·critic·judge)에서 와도 traceback 크래시 대신 *graceful stop*. 완료 유닛은 보존,
+        #   상태를 stopped_credit로 봉인(명확 사유) → 충전 후 #58 --continue-from으로 재개.
+        #   (#43/#54 패턴 재사용 — best-effort, 기록/저장 중 추가 예외도 흡수해 2차 크래시 금지.)
+        try:
+            record_transition(STAGE_ESCALATE)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if state is not None and state.status == Status.running:
+                state.status = Status.stopped_credit
+                state.pending_escalations.append({
+                    "reason": "codex 크레딧 소진 — 충전 후 `--continue-from`으로 재개(완료 유닛 보존)",
+                    "detail": str(e),
+                })
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            emit(_final_label(state))
+        except Exception:  # noqa: BLE001
+            pass
+        try_save()
+        return state
     except CodexStalled as e:
         # WO#54: *필수* codex 호출(합성·replan·빌드)이 bounded 재시도 후에도 무진행(멈춤).
         #   가짜 진행 금지 — 정직하게 사람 tier로 escalate한다(무한 hang 대신 클린 종료).
@@ -1141,6 +1196,9 @@ def _parallel_loop(
     run_decomp_critic: Callable[[NextOrder, str], "DecompCritique | None"] = lambda no, last: None,
     account_decomp_cost: Callable[[], None] = lambda: None,
     or_alternatives: int = 1,
+    max_tokens: int | None = None,
+    unit_attempt_budget: int | None = None,
+    unit_token_budget: int | None = None,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -1197,6 +1255,65 @@ def _parallel_loop(
         """이 유닛의 *이번 시도* tier — base(시작 힌트) + escalation, top에서 cap(bounded)."""
         idx = min(start_base_of.get(unit, 0) + escalation_of.get(unit, 0), tier_top)
         return ladder[idx]
+
+    # ── WO#68 비용 거버넌스 봉투 ───────────────────────────────────────────
+    # (C) 유닛별 *누적* 토큰(재시도+OR+통합OR 층 합산) — 누적 ceiling 판정에 사용.
+    #   escalation_of[unit]가 이미 *층 합산 재dispatch 수*(gate실패/충돌/OR마다 ++, 안 내림)라
+    #   그걸 누적 시도 수로 그대로 읽는다(별도 카운터 불필요 — 단조 비감소 보장됨).
+    unit_tokens_of: dict[str, int] = {u.unit: 0 for u in spec.decomposition}
+
+    def add_unit_tokens(unit: str, cost: Cost | None) -> None:
+        try:
+            t = getattr(cost, "tokens", None)
+            if t:
+                unit_tokens_of[unit] = unit_tokens_of.get(unit, 0) + t
+        except Exception:  # noqa: BLE001
+            pass
+
+    def over_global_budget() -> bool:
+        """(B) 전역 토큰 cap 초과? 미설정=무제한(무회귀). best-effort."""
+        if max_tokens is None:
+            return False
+        try:
+            return (state.budget.spent.tokens or 0) > max_tokens
+        except Exception:  # noqa: BLE001
+            return False
+
+    def unit_ceiling_hit(unit: str) -> bool:
+        """(C) 이 유닛이 누적 수렴 ceiling(시도 수/토큰)을 넘었나? 미설정=off(무회귀).
+
+        escalation_of=층 합산 재dispatch 수. 더 던지기 전에 사람에게 넘기는 신호 — 바는 안 낮춘다.
+        """
+        if unit_attempt_budget is not None and escalation_of.get(unit, 0) >= unit_attempt_budget:
+            return True
+        if unit_token_budget is not None and unit_tokens_of.get(unit, 0) >= unit_token_budget:
+            return True
+        return False
+
+    def escalate_unit_unconverged(
+        unit: str, order: NextOrder, result: str, gr: GateResult, event_cost: Cost | None
+    ) -> None:
+        """(C) 안 수렴한 유닛을 *사람에게* escalate(다음 OR로 안 던짐). 바 자동 미완화(anti-erosion).
+
+        criteria/done_when 불변 — 사유에 유닛·누적 시도/토큰을 명시하고 사람이 governed로 결정
+        (바 조정/수용/대안). 폐기 시도 비용은 정직하게 누적, 유닛은 failed로 봉인(#58 재개 시 복귀).
+        """
+        nonlocal terminal
+        account(event_cost)
+        record(unit, order.goal, result, gr.verdict, gr.checks, cost=event_cost, ts=now())
+        _set_plan_state(state, unit, PlanState.failed)
+        terminal = "escalated"
+        state.pending_escalations.append({
+            "reason": (
+                f"unit {unit} — {escalation_of.get(unit, 0)} 시도(층 합산)·"
+                f"{unit_tokens_of.get(unit, 0)} 토큰 후 미수렴. 사람 결정 필요: "
+                f"바 조정(governed)/수용/대안 (자동 완화 없음)"
+            ),
+            "unit": unit,
+            "attempts": escalation_of.get(unit, 0),
+            "tokens": unit_tokens_of.get(unit, 0),
+        })
+        persist()
 
     def record(unit: str, goal: str | None, result: str, verdict: Verdict,
                checks: list[CheckReport], cost: Cost | None = None,
@@ -1333,6 +1450,7 @@ def _parallel_loop(
         # 이 시도 비용 = replan(orchestration) + executor + judge(per-unit gate).
         # judge_cost는 worker가 gate에서 받은 GateResult에 실려 main으로 돌아온다(스레드 안전).
         event_cost = combine_costs([orch_cost_of.pop(unit, None), exec_cost, gr.judge_cost])
+        add_unit_tokens(unit, event_cost)  # WO#68 (C): 유닛 누적 토큰(ceiling 판정용)
         emit(_summarize_gate(gr))
 
         if verdict in (Verdict.pass_, Verdict.done):
@@ -1356,6 +1474,10 @@ def _parallel_loop(
                 if p.state == PlanState.done and p.unit != unit
             ]
             wm.discard(unit)
+            # WO#68 (C): 누적 수렴 ceiling 초과면 더 재빌드 안 던지고 사람에게 escalate(바 불변).
+            if unit_ceiling_hit(unit):
+                escalate_unit_unconverged(unit, order, result, gr, event_cost)
+                return
             if attempts_of[unit] < unit_retries:
                 attempts_of[unit] += 1
                 escalation_of[unit] += 1  # WO#64: 충돌 재빌드 = 한 tier 상향(다음 dispatch가 읽음)
@@ -1389,6 +1511,11 @@ def _parallel_loop(
 
         # gate 실패 → 바운드 *재시도*(같은 접근, 재dispatch). 재시도 소진 후엔 OR 대안.
         wm.discard(unit)  # 백트래킹: 실패 접근 worktree 정리(#21 보장 cleanup)
+        # WO#68 (C): 누적 수렴 ceiling 초과면 재시도/OR로 더 던지지 않고 사람에게 escalate(바 불변).
+        #   재시도+OR+통합OR 층 stacking이 무한히 돈을 빨아먹지 않게 *누적*에 천장을 둔다.
+        if unit_ceiling_hit(unit):
+            escalate_unit_unconverged(unit, order, result, gr, event_cost)
+            return
         if attempts_of[unit] < unit_retries:
             attempts_of[unit] += 1
             escalation_of[unit] += 1  # WO#64: gate 실패 재시도 = 한 tier 상향(top에서 cap)
@@ -1471,7 +1598,19 @@ def _parallel_loop(
                 futures: dict[Future, tuple[str, NextOrder, Path]] = {}
 
                 def dispatch_ready() -> None:
+                    nonlocal terminal
                     if terminal:
+                        return
+                    # WO#68 (B): 전역 예산 cap — 새 unit dispatch *전*에 누적 토큰이 --max-tokens
+                    #   초과면 더 안 던지고 clean stop(외부 컷오프 전 의도적). 미설정=무제한(무회귀).
+                    if over_global_budget():
+                        terminal = "budget"
+                        state.pending_escalations.append({
+                            "reason": (
+                                f"예산 초과 — 누적 토큰 {state.budget.spent.tokens} > "
+                                f"--max-tokens {max_tokens}. 충전/상한 조정 후 --continue-from으로 재개"
+                            ),
+                        })
                         return
                     for u in ready_units(state.plan, in_flight):
                         if terminal or len(futures) >= max_parallel:
@@ -1522,6 +1661,11 @@ def _parallel_loop(
                         exec_cost: Cost | None = None
                         try:
                             result, gr, exec_cost = fut.result()
+                        except CodexUsageLimitError:
+                            # WO#68 (A): 빌드 worker의 크레딧 소진은 *유닛 실패*가 아니라 run 전체
+                            #   graceful stop이다 — 일반 예외로 흡수(재시도/OR)하지 말고 전파해
+                            #   _parallel_loop의 top-level 핸들러가 stopped_credit로 봉인하게 한다.
+                            raise
                         except Exception as e:  # noqa: BLE001 — executor/gate 예외=그 unit 실패
                             result = f"(executor/gate 예외: {e})"
                             gr = GateResult(verdict=Verdict.fail_recoverable)
@@ -1614,9 +1758,34 @@ def _parallel_loop(
             state.status = Status.done
         elif terminal == "stuck":
             state.status = Status.stopped_stuck
+        elif terminal == "budget":  # WO#68 (B): 전역 예산 cap 초과 → clean stop(재개 가능)
+            state.status = Status.stopped_budget
 
         materialize(integration_ev)
         emit(_final_label(state))
+        try_save()
+        return state
+    except CodexUsageLimitError as e:
+        # WO#68 (A): 병렬 경로의 codex 크레딧 소진(빌드 worker·gen_order replan·통합 judge 어디서든)
+        #   → traceback 크래시 대신 graceful stop. 진행분 materialize→봉인(stopped_credit)→저장.
+        #   worktree 정리는 아래 finally(cleanup_all)가 보장. best-effort(2차 크래시 금지).
+        try:
+            if state is not None and state.status == Status.running:
+                state.status = Status.stopped_credit
+                state.pending_escalations.append({
+                    "reason": "codex 크레딧 소진 — 충전 후 `--continue-from`으로 재개(완료 유닛 보존)",
+                    "detail": str(e),
+                })
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            materialize()  # 진행분(per-unit 이벤트) 봉인 — 통합 ev는 크레딧 stop 시 없음
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            emit(_final_label(state))
+        except Exception:  # noqa: BLE001
+            pass
         try_save()
         return state
     except KeyboardInterrupt:

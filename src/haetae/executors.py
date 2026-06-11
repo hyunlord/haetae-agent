@@ -13,7 +13,12 @@ from typing import Callable, NamedTuple
 
 from haetae.metering import Usage
 from haetae.models import NextOrder
-from haetae.providers.codex import CodexError, exec_codex_with_usage, observe_call
+from haetae.providers.codex import (
+    CodexError,
+    CodexUsageLimitError,
+    exec_codex_with_usage,
+    observe_call,
+)
 
 # 사람이 결과 입력을 끝낼 때 쓰는 센티넬 라인
 SENTINEL = "---END---"
@@ -199,6 +204,10 @@ class CodexExecutor:
             text, usage = observe_call(
                 self.heartbeat, self.transcript, "빌드", self.idle_timeout, prompt, call
             )
+        except CodexUsageLimitError:
+            # WO#68: 크레딧 소진은 타입 보존해 그대로 전파(루프가 graceful stop으로 라우팅).
+            # CodexExecutorError로 감싸면 타입이 사라져 일반 유닛 실패로 오인된다 — 감싸지 않는다.
+            raise
         except CodexError as e:
             raise CodexExecutorError(str(e)) from e
         self.last_usage = usage  # 읽기만 — sandbox 권한 불변
