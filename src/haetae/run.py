@@ -17,6 +17,7 @@ from haetae.executors import CodexExecutor, HumanRelayExecutor, Tier, tier_label
 from haetae.providers.launch_options import read_codex_config
 from haetae.gate import CompositeGate
 from haetae.heartbeat import HeartbeatWriter
+from haetae.transcript import TranscriptWriter
 from haetae.llm import CodexClient
 from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
@@ -642,10 +643,18 @@ def main(argv: list[str] | None = None) -> int:
         HeartbeatWriter(Path(args.state_path).parent / "heartbeat.json")
         if args.state_path else None
     )
+    # WO#67: 라이브 호출 트랜스크립트 사이드카. state.yaml 옆 transcripts.json에 각 호출의
+    #   입력(order/프롬프트) + 실시간 출력 tail을 bounded·best-effort로 흘린다(순수 텔레메트리·
+    #   state/heartbeat 스키마 무변경). --state-path 없으면 None(무사이드카). 모든 codex 클라이언트/
+    #   executor가 같은 인스턴스를 공유 → 합성·빌드·judge·critic 호출이 한 사이드카로 모인다.
+    transcript = (
+        TranscriptWriter(Path(args.state_path).parent / "transcripts.json")
+        if args.state_path else None
+    )
 
     client = CodexClient(
         model=args.model, idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
-        heartbeat=heartbeat,
+        heartbeat=heartbeat, transcript=transcript,
     )
 
     # judge LLM 비용 계측(WO#34): judge client를 passthrough MeteredClient로 감싼다.
@@ -657,7 +666,7 @@ def main(argv: list[str] | None = None) -> int:
             CodexClient(
                 model=args.judge_model, idle_timeout=idle_to, max_duration=max_dur,
                 stall_retries=0,  # best-effort: 멈추면 degrade(skipped→ambiguous, 가짜 pass 금지)
-                heartbeat=heartbeat,
+                heartbeat=heartbeat, transcript=transcript,
             ),
             source="judge", pricing=pricing,
         )
@@ -678,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model, workdir=args.workdir,
             reasoning_effort=args.reasoning_effort,
             idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
-            heartbeat=heartbeat,
+            heartbeat=heartbeat, transcript=transcript,
         )
     else:
         executor = HumanRelayExecutor()
@@ -701,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt, tier: CodexExecutor(
                 model=tier.model, workdir=wt, reasoning_effort=tier.reasoning_effort,
                 idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
-                heartbeat=heartbeat,
+                heartbeat=heartbeat, transcript=transcript,
             )
         else:
             executor_factory = lambda wt: HumanRelayExecutor()
@@ -719,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         CodexClient(
             model=effective_critic_model, idle_timeout=idle_to, max_duration=max_dur,
             stall_retries=0,  # best-effort: 멈추면 진행(critic은 advisory)
-            heartbeat=heartbeat, default_call_kind="critic",
+            heartbeat=heartbeat, transcript=transcript, default_call_kind="critic",
         )
         if critic_on else None
     )

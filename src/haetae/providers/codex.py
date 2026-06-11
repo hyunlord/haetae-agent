@@ -169,6 +169,44 @@ def _event_summary(line: str) -> str | None:
     return str(t) if t else None
 
 
+def _event_output_text(line: str) -> str | None:
+    """codex `--json` 이벤트 한 줄에서 모델 *출력 텍스트*를 best-effort로 뽑는다(WO#67 트랜스크립트).
+
+    '모델이 지금 뱉는 것' — reasoning/agent_message의 본문, command_execution의 명령,
+    file_change의 경로 등을 한 조각으로. 완료된 item(`item.completed`)만 취해 start/completed
+    중복을 피한다. 못 뽑으면 None(트랜스크립트에 안 더함). 순수 텔레메트리 — 절대 raise 안 함.
+    """
+    s = (line or "").strip()
+    if not s.startswith("{"):
+        return None
+    try:
+        ev = json.loads(s)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(ev, dict):
+        return None
+    if ev.get("type") != "item.completed":
+        return None  # 완료된 item만(중복/부분 방지)
+    item = ev.get("item") if isinstance(ev.get("item"), dict) else None
+    if item is None:
+        return None
+    it = item.get("type")
+    if it == "command_execution":
+        cmd = item.get("command")
+        return f"$ {cmd}" if cmd else None
+    if it in ("file_change", "file_update", "patch", "edit"):
+        path = (
+            item.get("path") or item.get("file")
+            or item.get("filename") or item.get("target")
+        )
+        return f"[edit] {path}" if path else None
+    txt = item.get("text") or item.get("message")
+    if isinstance(txt, str) and txt.strip():
+        prefix = "" if it in ("agent_message", "assistant_message", None) else f"[{it}] "
+        return prefix + txt.strip()
+    return None
+
+
 def _stream_codex(
     cmd: list[str],
     prompt: str,
@@ -176,6 +214,7 @@ def _stream_codex(
     idle_timeout: float,
     max_duration: float | None,
     on_event: Callable[[str | None], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> tuple[int, str, str]:
     """`codex --json`을 Popen으로 띄워 stdout JSONL을 *줄 단위*로 읽으며 idle을 감시한다.
 
@@ -255,6 +294,14 @@ def _stream_codex(
                 on_event(_event_summary(item))
             except Exception:  # noqa: BLE001 — 텔레메트리가 codex 호출을 죽이지 않는다
                 pass
+        # WO#67: 모델 출력 텍스트(완료 item)를 트랜스크립트 tail로 흘린다(순수 텔레메트리).
+        if on_output is not None:
+            try:
+                otext = _event_output_text(item)
+                if otext:
+                    on_output(otext)
+            except Exception:  # noqa: BLE001 — 트랜스크립트가 codex 호출을 죽이지 않는다
+                pass
         # 진행 중 — (선택) 아주 넉넉한 절대 backstop. 진행해도 pathological하게 길면 차단.
         if max_duration is not None and (time.monotonic() - start) > max_duration:
             _terminate_process(proc)
@@ -279,6 +326,7 @@ def _run_streaming_with_retries(
     max_duration: float | None,
     stall_retries: int,
     on_event: Callable[[str | None], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> tuple[int, str, str]:
     """스트리밍 실행을 *bounded* 재시도로 감싼다. 멈춤이 지속되면 마지막 CodexStalled 전파.
 
@@ -291,7 +339,7 @@ def _run_streaming_with_retries(
         try:
             return _stream_codex(
                 cmd, prompt, idle_timeout=idle_timeout, max_duration=max_duration,
-                on_event=on_event,
+                on_event=on_event, on_output=on_output,
             )
         except FileNotFoundError as e:
             raise CodexError(
@@ -347,6 +395,7 @@ def exec_codex(
     max_duration: float | None = None,
     stall_retries: int = 0,
     on_event: Callable[[str | None], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> str:
     """`codex exec`를 한 턴 돌려 `-o` 최종 메시지 파일을 읽어 반환하는 공유 헬퍼.
 
@@ -357,7 +406,7 @@ def exec_codex(
         prompt, sandbox=sandbox, cwd=cwd, model=model, timeout=timeout,
         ephemeral=ephemeral, reasoning_effort=reasoning_effort,
         idle_timeout=idle_timeout, max_duration=max_duration, stall_retries=stall_retries,
-        on_event=on_event,
+        on_event=on_event, on_output=on_output,
     )
     return text
 
@@ -375,6 +424,7 @@ def exec_codex_with_usage(
     max_duration: float | None = None,
     stall_retries: int = 0,
     on_event: Callable[[str | None], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> tuple[str, Usage | None]:
     """`codex exec`를 한 턴 돌려 (최종 메시지, token usage)를 반환하는 저수준 헬퍼.
 
@@ -434,7 +484,7 @@ def exec_codex_with_usage(
             returncode, stdout_text, stderr_text = _run_streaming_with_retries(
                 cmd, prompt,
                 idle_timeout=idle_timeout, max_duration=max_duration,
-                stall_retries=stall_retries, on_event=on_event,
+                stall_retries=stall_retries, on_event=on_event, on_output=on_output,
             )
         else:
             # 기존 경로(무회귀): subprocess.run(끝나고 캡처). 기존 테스트 seam(subprocess.run) 보존.
@@ -472,6 +522,13 @@ def exec_codex_with_usage(
             raise CodexError(
                 "codex exec가 빈 최종 메시지를 반환함", stdout_text, stderr_text
             )
+        # WO#67: 비스트리밍 경로(idle_timeout=None)는 이벤트 콜백이 안 불리므로 최종 텍스트를
+        # 한 번 트랜스크립트 출력으로 흘린다(스트리밍 경로는 item별로 이미 흘렸음 — 중복 방지).
+        if idle_timeout is None and on_output is not None and text:
+            try:
+                on_output(text)
+            except Exception:  # noqa: BLE001 — 트랜스크립트는 run을 죽이지 않는다
+                pass
         # usage 파싱은 best-effort 부가물 — 실패해도 text 반환은 영향 없음.
         # 스트리밍 경로에서도 동일: stdout_text는 그때까지 받은 전체 JSONL(부분 포함).
         usage = None
@@ -516,6 +573,70 @@ def heartbeat_wrapped(heartbeat, default_kind, idle_timeout, run_fn):
             pass
 
 
+def observe_call(heartbeat, transcript, default_kind, idle_timeout, prompt, run_fn):
+    """heartbeat(요약 한 줄) + transcript(입력+출력 tail) 사이드카를 함께 감싸 호출을 관측한다(WO#67).
+
+    run_fn은 `(on_event, on_output)`를 받는다 — on_event는 #55 하트비트 beat, on_output은 #67
+    트랜스크립트 출력 tail. 순수 텔레메트리·best-effort: 하트비트/트랜스크립트 관련 *어떤
+    예외도* codex 호출을 죽이지 않는다(#55/#43 패턴). call_kind/unit은 heartbeat가 깔아둔
+    스레드별 컨텍스트에서 읽고(없으면 default_kind), 입력(prompt)은 트랜스크립트가 head cap.
+    run_fn이 던지는 예외(CodexStalled 등)는 그대로 전파하되, 트랜스크립트 status를 error로 남긴다.
+    """
+    kind, unit = None, None
+    if heartbeat is not None:
+        try:
+            kind, unit = heartbeat.get_context()
+        except Exception:  # noqa: BLE001
+            kind, unit = None, None
+    kind = kind or default_kind
+
+    hb_handle = None
+    if heartbeat is not None:
+        try:
+            hb_handle = heartbeat.start(kind, unit, idle_timeout=idle_timeout)
+        except Exception:  # noqa: BLE001 — 텔레메트리 실패 → 하트비트 없이 진행
+            hb_handle = None
+
+    tr_id = None
+    if transcript is not None:
+        try:
+            tr_id = transcript.start(kind=kind, unit=unit, input_text=prompt)
+        except Exception:  # noqa: BLE001 — 트랜스크립트 실패 → 캡처 없이 진행
+            tr_id = None
+
+    def on_event(summary):
+        if hb_handle is not None:
+            try:
+                heartbeat.beat(hb_handle, summary)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def on_output(text):
+        if tr_id is not None:
+            try:
+                transcript.output(tr_id, text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    status = "done"
+    try:
+        return run_fn(on_event, on_output)
+    except BaseException:
+        status = "error"
+        raise
+    finally:
+        if hb_handle is not None:
+            try:
+                heartbeat.finish(hb_handle)
+            except Exception:  # noqa: BLE001
+                pass
+        if tr_id is not None:
+            try:
+                transcript.finish(tr_id, status)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class CodexClient:
     """`codex exec`를 한 턴 돌려 최종 텍스트를 반환하는 LLMClient.
 
@@ -532,6 +653,7 @@ class CodexClient:
         max_duration: float | None = None,
         stall_retries: int = 0,
         heartbeat=None,
+        transcript=None,
         default_call_kind: str | None = None,
         **default_opts,
     ):
@@ -544,6 +666,8 @@ class CodexClient:
         # WO#55: 라이브 하트비트 sink(HeartbeatWriter, duck-typed). None이면 텔레메트리 off(무회귀).
         # call_kind/unit은 루프가 set_context로 깔고 _run이 읽는다. default_call_kind는 폴백.
         self.heartbeat = heartbeat
+        # WO#67: 라이브 트랜스크립트 sink(TranscriptWriter, duck-typed). None이면 캡처 off(무회귀).
+        self.transcript = transcript
         self.default_call_kind = default_call_kind
         self.default_opts = default_opts  # 향후 플래그 확장용으로 보존
         # 직전 호출의 token usage(WO#33). 미노출/파싱 실패면 None(날조 금지).
@@ -567,7 +691,7 @@ class CodexClient:
     # ── 테스트 seam: 실제 subprocess 실행은 공유 헬퍼로 격리 ────────────
     def _run(self, prompt: str) -> str:
         # 생성(읽기전용) 용도 → read-only sandbox. workdir 미지정이면 헬퍼가 격리.
-        def call(on_event):
+        def call(on_event, on_output):
             return exec_codex_with_usage(
                 prompt,
                 sandbox="read-only",
@@ -577,10 +701,12 @@ class CodexClient:
                 max_duration=self.max_duration,
                 stall_retries=self.stall_retries,
                 on_event=on_event,
+                on_output=on_output,
             )
 
-        text, usage = heartbeat_wrapped(
-            self.heartbeat, self.default_call_kind, self.idle_timeout, call
+        text, usage = observe_call(
+            self.heartbeat, self.transcript, self.default_call_kind,
+            self.idle_timeout, prompt, call,
         )
         self.last_usage = usage  # 읽기만 — sandbox 권한 불변
         return text

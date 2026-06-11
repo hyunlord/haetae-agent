@@ -13,7 +13,7 @@ from typing import Callable, NamedTuple
 
 from haetae.metering import Usage
 from haetae.models import NextOrder
-from haetae.providers.codex import CodexError, exec_codex_with_usage, heartbeat_wrapped
+from haetae.providers.codex import CodexError, exec_codex_with_usage, observe_call
 
 # 사람이 결과 입력을 끝낼 때 쓰는 센티넬 라인
 SENTINEL = "---END---"
@@ -151,6 +151,7 @@ class CodexExecutor:
         max_duration: float | None = None,
         stall_retries: int = 1,
         heartbeat=None,
+        transcript=None,
     ):
         self.model = model
         self.workdir = Path(workdir)
@@ -160,6 +161,8 @@ class CodexExecutor:
         # WO#55: 라이브 하트비트 sink(duck-typed). None이면 텔레메트리 off(무회귀).
         # 빌드 call_kind는 "빌드" 고정(루프 컨텍스트가 unit을 깔아준다).
         self.heartbeat = heartbeat
+        # WO#67: 라이브 트랜스크립트 sink(duck-typed). None이면 캡처 off(무회귀).
+        self.transcript = transcript
         # WO#54: idle(무진행) timeout. None(기본)이면 기존 subprocess.run 경로(무회귀).
         # 빌드는 *필수* 호출이라 멈춤 시 bounded 재시도(stall_retries 기본 1) 후 escalate.
         self.idle_timeout = idle_timeout
@@ -177,7 +180,7 @@ class CodexExecutor:
     def _run(self, prompt: str) -> str:
         # CodexStalled(무진행 멈춤)는 *의도적으로* 잡지 않는다 — CodexError가 아니므로
         # 이 except에 안 걸리고 그대로 전파돼, 루프가 "빌드 멈춤"을 타입으로 escalate한다.
-        def call(on_event):
+        def call(on_event, on_output):
             return exec_codex_with_usage(
                 prompt,
                 sandbox=self.sandbox,
@@ -189,10 +192,13 @@ class CodexExecutor:
                 max_duration=self.max_duration,
                 stall_retries=self.stall_retries,
                 on_event=on_event,
+                on_output=on_output,
             )
 
         try:
-            text, usage = heartbeat_wrapped(self.heartbeat, "빌드", self.idle_timeout, call)
+            text, usage = observe_call(
+                self.heartbeat, self.transcript, "빌드", self.idle_timeout, prompt, call
+            )
         except CodexError as e:
             raise CodexExecutorError(str(e)) from e
         self.last_usage = usage  # 읽기만 — sandbox 권한 불변

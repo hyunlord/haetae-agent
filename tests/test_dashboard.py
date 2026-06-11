@@ -1817,3 +1817,135 @@ def test_html_stable_inplace_render():
     assert "DAG_SIG" in src
     # 스크롤 위치 보존(applyView가 main scrollTop 복원).
     assert "scrollTop" in src and "scrollLeft" in src
+
+
+# ════════════════════ WO#67: 라이브 호출 트랜스크립트 인스펙터 ════════════════════
+
+
+def _write_transcripts(state_path: Path, calls: list[dict]) -> Path:
+    """state.yaml 옆 transcripts.json 사이드카를 쓴다(테스트 헬퍼)."""
+    tp = Path(state_path).parent / "transcripts.json"
+    tp.write_text(
+        json.dumps({"updated_at": "2026-06-11T10:00:00Z", "calls": calls}),
+        encoding="utf-8",
+    )
+    return tp
+
+
+def _call(**kw) -> dict:
+    base = {
+        "call_id": 0, "kind": "빌드", "unit": "u1", "phase": None,
+        "input": "받은 work order", "input_truncated": False,
+        "output_tail": "$ npm test\n3 passed", "output_truncated": False,
+        "output_chars": 20, "started_at": "2026-06-11T10:00:00Z",
+        "last_event_at": "2026-06-11T10:00:05Z", "status": "active",
+    }
+    base.update(kw)
+    return base
+
+
+# ──────────────────── 사이드카 리더(load_transcripts) ────────────────────
+
+
+def test_load_transcripts_reads_sidecar(tmp_path: Path):
+    from haetae.dashboard import load_transcripts
+    sp = tmp_path / "state.yaml"
+    _write_transcripts(sp, [_call()])
+    data = load_transcripts(sp)
+    assert data["calls"][0]["unit"] == "u1"
+    assert "$ npm test" in data["calls"][0]["output_tail"]
+
+
+def test_load_transcripts_missing_and_bad_json_are_none(tmp_path: Path):
+    from haetae.dashboard import load_transcripts
+    sp = tmp_path / "state.yaml"
+    assert load_transcripts(sp) is None             # 미생성 → None(조용히)
+    (tmp_path / "transcripts.json").write_text("{partial", encoding="utf-8")
+    assert load_transcripts(sp) is None             # 깨짐 → None
+    assert load_transcripts(None) is None           # 경로 없음 → None
+
+
+def test_load_view_attaches_transcripts(tmp_path: Path):
+    """state.yaml + transcripts.json → view['transcripts'] 동봉(유닛/단계 드릴다운용)."""
+    sp = tmp_path / "state.yaml"
+    sp.write_text("spec_ref: x\nspec_version: 1\nstatus: running\n", encoding="utf-8")
+    _write_transcripts(sp, [_call(unit="u1")])
+    v = load_view(sp)
+    assert "error" not in v
+    assert v["transcripts"]["calls"][0]["unit"] == "u1"
+
+
+def test_load_view_synthesizing_attaches_transcripts(tmp_path: Path):
+    """합성 정상 부재(state 없음 + heartbeat 활성)에도 합성 트랜스크립트를 동봉(가장 값짐)."""
+    sp = tmp_path / "state.yaml"  # 부재
+    _write_heartbeat(sp, [{"call_kind": "합성", "unit": None, "elapsed_s": 3.0, "idle_seconds": 1.0}])
+    _write_transcripts(sp, [_call(kind="합성", unit=None, phase="합성", status="active")])
+    v = load_view(sp)
+    assert v.get("synthesizing") is True
+    assert v["transcripts"]["calls"][0]["kind"] == "합성"
+
+
+def test_load_view_error_attaches_transcripts(tmp_path: Path):
+    """파싱 에러(파일 깨짐)에도 트랜스크립트는 별도 — 진단 위해 함께 실린다."""
+    sp = tmp_path / "state.yaml"
+    sp.write_text(":::not yaml::: [", encoding="utf-8")
+    _write_transcripts(sp, [_call()])
+    v = load_view(sp)
+    assert "error" in v
+    assert v["transcripts"]["calls"]
+
+
+def test_server_state_includes_transcripts(tmp_path: Path):
+    """스모크: /api/state?run=<id>가 transcripts 사이드카를 동봉(200)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    rid = "20260611-120000-tr"
+    d = rm.runs_dir / rid
+    d.mkdir(parents=True)
+    (d / "state.yaml").write_text(_state_yaml(), encoding="utf-8")
+    _write_transcripts(d / "state.yaml", [_call(unit="u1", status="active")])
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, f"/api/state?run={rid}")
+        assert code == 200
+        v = json.loads(body)
+        assert v["transcripts"]["calls"][0]["unit"] == "u1"
+    finally:
+        httpd.shutdown()
+
+
+# ──────────────────── HTML 드릴다운(유닛 + director-side 단계) ────────────────────
+
+
+def test_html_transcript_panels_and_helpers():
+    """HTML: 받은 입력 + 실시간 출력 패널 + 유닛/단계 트랜스크립트 헬퍼·렌더 함수 존재."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "function renderTranscript" in src
+    assert "function _transcriptForUnit" in src
+    assert "function _transcriptForPhase" in src
+    assert "받은 입력" in src and "실시간 출력" in src       # 입력/출력 패널 라벨
+    assert "호출 트랜스크립트" in src                        # 유닛 드릴다운 섹션
+    assert "output_tail" in src and "input" in src          # 사이드카 스키마 소비
+
+
+def test_html_director_side_phase_drilldown():
+    """HTML: director-side 단계(합성/스캐폴드) 클릭 → 트랜스크립트 드릴다운(스모크)."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "function selectPhase" in src and "function renderPhaseDetail" in src
+    assert "phase-clk" in src and "data-phkind" in src        # 단계 클릭 가능 마크업
+    assert "PHASE_TR_KIND" in src                            # 단계→call_kind 매핑(합성/스캐폴드)
+    assert "SEL_PHASE" in src                                # 선택 단계 추적
+    assert "director-side" in src
+
+
+def test_html_bounded_and_empty_state():
+    """HTML: bounded 표기('생략'·'bounded') + 미캡처 시 빈 상태(에러 아님)."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "bounded" in src and "생략" in src                # cap 도달 정직 표기
+    assert "아직 캡처된 트랜스크립트 없음" in src              # 미캡처 빈 상태(에러 아님)
+
+
+def test_html_live_synthesis_transcript_in_synthesizing_view():
+    """HTML: 합성 정상 부재 패널에 라이브 합성 트랜스크립트(state 생성 전이 가장 값짐)."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "tr-syn" in src                                   # 합성 패널 안 트랜스크립트 박스
+    assert "tr-autoscroll" in src                            # 라이브 출력 자동 스크롤

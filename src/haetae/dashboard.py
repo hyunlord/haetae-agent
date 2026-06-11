@@ -709,6 +709,35 @@ def _heartbeat_active(heartbeat: dict[str, Any] | None) -> bool:
     return isinstance(acts, list) and len(acts) > 0
 
 
+def _transcripts_path(state_path: str | Path | None) -> Path | None:
+    """state.yaml 옆 transcripts.json 경로(WO#67 사이드카). state_path 없으면 None."""
+    if state_path is None:
+        return None
+    return Path(state_path).parent / "transcripts.json"
+
+
+def load_transcripts(state_path: str | Path | None) -> dict[str, Any] | None:
+    """state.yaml 옆 transcripts.json을 best-effort로 읽는다(WO#67, read-only).
+
+    미생성/깨짐/부분쓰기는 *조용히 None*(에러 아님 — #44/#55 빈 상태 패턴). 사이드카라
+    실패해도 state 뷰엔 무영향. 반환 dict는 {updated_at, calls:[...]} 형태(스키마는 transcript.py).
+    엔진을 import하지 않는다 — 사이드카 *파일*만 읽는다(read-only 위성 불변식 유지).
+    """
+    tp = _transcripts_path(state_path)
+    if tp is None:
+        return None
+    try:
+        data = json.loads(tp.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    calls = data.get("calls")
+    if not isinstance(calls, list):
+        return None
+    return data
+
+
 def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> dict[str, Any]:
     """state(+옵션 spec) 재로드 → view. 실패는 {error}로 흡수(서버 안 죽음).
 
@@ -722,6 +751,7 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
     없음)이나 파싱 에러(파일은 있는데 깨짐)는 그대로 {error}.
     """
     heartbeat = load_heartbeat(state_path)
+    transcripts = load_transcripts(state_path)  # WO#67: 라이브 호출 트랜스크립트 사이드카(별도 파일)
     state_exists = False
     try:
         state_exists = Path(state_path).exists()
@@ -732,15 +762,22 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
     except Exception as e:  # noqa: BLE001 — 파일없음/파싱에러 전부 흡수
         # 합성 중 정상 부재(파일 자체가 아직 없음 + 하트비트 활성) → 에러 아님.
         if not state_exists and _heartbeat_active(heartbeat):
-            return {
+            syn: dict[str, Any] = {
                 "synthesizing": True,
                 "reason": "state.yaml 생성 전 (합성/준비 중)",
                 "state_path": str(state_path),
                 "heartbeat": heartbeat,
             }
+            # WO#67: 합성 트랜스크립트(입력 프롬프트 + 라이브 출력)는 state 생성 *전*이 가장 값짐 —
+            #   "합성이 오래 걸려도 지금 뭘 뱉는지"를 보이게 동봉(있으면).
+            if transcripts is not None:
+                syn["transcripts"] = transcripts
+            return syn
         err: dict[str, Any] = {"error": f"{type(e).__name__}: {e}", "state_path": str(state_path)}
         if heartbeat is not None:
             err["heartbeat"] = heartbeat
+        if transcripts is not None:
+            err["transcripts"] = transcripts
         return err
     spec = None
     if spec_path:
@@ -754,6 +791,8 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
         view = {"error": f"view build failed: {type(e).__name__}: {e}"}
     if heartbeat is not None:
         view["heartbeat"] = heartbeat
+    if transcripts is not None:
+        view["transcripts"] = transcripts  # WO#67: 유닛/단계 드릴다운용 라이브 트랜스크립트
     return view
 
 
@@ -1300,6 +1339,7 @@ def make_handler(
             idle = 0
             ping_every = max(1, int(15.0 / stream_interval))
             hb_path = _heartbeat_path(sp)
+            tr_path = _transcripts_path(sp)  # WO#67: 트랜스크립트 사이드카도 감시(라이브 출력 tail)
             try:
                 while True:
                     # WO#55: state.yaml + heartbeat.json mtime 둘 다 감시 → 라이브 하트비트가
@@ -1315,7 +1355,11 @@ def make_handler(
                         hb_m = os.path.getmtime(hb_path) if hb_path is not None else None
                     except OSError:
                         hb_m = None
-                    sig = (st_m, hb_m)
+                    try:
+                        tr_m = os.path.getmtime(tr_path) if tr_path is not None else None
+                    except OSError:
+                        tr_m = None
+                    sig = (st_m, hb_m, tr_m)
                     if sig != last_sig:
                         last_sig = sig
                         self.wfile.write(b"data: " + _view_payload(sp, spec, err) + b"\n\n")
