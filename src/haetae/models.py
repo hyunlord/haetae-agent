@@ -139,6 +139,12 @@ class DecompositionUnit(BaseModel):
     # 없으면 base=0(사다리 맨 앞=싼 tier). optional·비파괴(scope 패턴). 사다리 미지정이면
     # 무시된다(단일 tier). bar는 불변 — 시작 강도만 바꾼다(anti-erosion).
     start_tier: str = ""
+    # WO#71(②b 깊은 증분): 증분 합성(continue-from)에서 이 유닛이 *부모 run의 검증된 유닛*과
+    # 동일(불변)함을 표식하는 부모 unit-id. 합성기가 단다(신규/변경 유닛은 생략). 루프가 부모
+    # manifest와 acceptance_criteria·scope 동등성을 *직접 대조*해 검증한 뒤에만 done으로 시드해
+    # 재빌드를 생략한다(라벨+가드 이중). **합성 라벨을 신뢰만 하지 않는다** — 바가 바뀌었으면
+    # (다른 바) 무시하고 정상 빌드+gate(anti-erosion). optional·비파괴(scope/start_tier 패턴).
+    reuse_of: str = ""
 
 
 # ──────────────────── 능력 획득 거버넌스 (WO#53 Phase F.1) ────────────────────

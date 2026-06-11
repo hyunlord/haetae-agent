@@ -44,6 +44,11 @@
   수치/파싱 등)만 시작 tier 힌트를 적어라(예: `start_tier: "gpt-5.5:high"`). 시작을 더 센
   모델/effort로 *probe*하게 한다. 대부분의 유닛은 **비워둬라** — 싼 tier로 시작해 실패하면
   엔진이 한 칸씩 자동으로 올린다(첫 시도가 probe). 시작 강도만 바꿀 뿐 *기준은 불변*이다.
+- 선택 `reuse_of`(`str`) — **이어가기(증분) 합성에서만**. 이번 delta로 *바뀌지 않는* 부모
+  유닛(같은 acceptance_criteria·scope로 이미 검증됨)을 그대로 다시 둘 때 부모 unit-id를 적어라
+  (예: `reuse_of: "u1"`). 루프가 부모와 기준 동등성을 대조해 맞으면 재빌드를 생략한다(코드는
+  시딩됨). **바를 바꿨거나 새로 만드는 유닛엔 절대 달지 마라**(재사용≠검증 우회). greenfield
+  (이어가기 아님)면 항상 비워라. 라벨이 틀려도 루프 가드가 막는다(틀리면 정상 빌드+gate).
 - `acceptance_criteria[]`는 `id`, `desc`, `check`, 선택 `unit`(str). `check`의 명령 키는
   **`cmd`**(절대 `command` 아님), 그리고 `type`(enum), 선택 `pass`. `check`에 다른
   키(`command`, `desc` 등)를 **추가하지 마라**.

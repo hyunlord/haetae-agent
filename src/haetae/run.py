@@ -62,6 +62,8 @@ def run(
     heartbeat=None,
     synth_context: str | None = None,
     seeded: bool = False,
+    reuse_manifest: dict | None = None,
+    reuse: bool = True,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -73,6 +75,8 @@ def run(
         heartbeat=heartbeat,
         synth_context=synth_context,
         seeded=seeded,
+        reuse_manifest=reuse_manifest,
+        reuse=reuse,
         capabilities_on=capabilities_on,
         capability_registry_path=capability_registry_path,
         capability_allowlist=capability_allowlist,
@@ -321,11 +325,30 @@ def _write_lineage(state_path: str | Path, parent_run_id: str) -> None:
         pass
 
 
-def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str | Path):
-    """부모 해석 + 새 workdir 시딩 + 증분 context 구성. 반환 (synth_context, parent_dir, seeded_n).
+def build_reuse_manifest(parent_spec, parent_state) -> dict:
+    """부모 *검증된 done 유닛*의 바 지문 manifest (WO#71 ②b 깊은 증분).
 
-    부모 못 찾음/시딩 실패는 ContinuationError(명확). spec.yaml 없으면 meta order로 degrade.
-    judge·critic엔 절대 안 가는 context(합성기 전용)만 만든다 — 호출부가 run(synth_context=)로 전달.
+    검증 가능 done만 — 상태 done + (코드가 시딩된 main에 존재; 시딩은 전체 workdir 복사라 충족).
+    각 항목 parent_unit_id → {criteria, scope}(unit_bar_signature). 새 run의 reuse_of 유닛이
+    이 manifest와 *직접 대조*돼 criteria·scope 불변일 때만 재사용된다(anti-erosion 가드).
+    부모 spec/state 없으면(옛 부모·crashed) 빈 dict → 재사용 0(전부 정상 빌드, graceful).
+    """
+    from haetae.intake import unit_bar_signature
+    from haetae.models import PlanState
+
+    if parent_spec is None or parent_state is None:
+        return {}
+    done = {p.unit for p in parent_state.plan if p.state == PlanState.done}
+    return {uid: unit_bar_signature(parent_spec, uid) for uid in done}
+
+
+def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str | Path):
+    """부모 해석 + 새 workdir 시딩 + 증분 context + 재사용 manifest 구성.
+
+    반환 (synth_context, parent_dir, seeded_n, reuse_manifest). 부모 못 찾음/시딩 실패는
+    ContinuationError(명확). spec.yaml 없으면 meta order로 degrade. judge·critic엔 절대 안 가는
+    context(합성기 전용)만 만든다 — 호출부가 run(synth_context=)로 전달. reuse_manifest는 부모
+    검증 done 유닛의 바 지문(WO#71) — 새 run의 reuse_of 검증·done 시드용(없으면 빈 dict).
     """
     from haetae.intake import build_continuation_context
     from haetae.models import ProjectSpec, State as _State
@@ -357,7 +380,8 @@ def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str
         parent_order = None
 
     ctx = build_continuation_context(parent_spec, parent_state, parent_order=parent_order)
-    return ctx, parent_dir, seeded_n
+    reuse_manifest = build_reuse_manifest(parent_spec, parent_state)
+    return ctx, parent_dir, seeded_n, reuse_manifest
 
 
 def format_summary(state: State) -> str:
@@ -472,6 +496,17 @@ def main(argv: list[str] | None = None) -> int:
         "--runs-dir",
         default="runs",
         help="--continue-from을 run-id로 줄 때 부모를 찾을 베이스 디렉터리 (기본 runs/).",
+    )
+    parser.add_argument(
+        "--no-reuse",
+        action="store_true",
+        default=False,
+        help=(
+            "이어가기(②b) 시 검증된 부모 유닛 재사용을 끄고 *전부 재빌드*한다(escape). 기본은 "
+            "ON(continue-from에서만 동작) — 부모서 done이고 acceptance_criteria·scope가 불변인 "
+            "유닛을 done으로 시드해 재빌드를 생략한다(토큰 절약). 바가 바뀐 유닛은 재사용 안 됨 "
+            "(재빌드+재gate, anti-erosion). 통합 gate는 재사용 run서도 항상 최종 결과에 실행."
+        ),
     )
     parser.add_argument("--max-iters", type=int, default=30, help="최대 루프 횟수 (기본 30)")
     # ── WO#68 비용 거버넌스(전부 opt-in, 미지정=무제한·기존 동작 불변) ──
@@ -774,9 +809,10 @@ def main(argv: list[str] | None = None) -> int:
     # 명시적 요청이라 실패는 명확한 에러(조용한 폴백 아님). scaffold는 스킵(스택 이미 존재).
     synth_context: str | None = None
     seeded = False
+    reuse_manifest: dict | None = None
     if args.continue_from:
         try:
-            ctx, parent_dir, seeded_n = load_continuation(
+            ctx, parent_dir, seeded_n, reuse_manifest = load_continuation(
                 args.continue_from, args.runs_dir, args.workdir
             )
         except ContinuationError as e:
@@ -787,8 +823,11 @@ def main(argv: list[str] | None = None) -> int:
         scaffold_client = None  # 이어가기 = scaffold 스킵(스택 이미 시딩됨)
         if args.state_path:
             _write_lineage(args.state_path, parent_dir.name)  # 계보 사이드카(best-effort)
+        reuse_n = 0 if (args.no_reuse or not reuse_manifest) else len(reuse_manifest)
         print(
-            f"… 이어가기: 부모 {parent_dir.name}에서 {seeded_n}개 파일 시딩 + scaffold 스킵 + 증분 합성",
+            f"… 이어가기: 부모 {parent_dir.name}에서 {seeded_n}개 파일 시딩 + scaffold 스킵 + "
+            f"증분 합성 (재사용 후보 done 유닛 {reuse_n}개"
+            + (", --no-reuse로 끔" if args.no_reuse else "") + ")",
             file=sys.stderr, flush=True,
         )
 
@@ -842,6 +881,8 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat=heartbeat,
             synth_context=synth_context,
             seeded=seeded,
+            reuse_manifest=reuse_manifest,            # WO#71 ②b: 부모 검증 done 유닛 manifest
+            reuse=not args.no_reuse,                  # --no-reuse면 전부 재빌드(escape)
             capabilities_on=args.capabilities,
             # opt-in: --capabilities일 때만 레지스트리/allowlist를 넘긴다(OFF면 no-op).
             capability_registry_path=(args.capability_registry if args.capabilities else None),

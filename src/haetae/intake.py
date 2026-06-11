@@ -349,9 +349,37 @@ def build_continuation_context(
         "  (부모가 충족한 기준은 새 run에서도 계속 충족돼야 한다. 통합 gate가 합쳐진 결과를 판정한다.)",
         "- 새 주문의 기능을 *추가*하는 방향으로만 분해하라(기존 동작 회귀 금지).",
         "",
+        "## 검증된 유닛 재사용 (reuse_of — 선택, 토큰 절약)",
+        "- 이번 delta로 **바뀌지 않는** 부모 유닛(같은 acceptance_criteria·scope로 이미 검증됨)을",
+        "  새 분해에 그대로 다시 둘 때는 그 유닛에 `reuse_of: <부모 unit-id>`를 달아라.",
+        "  → 루프가 부모와 기준 동등성을 *대조*해 맞으면 재빌드를 생략한다(코드는 이미 시딩됨).",
+        "- **바를 바꿨거나(기준/scope 변경) 새로 만드는 유닛에는 절대 `reuse_of`를 달지 마라** —",
+        "  그러면 다른 바이므로 정상 빌드+gate가 돼야 한다(재사용은 검증 우회가 아니다).",
+        "  부모 유닛 id가 헷갈리면 생략하라(생략 시 정상 빌드). 라벨이 틀려도 루프 가드가 막는다.",
+        "",
         "# 새 주문(delta) — 아래가 이번에 추가/변경할 것이다",
     ]
     return "\n".join(lines)
+
+
+def unit_bar_signature(spec: ProjectSpec, unit_id: str) -> dict:
+    """유닛의 '바' 지문 — 그 유닛에 태그된 acceptance_criteria + scope (WO#71 재사용 대조용).
+
+    재사용(continue-from)은 *바가 불변*일 때만 허용된다(anti-erosion). 부모/새 spec에서 같은
+    함수로 지문을 뽑아 **직접 대조**해 동등성을 판정한다(합성 라벨만 신뢰하지 않음 = 라벨+가드 이중).
+    criteria: 정렬된 (id, desc, check.type, check.cmd, check.pass) 튜플 리스트. scope: 정렬 경로.
+    유닛이 없으면 빈 지문. 순수 함수(LLM/IO 없음) — 직렬화·동등비교 가능한 dict.
+    """
+    criteria: list[tuple] = []
+    for ac in spec.acceptance_criteria:
+        if ac.unit == unit_id:
+            chk = ac.check
+            ctype = chk.type.value if hasattr(chk.type, "value") else chk.type
+            criteria.append((ac.id, ac.desc, ctype, chk.cmd, chk.pass_))
+    criteria.sort()
+    unit = next((u for u in spec.decomposition if u.unit == unit_id), None)
+    scope = sorted(unit.scope) if unit and unit.scope else []
+    return {"criteria": criteria, "scope": scope}
 
 
 # ──────────────────── WO#59: disjoint-scope 분해 유도 (#51의 형제) ────────────────────

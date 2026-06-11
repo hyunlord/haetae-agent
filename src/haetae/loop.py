@@ -23,6 +23,7 @@ from haetae.intake import (
     nudge_disjoint_scope,
     nudge_integration_deps,
     synthesize,
+    unit_bar_signature,
 )
 from haetae.llm import CodexStalled, CodexUsageLimitError, LLMClient
 from haetae.metering import (
@@ -77,6 +78,8 @@ STAGE_ESCALATE = "escalate"
 STAGE_DECOMP_REJECT = "decomp-reject"  # WO#40: 분해 critic이 무진전 work order를 reject→재replan
 STAGE_OR_ALTERNATIVE = "or-alternative"  # WO#41: gate 실패 소진 → 다른 접근으로 백트래킹·재시도
 STAGE_AUTO_CONFIG = "auto-config"  # WO#65: --auto가 해석한 운영 config(사다리·critic·scaffold 등) 기록
+STAGE_REUSE = "reuse"  # WO#71: continue-from서 검증된 부모 유닛을 done으로 시드(재빌드 생략)
+STAGE_REBUILD = "rebuild"  # WO#71: reuse_of 있으나 바 변경/부모 미검증 → 재사용 거부·정상 빌드(anti-erosion)
 from haetae.decomp_critic import (
     DEFAULT_DECOMP_CRITIC_PROMPT_PATH,
     build_decomp_feedback,
@@ -157,6 +160,65 @@ def resolve_start_tier(start_tier: str, ladder: list[Tier]) -> int:
         if s in labels:
             return min(i, len(ladder) - 1)
     return 0
+
+
+# ──────────────────── 검증된 유닛 재사용 (②b 깊은 증분, WO#71) ────────────────────
+
+
+class ReuseDecision:
+    """한 유닛의 재사용/재빌드 결정(이벤트·transition 기록용). 가벼운 값 객체."""
+
+    __slots__ = ("unit", "parent", "reused", "reason")
+
+    def __init__(self, unit: str, parent: str, reused: bool, reason: str):
+        self.unit = unit
+        self.parent = parent
+        self.reused = reused
+        self.reason = reason
+
+
+def evaluate_reuse(
+    spec: ProjectSpec,
+    reuse_manifest: dict | None,
+    *,
+    reuse_on: bool = True,
+) -> list[ReuseDecision]:
+    """새 spec의 `reuse_of` 유닛을 부모 done-manifest와 대조해 재사용/재빌드를 결정한다.
+
+    anti-erosion 가드(검증 우회 금지):
+      - reuse_on=False(--no-reuse)거나 manifest 없으면 → 빈 리스트(전부 정상 빌드, 무변경).
+      - 새 유닛에 reuse_of가 없으면 → 결정 없음(신규/변경 유닛은 정상 빌드).
+      - reuse_of=<pid>인데 부모 manifest에 pid가 없으면(부모서 non-done/없음 = 검증 불가) →
+        **재사용 거부·재빌드**(crashed-parent graceful).
+      - pid가 있어도 acceptance_criteria·scope 지문이 *다르면*(바 변경) → **재사용 거부·재빌드+
+        재gate**. 합성 라벨을 신뢰만 하지 않고 지문을 직접 대조한다(라벨+가드 이중).
+      - 부모 done + 지문 불변일 때만 reused=True(done 시드 대상).
+    순수 함수(IO/LLM 없음) — 결정만 돌려준다. 시드/이벤트는 호출부가 한다.
+    """
+    decisions: list[ReuseDecision] = []
+    # manifest=None = continue-from 아님(무변경). 빈 dict {}는 *continue-from인데 부모 done 0*
+    # (crashed/half) — 그땐 reuse_of 유닛마다 '부모 미검증→재빌드' 결정을 내야 하므로 통과시킨다.
+    if not reuse_on or reuse_manifest is None:
+        return decisions
+    for u in spec.decomposition:
+        pid = (getattr(u, "reuse_of", "") or "").strip()
+        if not pid:
+            continue  # 신규/변경 유닛 — 정상 빌드(결정 없음)
+        parent_sig = reuse_manifest.get(pid)
+        if parent_sig is None:
+            decisions.append(ReuseDecision(
+                u.unit, pid, False,
+                f"부모 '{pid}' 미검증(non-done/없음) → 재빌드 (crashed-parent graceful)"))
+            continue
+        new_sig = unit_bar_signature(spec, u.unit)
+        if new_sig == parent_sig:
+            decisions.append(ReuseDecision(
+                u.unit, pid, True, f"부모 '{pid}' 재사용 — acceptance_criteria·scope 불변"))
+        else:
+            decisions.append(ReuseDecision(
+                u.unit, pid, False,
+                f"criteria/scope 변경(vs 부모 '{pid}') → 재빌드+재gate (anti-erosion)"))
+    return decisions
 
 
 # ──────────────────────────── 주입 인터페이스 ────────────────────────────
@@ -470,6 +532,8 @@ def run_loop(
     deps_runner: DepsRunner | None = None,
     synth_context: str | None = None,
     seeded: bool = False,
+    reuse_manifest: dict | None = None,
+    reuse: bool = True,
     skills_dir: str | Path | None = None,
     pricing: dict | None = None,
     clock: Callable[[], str] | None = None,
@@ -813,6 +877,26 @@ def run_loop(
                     try_save()
                     return state
 
+        # ── ②b 깊은 증분(WO#71): 검증된 부모 유닛 명시적 재사용 — done 시드로 재빌드 생략 ──
+        # continue-from에서만(reuse_manifest 있을 때). 합성기가 단 `reuse_of` 라벨을 부모
+        # done-manifest와 acceptance_criteria·scope로 *대조*해(라벨+가드 이중) 불변일 때만 done으로
+        # 시드한다 → 스케줄러가 자연히 skip(delta DAG). 바 변경/부모 미검증이면 재사용 거부·정상
+        # 빌드+gate(anti-erosion — 부모 통과로 도장 금지). 통합 gate는 재사용 유닛도 머지된 main
+        # 통합 스코프에 포함돼 최종 결과에 항상 실행된다(개별 재사용≠통합 생략). 결정은 이벤트+transition.
+        reuse_events: list[Event] = []
+        for d in evaluate_reuse(spec, reuse_manifest, reuse_on=reuse):
+            record_transition(STAGE_REUSE if d.reused else STAGE_REBUILD, d.unit)
+            emit(("재사용: " if d.reused else "재빌드: ") + f"{d.unit} — {d.reason}")
+            if d.reused:
+                _set_plan_state(state, d.unit, PlanState.done)
+                reuse_events.append(Event(
+                    seq=0, unit=d.unit, work_order_ref=f"reuse_of={d.parent}",
+                    result=d.reason, verdict=Verdict.pass_, learnings=d.reason,
+                    ts=now(), stage=STAGE_REUSE,
+                ))
+        if reuse_events or reuse_manifest:
+            try_save()  # 증분: 재사용/재빌드 결정을 즉시 감사 로그에 보존
+
         # 선제 스캐폴드(WO#27): executor *dispatch 전에* host가 진짜 스택을 깐다.
         # scaffold_client 없으면 None → 모든 신규 경로 no-op(기존 동작 불변, critic 패턴과 동형).
         # generate_scaffold는 best-effort라 dep 스택 불필요/실패면 None을 돌려준다.
@@ -872,7 +956,13 @@ def run_loop(
                 max_tokens=max_tokens,
                 unit_attempt_budget=unit_attempt_budget,
                 unit_token_budget=unit_token_budget,
+                reuse_events=reuse_events,  # WO#71: 재사용 시드 이벤트(materialize가 포함)
             )
+
+        # WO#71: 순차 경로는 materialize가 없어 재사용 이벤트를 여기서 직접 events에 싣는다.
+        for ev in reuse_events:
+            ev.seq = len(state.events) + 1
+            state.events.append(ev)
 
         # 순차(N=1): worktree 없음 → workdir에 직접 scaffold 쓰기 + host-install(커밋 불필요).
         # scaffold=None이면 no-op → 기존 순차 경로 불변.
@@ -1221,6 +1311,7 @@ def _parallel_loop(
     max_tokens: int | None = None,
     unit_attempt_budget: int | None = None,
     unit_token_budget: int | None = None,
+    reuse_events: list[Event] | None = None,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -1366,16 +1457,18 @@ def _parallel_loop(
 
     def materialize(integration_ev: Event | None = None) -> None:
         ordered = sorted(buf, key=lambda e: (e["unit"], e["attempt"]))
-        evs: list[Event] = []
-        for i, e in enumerate(ordered, start=1):
+        # WO#71: 재사용 시드 이벤트(시드 시점·spec 순서로 결정적)를 맨 앞에 둔다.
+        evs: list[Event] = list(reuse_events or [])
+        for e in ordered:
             evs.append(Event(
-                seq=i, unit=e["unit"], work_order_ref=e["goal"],
+                seq=0, unit=e["unit"], work_order_ref=e["goal"],
                 result=e["result"], verdict=e["verdict"], checks=e["checks"],
                 cost=e.get("cost"), ts=e.get("ts"), stage=STAGE_BUILD,
             ))
         if integration_ev is not None:
-            integration_ev.seq = len(evs) + 1
             evs.append(integration_ev)
+        for i, ev in enumerate(evs, start=1):  # 전체 재번호(재사용+빌드+통합) — 결정적 seq
+            ev.seq = i
         state.events = evs
 
     def persist() -> None:
@@ -1625,6 +1718,13 @@ def _parallel_loop(
                 res = ensure_deps(wm.workdir, runner=deps_runner)
                 emit(f"scaffold host-install(main): {res.manager} ok={res.ok}")
             commit_scaffold(wm.workdir)  # worktree가 분기 시 상속(node_modules는 gitignore 제외)
+        elif seeded:
+            # WO#71(②b): 이어가기 — 시딩된 부모 코드를 main에 커밋해야 worktree가 분기 시
+            # 상속한다(재사용 유닛 코드 + 하류 빌드 base). ensure_repo의 초기 커밋은 빈 트리라,
+            # 커밋 안 하면 worktree가 빈 main에서 분기해 재사용 코드를 못 본다(delta DAG의 전제).
+            # commit_scaffold = git add -A + commit(best-effort·멱등; node_modules는 미시딩).
+            if commit_scaffold(wm.workdir, message="haetae: seeded parent (continue-from)"):
+                emit("이어가기: 시딩된 부모 코드를 main에 커밋 (worktree 분기 base)")
 
         if not state.plan:
             state.status = Status.escalated

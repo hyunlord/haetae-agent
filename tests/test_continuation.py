@@ -170,11 +170,12 @@ def test_load_continuation_seeds_and_builds_context(tmp_path):
     (rdir / "meta.json").write_text(json.dumps({"id": "p", "order": "부모주문"}), encoding="utf-8")
 
     new_work = tmp_path / "child" / "work"
-    ctx, parent_dir, n = load_continuation("20260610-100000-p", runs, new_work)
+    ctx, parent_dir, n, reuse_manifest = load_continuation("20260610-100000-p", runs, new_work)
     assert parent_dir == rdir
     assert (new_work / "src" / "engine.ts").is_file()  # 시딩됨
     assert "리테일 체크아웃 시뮬레이터" in ctx           # 부모 spec goal
     assert "확장" in ctx and "약화" in ctx               # anti-erosion
+    assert isinstance(reuse_manifest, dict)              # WO#71: 재사용 manifest 동봉(여기선 plan 없어 빈)
 
 
 # ──────────────────────────── spec 사이드카(loop) ────────────────────────────
