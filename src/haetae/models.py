@@ -295,14 +295,23 @@ class CheckReport(BaseModel):
 
 
 class Cost(BaseModel):
-    """LLM 호출 비용 (WO#33 계측).
+    """LLM 호출 비용 (WO#33 계측 + WO#70 sub-attribution).
 
     tokens: 총 토큰(input+output) — 후방호환 필드(기존 schema/state가 쓰던 int).
     input/output: 토큰 분해(잡히면). usd: 가격표로 계산(모델 미상이면 None — 날조 금지).
-    source: orchestration(합성/replan/critic/scaffold) | executor(codex 서브프로세스) |
-            judge(gate 내부 judge/run-judge) | mixed.
+    source: orchestration(합성/replan/scaffold) | executor(codex 서브프로세스) |
+            judge(gate 내부 judge/run-judge) | critic(적대적 spec/decomp critic) | mixed.
     note: 못 잡는 비용을 *정직하게* 남기는 메모(예: "executor usage 미노출").
     새 필드는 전부 optional/None 기본 → 기존 Cost(tokens=…, usd=…) 그대로 유효(무회귀).
+
+    sub-attribution(WO#70 — 44.8M이 *어디로* 갔나): 한 계측 호출(leaf)을 source 외에도
+      tier/kind/unit으로 태그해 대시보드가 "u6 6.4M = xhigh 빌드 재시도 3.1M·OR 2.0M·
+      run-judge 1.3M"처럼 분해해 보이게 한다. 전부 optional(미상이면 None — 날조 금지).
+      tier:  실행 강도 라벨('model/effort', #64 사다리). orchestration/judge엔 보통 None.
+      kind:  호출 종류 — synth|replan|scaffold|build|retry|OR|integration-OR|judge|critic.
+      unit:  어느 유닛에 든 비용인지(전역 단계는 None).
+      parts: 이 Cost가 여러 호출의 합(combine_costs)이면 그 *leaf*들(분해 가능 원천). 단일
+             호출(leaf)이면 빈 리스트. 권위 total(tokens 등)은 그대로, parts는 분해용 추가형.
     """
 
     tokens: int | None = None
@@ -311,6 +320,11 @@ class Cost(BaseModel):
     output: int | None = None
     source: str | None = None
     note: str | None = None
+    # WO#70 sub-attribution(전부 추가형·optional — 기존 Cost 직렬화/read 무영향).
+    tier: str | None = None
+    kind: str | None = None
+    unit: str | None = None
+    parts: list["Cost"] = Field(default_factory=list)
 
 
 class GateResult(BaseModel):
@@ -491,6 +505,12 @@ class State(BaseModel):
     #   requests: 이번 run이 선언한 능력 gap. provenance: *승인되어 채택된* 능력(무엇·출처·라이선스·승인).
     capability_requests: list[CapabilityRequest] = Field(default_factory=list)
     capability_provenance: list[CapabilityProvenance] = Field(default_factory=list)
+    # WO#70 비용 분해 ledger — *모든* 계측 leaf(synth/scaffold/replan/build/retry/OR/judge/
+    # critic)를 budget.spent에 누적하는 *그 자리에서* append한다(단일 chokepoint=account).
+    #   → Σcost_parts.tokens == budget.spent.tokens 가 구성적으로 보장(정합 by construction).
+    #   대시보드가 이걸 source×tier×kind로 집계해 "토큰이 어디로 갔나"를 드릴다운한다.
+    #   추가형·append-only — 기존 read 무영향, 부재(구버전 state)면 빈 리스트(graceful).
+    cost_parts: list[Cost] = Field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "State":

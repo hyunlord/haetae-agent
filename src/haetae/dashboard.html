@@ -293,6 +293,12 @@
   .cost-tbl td,.cost-tbl th { text-align:right; padding:3px 6px; border-bottom:1px solid var(--bd); font-variant-numeric:tabular-nums; }
   .cost-tbl th { color:var(--mut); font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:.05em; }
   .cost-tbl td:first-child,.cost-tbl th:first-child { text-align:left; }
+  /* WO#70: 비용 분해 드릴다운 */
+  .cost-unit-row:hover { background:var(--panel2); }
+  .cost-drill { padding:4px 0 8px 14px; border-left:2px solid var(--accent); margin:2px 0 4px; }
+  .cost-sub-h { margin:8px 0 2px; text-transform:uppercase; letter-spacing:.05em; }
+  .cost-recon-ok { color:var(--done); font-size:11.5px; margin-top:6px; }
+  .cost-recon-bad { color:var(--fail); font-size:11.5px; margin-top:6px; }
   .gap { font-size:12px; padding:7px 9px; border:1px solid var(--bd); border-left:3px solid var(--accent); border-radius:6px; margin-bottom:8px; background:var(--panel2); }
   .empty { color:var(--mut); font-size:12.5px; }
   #detail .ph { color:var(--mut); font-size:13px; }
@@ -1330,7 +1336,24 @@ function renderIntegration(v) {
   }).join("");
 }
 
-const SRC_KO = {orchestration:"오케스트레이션", executor:"실행자(codex)", judge:"검증(judge)", mixed:"혼합", unknown:"미상"};
+const SRC_KO = {orchestration:"오케스트레이션", executor:"실행자(codex)", judge:"검증(judge)", critic:"비평(critic)", mixed:"혼합", unknown:"미상"};
+// WO#70: 호출 kind 한글 라벨(synth/replan/scaffold/build/retry/OR/integration-OR/judge/critic).
+const KIND_KO = {synth:"합성", replan:"재계획", scaffold:"스캐폴드", build:"빌드", retry:"재시도(같은 접근)", OR:"OR 대안", "integration-OR":"통합 OR", judge:"judge", critic:"critic"};
+
+// 차원(source/tier/kind) 분해를 tokens 내림차순 미니 테이블로. usd는 있으면, 없으면 '—'.
+function costDimTable(obj, koMap) {
+  const keys = Object.keys(obj||{});
+  if (!keys.length) return '';
+  keys.sort((a,b)=>(obj[b].tokens||0)-(obj[a].tokens||0));
+  return '<table class="cost-tbl">'
+    + keys.map(k=>'<tr><td>'+esc((koMap&&koMap[k])||k)+'</td><td>'+num(obj[k].tokens)+'</td><td>'+usd(obj[k].usd)+'</td></tr>').join("")
+    + '</table>';
+}
+// 유닛 행 클릭 → source/tier/kind 분해 펼침/접힘.
+function toggleCostUnit(uid) {
+  const el = document.getElementById('cost-drill-'+uid);
+  if (el) el.style.display = (el.style.display==='none' ? '' : 'none');
+}
 function renderCost(v) {
   const c = v.cost; if(!c){ $("cost").innerHTML='<div class="empty">비용 데이터 없음</div>'; return; }
   const t = c.total||{};
@@ -1354,12 +1377,32 @@ function renderCost(v) {
     h += '<div class="empty">귀속된 비용 없음</div>';
   }
 
-  // unit별 표
+  // WO#70: 정합(Σ분해 == total?) 정직 표기 — 미귀속분이 있으면 빨간 경고로 노출(No Fake Metrics).
+  const rc = c.reconciliation;
+  if (rc && rc.total_tokens!=null) {
+    if (rc.reconciled) h += '<div class="cost-recon-ok">✓ 분해 정합: Σ '+num(rc.attributed_tokens)+' = total</div>';
+    else h += '<div class="cost-recon-bad">⚠ 미귀속 '+num(rc.unattributed_tokens)+' tokens (Σ분해 '+num(rc.attributed_tokens)+' ≠ total '+num(rc.total_tokens)+')</div>';
+  }
+
+  // WO#70: 런 전체 kind별·tier별 요약(어느 재시도층/어느 tier에서 토큰이 났나).
+  if (Object.keys(c.by_kind||{}).length) { h += '<div class="cost-sub-h mut small">kind별</div>' + costDimTable(c.by_kind, KIND_KO); }
+  if (Object.keys(c.by_tier||{}).length) { h += '<div class="cost-sub-h mut small">tier별 (#64)</div>' + costDimTable(c.by_tier, null); }
+
+  // unit별 표 — 행 클릭 시 source/tier/kind 분해로 드릴다운("이 유닛 비용이 어디서 났나").
   const bu = c.by_unit||{}; const units = Object.keys(bu);
   if (units.length) {
-    h += '<table class="cost-tbl"><tr><th>unit</th><th>tokens</th><th>usd</th></tr>'
-      + units.map(u=>'<tr><td>'+esc(u)+'</td><td>'+num(bu[u].tokens)+'</td><td>'+usd(bu[u].usd)+'</td></tr>').join("")
-      + '</table>';
+    h += '<div class="cost-sub-h mut small">unit별 (클릭 → 분해)</div>';
+    h += '<table class="cost-tbl"><tr><th>unit</th><th>tokens</th><th>usd</th></tr>';
+    h += units.map(u=>{
+      const row = '<tr class="cost-unit-row" onclick="toggleCostUnit(\''+esc(u)+'\')"><td>▸ '+esc(u)+'</td><td>'+num(bu[u].tokens)+'</td><td>'+usd(bu[u].usd)+'</td></tr>';
+      const drill = '<tr id="cost-drill-'+esc(u)+'" style="display:none"><td colspan="3"><div class="cost-drill">'
+        + '<div class="mut small">source</div>' + (costDimTable(bu[u].by_source, SRC_KO) || '<div class="empty">—</div>')
+        + '<div class="mut small">tier</div>' + (costDimTable(bu[u].by_tier, null) || '<div class="empty">—</div>')
+        + '<div class="mut small">kind</div>' + (costDimTable(bu[u].by_kind, KIND_KO) || '<div class="empty">—</div>')
+        + '</div></td></tr>';
+      return row + drill;
+    }).join("");
+    h += '</table>';
   }
   $("cost").innerHTML = h;
 }

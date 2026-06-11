@@ -476,28 +476,87 @@ def state_to_view(
         for t in (getattr(state, "transitions", None) or [])
     ]
 
-    # 코스트: total(budget.spent, 권위) + event.cost를 source/unit별로 집계(귀속 분해).
+    # ── 코스트 분해(WO#70): total(budget.spent, 권위) + 호출별 leaf를 source×tier×kind×unit ──
+    # "44.8M이 *어디로* 갔나" — 유닛 총합을 넘어 어느 source(orchestration/executor/judge/
+    # critic)·어느 tier(#64)·어느 kind(synth/replan/scaffold/build/retry/OR/integration-OR/judge)
+    # 에서 났는지 가른다. 권위 total은 budget.spent 그대로 — 분해는 leaf 집계(읽기만).
     spent = state.budget.spent if state.budget is not None else None
     cap = state.budget.cap if state.budget is not None else None
+    _UNKNOWN_DIM = "(미상)"
+
+    def _leaves(c: Any) -> list[Any]:
+        """Cost를 leaf로 펼친다(combine 결과면 .parts, 단일이면 [자기]). 부재/구버전 흡수."""
+        if c is None:
+            return []
+        parts = getattr(c, "parts", None)
+        return list(parts) if parts else [c]
+
+    def _dim(leaf: Any, attr: str) -> str:
+        return getattr(leaf, attr, None) or _UNKNOWN_DIM
+
+    # 런-레벨 분해 원천: ledger(state.cost_parts)가 있으면 그것(synth/scaffold 등 *전역* 비용까지
+    # 포함 → total과 정합 by construction). 없으면(구버전/이벤트-only state) event.cost를 leaf로
+    # 펼쳐 폴백(이 경우 전역 비용은 event에 없어 아래 정합 검증이 '(미귀속)'으로 정직히 드러낸다).
+    ledger = getattr(state, "cost_parts", None) or []
+    run_leaves = list(ledger) if ledger else [lf for ev in state.events for lf in _leaves(ev.cost)]
+
     by_source: dict[str, Any] = {}
+    by_tier: dict[str, Any] = {}
+    by_kind: dict[str, Any] = {}
+    for lf in run_leaves:
+        _accumulate_cost(by_source.setdefault(getattr(lf, "source", None) or "unknown", {}), lf)
+        _accumulate_cost(by_tier.setdefault(_dim(lf, "tier"), {}), lf)
+        _accumulate_cost(by_kind.setdefault(_dim(lf, "kind"), {}), lf)
+
+    # 유닛별 집계(+드릴다운): event.cost를 ev.unit으로 묶고, 그 leaf를 source/tier/kind로 가른다.
+    # bu의 최상위 tokens/usd/...는 종전 형태 그대로(무회귀). by_source/by_tier/by_kind는 추가형.
     by_unit: dict[str, Any] = {}
     for ev in state.events:
         c = ev.cost
         if c is None:
             continue
-        src = getattr(c, "source", None) or "unknown"
-        _accumulate_cost(by_source.setdefault(src, {}), c)
-        _accumulate_cost(by_unit.setdefault(ev.unit or "(integration)", {}), c)
+        bu = by_unit.setdefault(ev.unit or "(integration)", {})
+        _accumulate_cost(bu, c)  # 유닛 총합(기존 tokens/usd 형태 보존)
+        sub_src = bu.setdefault("by_source", {})
+        sub_tier = bu.setdefault("by_tier", {})
+        sub_kind = bu.setdefault("by_kind", {})
+        for lf in _leaves(c):
+            _accumulate_cost(sub_src.setdefault(getattr(lf, "source", None) or "unknown", {}), lf)
+            _accumulate_cost(sub_tier.setdefault(_dim(lf, "tier"), {}), lf)
+            _accumulate_cost(sub_kind.setdefault(_dim(lf, "kind"), {}), lf)
+
+    # 정합 검증(No Fake Metrics): Σrun_leaves.tokens vs total(budget, 권위). 어긋나면 미귀속분을
+    # 정직히 노출(누락 0). ledger 경로는 account가 단일 길목이라 구성적으로 0; 폴백 경로는 전역
+    # 비용(합성/스캐폴드)이 event에 없어 gap이 날 수 있고, 그걸 '(미귀속)' 버킷으로 드러낸다.
+    total_tokens = getattr(spent, "tokens", None)
+    attributed_tokens = sum((getattr(lf, "tokens", None) or 0) for lf in run_leaves)
+    unattributed: int | None = None
+    if total_tokens is not None:
+        unattributed = total_tokens - attributed_tokens
+        if unattributed > 0:  # 미귀속분을 각 차원에 정직히 노출 → 차원합 == total 보장
+            for d in (by_source, by_tier, by_kind):
+                d["(미귀속)"] = {
+                    "tokens": unattributed, "usd": None, "input": None,
+                    "output": None, "count": 0,
+                }
     cost = {
         "total": {
-            "tokens": getattr(spent, "tokens", None),
+            "tokens": total_tokens,
             "usd": getattr(spent, "usd", None),
             "input": getattr(spent, "input", None),
             "output": getattr(spent, "output", None),
         },
         "cap": {"tokens": getattr(cap, "tokens", None), "usd": getattr(cap, "usd", None)},
         "by_source": by_source,
+        "by_tier": by_tier,
+        "by_kind": by_kind,
         "by_unit": by_unit,
+        "reconciliation": {
+            "total_tokens": total_tokens,
+            "attributed_tokens": attributed_tokens,
+            "unattributed_tokens": unattributed,
+            "reconciled": (total_tokens is None) or (unattributed == 0),
+        },
     }
 
     # ── v3.1(WO#44): #40/#41 표면화 + per-unit 집계(retry/OR/decomp-reject) ──

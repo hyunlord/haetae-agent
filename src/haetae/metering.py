@@ -76,11 +76,24 @@ def _sum_opt(values: list[int | float]) -> int | float | None:
     return sum(known) if known else None
 
 
+def cost_leaves(cost: Cost | None) -> list[Cost]:
+    """이 Cost의 *leaf*들(분해 원천). combine 결과면 .parts, 단일 호출이면 [자기]. None→[].
+
+    sub-attribution 집계/원장(ledger)이 호출별 비용을 source×tier×kind로 가르기 위한 단위다.
+    """
+    if cost is None:
+        return []
+    return list(cost.parts) if cost.parts else [cost]
+
+
 def combine_costs(costs: list[Cost | None]) -> Cost | None:
     """여러 Cost를 하나로 합산(이벤트 귀속용). 모두 None/빈 리스트면 None.
 
     source가 유일하면 그대로, 둘 이상이면 'mixed'. note는 이어붙인다.
     각 필드는 알려진 값만 합산(미상은 무시 → 정직).
+
+    WO#70: 합산 결과에 입력들의 *leaf*를 평탄화해 .parts에 싣는다(이미 combine된 입력은 그
+    leaf들을 펼쳐 중첩을 막는다). 권위 total(tokens 등)은 종전 그대로 — parts는 분해용 추가.
     """
     real = [c for c in costs if c is not None]
     if not real:
@@ -88,6 +101,9 @@ def combine_costs(costs: list[Cost | None]) -> Cost | None:
     sources = {c.source for c in real if c.source}
     source = sources.pop() if len(sources) == 1 else ("mixed" if sources else None)
     notes = [c.note for c in real if c.note]
+    parts: list[Cost] = []
+    for c in real:
+        parts.extend(cost_leaves(c))  # 평탄화: 중첩 combine은 leaf로 펼친다
     return Cost(
         tokens=_sum_opt([c.tokens for c in real]),
         usd=_sum_opt([c.usd for c in real]),
@@ -95,7 +111,35 @@ def combine_costs(costs: list[Cost | None]) -> Cost | None:
         output=_sum_opt([c.output for c in real]),
         source=source,
         note="; ".join(notes) if notes else None,
+        parts=parts,
     )
+
+
+def tag_cost(
+    cost: Cost | None,
+    *,
+    kind: str | None = None,
+    tier: str | None = None,
+    unit: str | None = None,
+) -> Cost | None:
+    """Cost와 그 leaf들에 kind/tier/unit를 *채워넣는다*(fill-if-None, in-place). cost를 반환.
+
+    WO#70 sub-attribution: 계측은 source만 안다(어느 client인지). kind/tier/unit은 *호출부*
+    (loop)가 안다 — synth인지 replan인지, 어느 tier(#64)에서, 어느 유닛에 든 비용인지. 그래서
+    호출 직후 여기서 태그한다. **fill-if-None** — 이미 값이 있으면 덮지 않는다(상위 combine이
+    유닛을 한 번 달면 하위 leaf의 개별 태그는 보존). None 안전(no-op). 순수 텔레메트리(판정 무관).
+    """
+    if cost is None:
+        return None
+    targets = (list(cost.parts) if cost.parts else []) + [cost]
+    for c in targets:
+        if kind is not None and c.kind is None:
+            c.kind = kind
+        if tier is not None and c.tier is None:
+            c.tier = tier
+        if unit is not None and c.unit is None:
+            c.unit = unit
+    return cost
 
 
 def accumulate(spent: Cost, cost: Cost | None) -> None:

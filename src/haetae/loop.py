@@ -30,6 +30,8 @@ from haetae.metering import (
     accumulate,
     combine_costs,
     cost_from_usage,
+    cost_leaves,
+    tag_cost,
 )
 from haetae.scaffold import (
     Scaffold,
@@ -573,9 +575,16 @@ def run_loop(
             return None
 
     def account(cost: Cost | None) -> None:
-        """budget.spent에 누적(best-effort)."""
+        """budget.spent에 누적 + 분해 ledger(state.cost_parts)에 leaf append(best-effort).
+
+        WO#70: account가 budget.spent로 가는 *유일한* 길목이라, 여기서 같은 cost의 leaf를
+        ledger에 적재하면 Σledger.tokens == budget.spent.tokens 가 구성적으로 보장된다
+        (정합 by construction). leaf는 이미 호출부에서 source/tier/kind/unit 태그됨.
+        """
         try:
             accumulate(state.budget.spent, cost)
+            for leaf in cost_leaves(cost):
+                state.cost_parts.append(leaf)
         except Exception:  # noqa: BLE001
             pass
 
@@ -632,8 +641,10 @@ def run_loop(
     # brain/critic/scaffold 호출을 metering으로 감싼다(orchestration source). inner의
     # complete 반환은 그대로 통과하므로 호출부·테스트는 불변. drain()으로 적립분을 꺼낸다.
     m_client = MeteredClient(client, source="orchestration", pricing=pricing)
+    # WO#70: critic(적대적 spec/decomp critic)은 *독립 source*로 귀속 — orchestration과 분리해
+    # "검증 측 비용이 얼마나 드나"를 따로 본다(적대 분리의 비용 가시화). 판정 행동 불변.
     m_critic = (
-        MeteredClient(critic_client, source="orchestration", pricing=pricing)
+        MeteredClient(critic_client, source="critic", pricing=pricing)
         if critic_client is not None
         else None
     )
@@ -736,9 +747,9 @@ def run_loop(
             )
             record_transition(STAGE_SYNTHESIZE)
             # 합성 실패라도 거기까지 든 비용은 정직하게 누적(state 생성 후 — budget 존재).
-            account(combine_costs(m_client.drain()))
+            account(tag_cost(combine_costs(m_client.drain()), kind="synth"))
             if m_critic is not None:
-                account(combine_costs(m_critic.drain()))
+                account(tag_cost(combine_costs(m_critic.drain()), kind="critic"))
             emit(_final_label(state))
             try_save()
             return state
@@ -767,9 +778,9 @@ def run_loop(
             record_transition(STAGE_AUTO_CONFIG)
         record_transition(STAGE_SYNTHESIZE)
         # 합성/critic/통합-deps 넛지(전역 단계) 비용을 budget에 누적(특정 유닛 event 아님).
-        account(combine_costs(m_client.drain()))
+        account(tag_cost(combine_costs(m_client.drain()), kind="synth"))
         if m_critic is not None:
-            account(combine_costs(m_critic.drain()))
+            account(tag_cost(combine_costs(m_critic.drain()), kind="critic"))
         if critique is not None:
             state.spec_critique = critique  # 감사 기록(재합성 발생 여부 포함)
             emit(_critique_label(critique))
@@ -811,7 +822,8 @@ def run_loop(
             record_transition(STAGE_SCAFFOLD)
             hb("scaffold")
             scaffold = generate_scaffold(spec, m_scaffold, prompt_path=scaffold_prompt)
-            account(combine_costs(m_scaffold.drain()))  # scaffold(전역 단계) 비용 누적
+            # scaffold(전역 단계) 비용 누적 + kind 태그(분해 ledger에 'scaffold'로 보임).
+            account(tag_cost(combine_costs(m_scaffold.drain()), kind="scaffold"))
             emit(
                 f"scaffold: {len(scaffold.files)}개 파일 (install={scaffold.install})"
                 if scaffold is not None
@@ -852,7 +864,7 @@ def run_loop(
                 decomp_retries=decomp_retries,
                 run_decomp_critic=run_decomp_critic,
                 account_decomp_cost=(
-                    (lambda: account(combine_costs(m_critic.drain())))
+                    (lambda: account(tag_cost(combine_costs(m_critic.drain()), kind="critic")))
                     if m_critic is not None
                     else (lambda: None)
                 ),
@@ -957,10 +969,11 @@ def run_loop(
                         f"{_truncate(crit.reason or '')}"
                     )
             # 이 iteration의 replan(재계획 재시도 포함) orchestration 비용을 꺼낸다.
-            replan_cost = combine_costs(m_client.drain())
+            # kind="replan" 태그(unit은 next_order 채택 시 채움 — fill-if-None).
+            replan_cost = tag_cost(combine_costs(m_client.drain()), kind="replan")
             # 분해 critic(verifier-side) 비용도 정직하게 누적(코스트 패널에 보임).
             if m_critic is not None:
-                account(combine_costs(m_critic.drain()))
+                account(tag_cost(combine_costs(m_critic.drain()), kind="critic"))
             if decision is None:
                 account(replan_cost)  # 실패한 replan도 비용은 정직하게 누적
                 state.status = Status.escalated
@@ -997,6 +1010,13 @@ def run_loop(
                 hb("빌드", no.unit)  # WO#55: 빌드 codex 호출 라이브 표면화
                 result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
                 exec_cost = _executor_cost(executor, pricing)  # 읽기만(best-effort)
+                # WO#70: 빌더 비용 태그 — retry면 kind=retry, 아니면 build. 순차 경로는 단일
+                # tier라 tier=None(날조 금지). unit 귀속.
+                tag_cost(
+                    exec_cost,
+                    kind=("retry" if action == Action.retry else "build"),
+                    unit=no.unit,
+                )
                 # WO#33: gate 진입=verify 단계로 갱신.
                 activity_set_stage(no.unit, STAGE_VERIFY)
                 record_transition(STAGE_VERIFY, no.unit)
@@ -1007,6 +1027,8 @@ def run_loop(
                 emit(_summarize_gate(gr))
                 activity_end(no.unit)  # 완료 → 라이브 activity에서 제거
                 # 이 유닛 처리 비용 = replan(orchestration) + executor + judge(gate) 귀속.
+                tag_cost(replan_cost, unit=no.unit)  # replan에 유닛 채움(kind은 이미 replan)
+                tag_cost(gr.judge_cost, kind="judge", unit=no.unit)
                 event_cost = combine_costs([replan_cost, exec_cost, gr.judge_cost])
                 account(event_cost)
                 state.events.append(
@@ -1256,6 +1278,24 @@ def _parallel_loop(
         idx = min(start_base_of.get(unit, 0) + escalation_of.get(unit, 0), tier_top)
         return ladder[idx]
 
+    # WO#70: 유닛별 *이번 dispatch* tier 라벨(비용 태그용). dispatch 시 기록, 머지/판정 시 읽음.
+    # 다중 tier(tier_top>0)일 때만 라벨(단일이면 None — 날조 금지). 한 유닛 동시 1시도라 안전.
+    tier_label_of: dict[str, str | None] = {}
+
+    def cost_kind_for(unit: str) -> str:
+        """이 시도의 빌더 비용 kind — 어느 *재시도층*에서 났나(#68/#41/#48 stacking 가시화).
+
+        통합 OR 재빌드 중이면 integration-OR, OR 대안 접근이면 OR, gate-실패 재시도면 retry,
+        최초면 build. (카운터는 handle_outcome가 ++하기 *전*에 읽으므로 방금 돈 시도를 가리킨다.)
+        """
+        if integration_alt > 0:
+            return "integration-OR"
+        if alt_count.get(unit, 0) > 0:
+            return "OR"
+        if attempts_of.get(unit, 0) > 0:
+            return "retry"
+        return "build"
+
     # ── WO#68 비용 거버넌스 봉투 ───────────────────────────────────────────
     # (C) 유닛별 *누적* 토큰(재시도+OR+통합OR 층 합산) — 누적 ceiling 판정에 사용.
     #   escalation_of[unit]가 이미 *층 합산 재dispatch 수*(gate실패/충돌/OR마다 ++, 안 내림)라
@@ -1397,7 +1437,8 @@ def _parallel_loop(
                 state.decomp_critiques.append(crit)  # 소진 — rejected=False(진행)
                 emit(f"분해 critic: weak이나 재시도 소진 → 진행 ({unit}): {_truncate(crit.reason or '')}")
         # 이 unit replan(재계획 재시도 포함) orchestration 비용 적립(머지 시 event에 귀속).
-        orch_cost_of[unit] = combine_costs(client.drain())
+        # WO#70: kind="replan"·unit 태그 → 분해 ledger에서 orchestration/replan/유닛으로 보임.
+        orch_cost_of[unit] = tag_cost(combine_costs(client.drain()), kind="replan", unit=unit)
         account_decomp_cost()  # 분해 critic(verifier-side) 비용 누적(코스트 패널에 보임)
         if decision is None:
             account(orch_cost_of.pop(unit, None))  # event 없음 → budget에만
@@ -1449,6 +1490,10 @@ def _parallel_loop(
         activity_end(unit)
         # 이 시도 비용 = replan(orchestration) + executor + judge(per-unit gate).
         # judge_cost는 worker가 gate에서 받은 GateResult에 실려 main으로 돌아온다(스레드 안전).
+        # WO#70: 빌더 비용에 kind(build/retry/OR/integration-OR)·tier(#64)·unit 태그, judge에
+        # kind=judge·unit 태그(카운터 ++ 전이라 방금 돈 시도를 정확히 가리킴) → 분해 가능.
+        tag_cost(exec_cost, kind=cost_kind_for(unit), tier=tier_label_of.get(unit), unit=unit)
+        tag_cost(gr.judge_cost, kind="judge", unit=unit)
         event_cost = combine_costs([orch_cost_of.pop(unit, None), exec_cost, gr.judge_cost])
         add_unit_tokens(unit, event_cost)  # WO#68 (C): 유닛 누적 토큰(ceiling 판정용)
         emit(_summarize_gate(gr))
@@ -1638,6 +1683,9 @@ def _parallel_loop(
                         # 모델 불변(적대 분리). 사다리 미지정/1-arg 팩토리면 tier 무시(후방호환).
                         tier = tier_for(u)
                         build_kind = "빌드"
+                        # WO#70: 이번 시도 tier 라벨을 기록(머지/판정 시 빌더 비용 태그용).
+                        # 단일 tier(tier_top==0)면 None(날조 금지 — tier 의미 없음).
+                        tier_label_of[u] = tier_label(tier) if tier_top > 0 else None
                         if tier_top > 0:  # 다중 tier일 때만 하트비트/이벤트에 tier 표면화
                             label = tier_label(tier)
                             build_kind = f"빌드(재시도 {escalation_of.get(u, 0)} · tier={label})"
@@ -1693,6 +1741,8 @@ def _parallel_loop(
                 hb("통합 judge")  # WO#55: 통합 gate codex 호출 라이브 표면화
                 igr = integration_gate.judge("(integration — 머지된 main 통합 검사)", spec)
                 emit(_summarize_gate(igr))
+                # WO#70: 통합 judge 비용 — kind=judge·unit=None(통합/run-level). budget+ledger.
+                tag_cost(igr.judge_cost, kind="judge")
                 account(igr.judge_cost)  # 통합 gate judge 비용을 budget에 누적
                 integration_ev = Event(
                     seq=0, unit=None, work_order_ref="(integration)",
