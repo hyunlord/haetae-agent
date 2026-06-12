@@ -325,6 +325,32 @@ def _write_lineage(state_path: str | Path, parent_run_id: str) -> None:
         pass
 
 
+def _write_cli_meta(state_path: str | Path, order: str, *, status: str = "running") -> None:
+    """CLI run의 원 주문을 state.yaml 옆 meta.json 사이드카에 best-effort 기록 (WO#75).
+
+    웹 런처(RunManager)와 *동일 형식*({id, order, started_at, status}) → 대시보드 `/api/runs`
+    (meta.json 스캔)·#57 주문 뷰가 CLI run도 커버한다. **이미 meta.json이 있으면 안 덮는다** —
+    런처가 spawn한 경우 옵션/argv/계보가 든 더 풍부한 meta를 잃지 않기 위함(추가형·비파괴).
+    """
+    try:
+        import json
+        from datetime import datetime, timezone
+        d = Path(state_path).parent
+        p = d / "meta.json"
+        if p.exists():
+            return  # 런처가 이미 더 풍부한 meta를 씀 — 클로버 금지
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        p.write_text(
+            json.dumps(
+                {"id": d.name, "order": order, "started_at": started_at, "status": status},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 — 사이드카 기록 실패가 run을 죽이지 않는다(best-effort)
+        pass
+
+
 def build_reuse_manifest(parent_spec, parent_state) -> dict:
     """부모 *검증된 done 유닛*의 바 지문 manifest (WO#71 ②b 깊은 증분).
 
@@ -830,6 +856,11 @@ def main(argv: list[str] | None = None) -> int:
             + (", --no-reuse로 끔" if args.no_reuse else "") + ")",
             file=sys.stderr, flush=True,
         )
+
+    # WO#75: CLI run의 원 주문을 meta.json 사이드카로 기록(런처 형식 호환) → 대시보드 #57 주문
+    # 뷰가 CLI run도 커버. 런처가 spawn한 경우 이미 meta가 있어 안 덮는다(추가형·best-effort).
+    if args.state_path:
+        _write_cli_meta(args.state_path, args.order)
 
     # 스킬 주입(빌더 전용): --skills(기본 on)면 --skills-dir에서 로드. --no-skills면 None.
     skills_dir = args.skills_dir if args.skills else None

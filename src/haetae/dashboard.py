@@ -797,6 +797,61 @@ def load_transcripts(state_path: str | Path | None) -> dict[str, Any] | None:
     return data
 
 
+def _meta_sidecar_path(state_path: str | Path | None) -> Path | None:
+    """state.yaml 옆 meta.json 경로(WO#75 CLI order 사이드카). state_path 없으면 None."""
+    if state_path is None:
+        return None
+    return Path(state_path).parent / "meta.json"
+
+
+def load_meta(state_path: str | Path | None) -> dict[str, Any] | None:
+    """state.yaml 옆 meta.json을 best-effort로 읽는다(WO#75, read-only).
+
+    웹 런처(RunManager)·CLI(haetae.run) 둘 다 같은 형식으로 쓴다 → #57 주문 뷰가 CLI run도
+    커버. 미생성/깨짐은 조용히 None(에러 아님 — #44/#55 빈 상태 패턴). 엔진 무import(파일만 읽음).
+    """
+    mp = _meta_sidecar_path(state_path)
+    if mp is None:
+        return None
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def detect_stale_run(
+    status_value: str | None, heartbeat: dict[str, Any] | None, now_dt: datetime | None
+) -> dict[str, Any] | None:
+    """죽은/응답없는 run 감지 (WO#75, read-only·best-effort).
+
+    상태가 `running`인데 하트비트의 어떤 활동이든 last_event_at가 그 활동 idle-timeout의
+    **2× 이상** 오래됐으면 stale로 본다 — #54 idle-timeout이 죽였어야 할 호출이 아직 살아있다는
+    건 writer 프로세스가 죽었거나 멈췄다는 신호다(started_at 기반 가짜 경과로 'running' 오인 방지).
+
+    running 아님 / 하트비트 없음 / idle_timeout·last_event_at 미상이면 None(=stale 아님 — 신선한
+    run·구버전 graceful). 순수 함수(IO 없음) — now_dt만 주입하면 테스트 가능. 엔진 판정 무관(표시뿐).
+    """
+    if status_value != "running" or not heartbeat or now_dt is None:
+        return None
+    worst: float | None = None
+    for a in (heartbeat.get("activities") or []):
+        ito = a.get("idle_timeout")
+        last = _parse_ts(a.get("last_event_at"))
+        if not ito or last is None:
+            continue
+        age = (now_dt - last).total_seconds()
+        if age >= 2 * ito and (worst is None or age > worst):
+            worst = age
+    if worst is None:
+        return None
+    return {
+        "stale": True,
+        "idle_age_s": round(worst, 1),
+        "reason": "응답 없음 — 죽었을 수 있음 (heartbeat last_event_at가 idle-timeout 2× 초과)",
+    }
+
+
 def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> dict[str, Any]:
     """state(+옵션 spec) 재로드 → view. 실패는 {error}로 흡수(서버 안 죽음).
 
@@ -811,6 +866,7 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
     """
     heartbeat = load_heartbeat(state_path)
     transcripts = load_transcripts(state_path)  # WO#67: 라이브 호출 트랜스크립트 사이드카(별도 파일)
+    meta = load_meta(state_path)  # WO#75: 원 주문 사이드카(CLI/런처 공통) — #57 주문 뷰가 CLI도 커버
     state_exists = False
     try:
         state_exists = Path(state_path).exists()
@@ -831,12 +887,16 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
             #   "합성이 오래 걸려도 지금 뭘 뱉는지"를 보이게 동봉(있으면).
             if transcripts is not None:
                 syn["transcripts"] = transcripts
+            if meta is not None:
+                syn["meta"] = meta  # WO#75: 합성 중에도 원 주문(무엇을 시켰나) 표시
             return syn
         err: dict[str, Any] = {"error": f"{type(e).__name__}: {e}", "state_path": str(state_path)}
         if heartbeat is not None:
             err["heartbeat"] = heartbeat
         if transcripts is not None:
             err["transcripts"] = transcripts
+        if meta is not None:
+            err["meta"] = meta  # WO#75: 로드 실패에도 원 주문은 meta 기반이라 표시
         return err
     spec = None
     if spec_path:
@@ -852,6 +912,15 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
         view["heartbeat"] = heartbeat
     if transcripts is not None:
         view["transcripts"] = transcripts  # WO#67: 유닛/단계 드릴다운용 라이브 트랜스크립트
+    if meta is not None:
+        view["meta"] = meta  # WO#75: 원 주문 사이드카(#57 CLI 커버)
+    # WO#75: stale 감지(running인데 heartbeat 응답 없음 → 죽었을 수 있음). best-effort·표시뿐.
+    try:
+        stale = detect_stale_run(view.get("status"), heartbeat, datetime.now(timezone.utc))
+        if stale is not None:
+            view["stale"] = stale
+    except Exception:  # noqa: BLE001 — stale 감지 실패가 뷰를 죽이지 않는다
+        pass
     return view
 
 

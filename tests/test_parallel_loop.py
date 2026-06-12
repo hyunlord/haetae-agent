@@ -820,7 +820,7 @@ def test_parallel_interrupt_cleans_worktree_and_saves(tmp_path):
     )
     # KeyboardInterrupt가 밖으로 새지 않고 State로 마무리(클린 종료).
     assert isinstance(state, State)
-    assert state.status is Status.stopped_stuck
+    assert state.status is Status.stopped_interrupted  # WO#75: 사용자 중단 = stopped_interrupted
     assert any("중단됨" in m for m in msgs)
     assert sp.exists()
     # finally(cleanup_all)가 worktree·브랜치·관리루트를 0으로 — 인터럽트에도 흔적 없음.

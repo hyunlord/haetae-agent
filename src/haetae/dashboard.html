@@ -83,7 +83,8 @@
   #topbar .grow { flex:1; }
   .pill { padding:2px 11px; border-radius:999px; font-size:12px; font-weight:600; letter-spacing:.02em; }
   .s-running{background:#1e3a8a;color:#bfdbfe} .s-done{background:#14532d;color:#bbf7d0}
-  .s-escalated{background:#7c2d12;color:#fed7aa} .s-stopped_budget,.s-stopped_stuck,.s-stopped_credit{background:#3f3f46;color:#e4e4e7}
+  .s-escalated{background:#7c2d12;color:#fed7aa} .s-stopped_budget,.s-stopped_stuck,.s-stopped_credit,.s-stopped_interrupted{background:#3f3f46;color:#e4e4e7}
+  .s-stale{background:#7f1d1d;color:#fecaca}  /* WO#75: 죽은/응답없는 run */
   .mut { color:var(--mut); } .small { font-size:11.5px; }
   #live { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; }
   #live .dot { width:8px; height:8px; border-radius:50%; background:var(--mut); }
@@ -502,6 +503,7 @@ let SEL = null;       // 선택된 유닛 id
 let SEL_PHASE = null; // 선택된 director-side 단계 kind(합성/스캐폴드 등) — 트랜스크립트 드릴다운(WO#67)
 let RUN = null;       // 뷰어가 타겟팅하는 run id (null = 기본 --state-path 뷰)
 let RUNS = [];        // 최근 /api/runs 목록 캐시(원 주문 매칭용 client-side join, WO#57)
+let RUN_META = null;  // 현재 뷰의 meta 사이드카(WO#75 — CLI run 원 주문 폴백)
 let PARENT_FOR_NEW = null;  // 다음 launch의 부모 run id(이어가기 ②a, WO#58). 평소 null.
 let VIEW = null;
 let es = null;        // 현재 EventSource(타겟 바뀌면 재연결)
@@ -604,9 +606,11 @@ const RSTAT_KO = {running:"도는 중", finished:"완료", stopped:"정지됨", 
 function findRun(id){ return (RUNS||[]).find(r => r && r.id === id) || null; }
 function renderRunOrder(){
   const box = $("run-order"); if (!box) return;
-  if (!RUN){ box.style.display="none"; box.innerHTML=""; return; }  // 기본(--state-path) 뷰 — run 미타겟
-  const r = findRun(RUN);
-  const order = r && r.order;
+  // WO#57: 선택 run의 /api/runs order. WO#75: 없으면 meta 사이드카(view.meta.order)로 폴백
+  // → CLI run(/api/runs runs_dir 밖)·직접 --state-path 타겟도 원 주문이 보인다.
+  const r = RUN ? findRun(RUN) : null;
+  const order = (r && r.order) || (RUN_META && RUN_META.order) || null;
+  if (!RUN && !order){ box.style.display="none"; box.innerHTML=""; return; }  // 타겟·meta 둘 다 없음
   if (!order){
     // meta 없는 run(CLI/스크래치) — 에러 아님, 차분한 폴백(#44 빈-상태 패턴 일관).
     box.style.display = "block";
@@ -785,6 +789,7 @@ async function launchRun(){
 }
 
 function render(v) {
+  RUN_META = (v && v.meta) || null;  // WO#75: 원 주문 폴백 소스(CLI run = /api/runs에 없을 수 있음)
   const empty = $("main-empty"), cols = $("main-cols");
   if (v && v.empty) {
     // run 미선택 — 에러 아님. 메인에 차분한 안내(사이드바에서 고르라고).
@@ -840,10 +845,21 @@ function render(v) {
     return;
   }
   empty.style.display = "none"; cols.style.display = "";
-  const st = $("status"); st.textContent = v.status; st.className = "pill s-"+v.status;
+  const st = $("status");
+  // WO#75: stale(running인데 heartbeat 응답 없음 → 죽었을 수 있음) → 상태 배지를 stale로 덮어 표시.
+  if (v.stale && v.stale.stale) {
+    st.textContent = "stale (응답 없음)"; st.className = "pill s-stale";
+    st.title = v.stale.reason || "응답 없음 — 죽었을 수 있음";
+  } else {
+    st.textContent = v.status; st.className = "pill s-"+v.status; st.title = "";
+  }
   $("specref").textContent = v.spec.spec_ref + " · v" + v.spec.spec_version + (v.spec.goal? " · "+v.spec.goal : "");
   const bs = $("banner-slot");
-  if (v.status==="escalated" || (v.pending_escalations||[]).length) {
+  if (v.stale && v.stale.stale) {
+    bs.innerHTML = '<div class="banner" style="border-color:var(--fail);color:var(--fail)">⚠ <b>stale</b> — '
+      + esc(v.stale.reason||"응답 없음 — 죽었을 수 있음")
+      + ' <span class="mut small">(idle '+esc(String(v.stale.idle_age_s))+'s)</span></div>';
+  } else if (v.status==="escalated" || (v.pending_escalations||[]).length) {
     const e0 = (v.pending_escalations||[])[0] || {};
     bs.innerHTML = '<div class="banner">⚠ <b>escalated</b> — '+esc(e0.question||e0.reason||"사람 입력 대기")+'</div>';
   } else bs.innerHTML = "";

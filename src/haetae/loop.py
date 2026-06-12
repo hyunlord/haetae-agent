@@ -429,7 +429,7 @@ def _finalize_interrupt(
 
     멈춤을 깔끔히 닫는다: traceback 없이 "중단됨" 한 줄 + 종료 상태 봉인 + 부분 진행 저장.
       1) 로그 한 줄(_INTERRUPT_MSG) — 호출부가 raw traceback 대신 이걸 남긴다.
-      2) running이면 stopped(stopped_stuck)로 종료 상태 봉인 → 대시보드가 "중단됨"으로
+      2) running이면 stopped(stopped_interrupted, WO#75)로 종료 상태 봉인 → 대시보드가 "중단됨"으로
          보이고 "running"으로 오해하지 않는다(이미 terminal이면 그 값을 보존).
       3) 현재 state 저장(#18) — 그때까지의 부분 진행을 감사 로그/대시보드에 남긴다.
     정리/저장 중 추가 예외도 전부 흡수한다(인터럽트 처리가 또 다른 크래시가 되면 안 됨).
@@ -441,7 +441,8 @@ def _finalize_interrupt(
         pass
     try:
         if state is not None and state.status == Status.running:
-            state.status = Status.stopped_stuck
+            # WO#75: 사용자 stop/SIGINT는 *막힘*이 아니라 *의도 중단* — 명확한 상태로 봉인.
+            state.status = Status.stopped_interrupted
     except Exception:  # noqa: BLE001
         pass
     try:

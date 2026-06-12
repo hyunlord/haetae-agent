@@ -58,6 +58,9 @@ class Status(str, Enum):
     stopped_stuck = "stopped_stuck"
     # WO#68: codex 사용량/크레딧 소진으로 인한 graceful stop(외부 조건 — 크래시 아님, 재개 가능).
     stopped_credit = "stopped_credit"
+    # WO#75: 사용자 stop/SIGINT(#43 graceful interrupt)로 멈춤 — "막힘(stuck)"과 의미 구분.
+    #   (사용자 의도 중단 vs 진전 불가). 추가형 enum — 구버전 state read 무영향.
+    stopped_interrupted = "stopped_interrupted"
 
 
 class PlanState(str, Enum):

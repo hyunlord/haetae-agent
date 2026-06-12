@@ -30,6 +30,9 @@ GITIGNORE_ENTRIES = (
     "__pycache__/",
     "*.pyc",
     ".haetae-worktrees/",
+    # WO#75: 로컬 oh-my-codex 툴링 산출물(.omx/logs·.omx/state)이 worktree에 흘러
+    # `git add -A` 머지에 잡혀 충돌을 일으키던 노이즈 — 커밋 대상서 제외(머지 위생).
+    ".omx/",
 )
 
 # install 실행 결과를 받는 runner 시그니처: (cmd, cwd, timeout) -> (returncode, output)

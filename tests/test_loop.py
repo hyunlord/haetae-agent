@@ -756,13 +756,13 @@ def test_sequential_interrupt_saves_state_clean_exit(tmp_path):
         state_path=sp, progress=msgs.append,
     )
     assert isinstance(state, State)
-    # 종료 상태 봉인: running 아님(stopped로 해석 → 대시보드에 "중단됨").
-    assert state.status is Status.stopped_stuck
+    # 종료 상태 봉인: running 아님(WO#75: 사용자 중단 → stopped_interrupted, "막힘"과 구분).
+    assert state.status is Status.stopped_interrupted
     assert any("중단됨" in m for m in msgs)
     # state 저장 + 부분 진행 보존(u1 dispatch까지 반영).
     assert sp.exists()
     saved = State.from_yaml(sp)
-    assert saved.status is Status.stopped_stuck
+    assert saved.status is Status.stopped_interrupted
     assert saved.spec_ref == "loop-001"  # 합성된 spec 보존(부분 진행)
 
 
@@ -780,7 +780,7 @@ def test_interrupt_during_synthesis_uses_placeholder_state(tmp_path):
         state_path=sp, progress=msgs.append,
     )
     assert isinstance(state, State)
-    assert state.status is Status.stopped_stuck
+    assert state.status is Status.stopped_interrupted
     assert state.spec_ref == "(interrupted)"  # placeholder 사용됨
     assert any("중단됨" in m for m in msgs)
     assert sp.exists()
@@ -800,7 +800,7 @@ def test_finalize_interrupt_absorbs_emit_and_save_errors():
 
     # 예외를 raise하지 않고 정상 반환해야 한다(2차 크래시 금지).
     _finalize_interrupt(st, bad_emit, bad_save)
-    assert st.status is Status.stopped_stuck
+    assert st.status is Status.stopped_interrupted
 
 
 def test_no_interrupt_normal_done_unchanged():
