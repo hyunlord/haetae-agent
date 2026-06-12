@@ -9,13 +9,14 @@ model_validate 직전에 _normalize_spec_dict로 흔한 출력 변종을 흡수�
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from haetae.llm import LLMClient
-from haetae.models import ProjectSpec, State
+from haetae.models import CheckType, ProjectSpec, State
 from haetae.parsing import ParseError, parse_yaml_model
 
 DEFAULT_PROMPT_PATH = "prompts/synthesizer.md"
@@ -543,3 +544,86 @@ def nudge_disjoint_scope(
     except Exception:  # noqa: BLE001 — 넛지는 advisory: 어떤 실패도 run을 막지 않는다(원본 진행)
         return spec
     return _adopt_scope_only(spec, restructured)
+
+
+# ──────────────────── WO#78: 검증 증거 계약 추출 (criteria → 하니스 유닛) ────────────────────
+#
+# 캡스톤 #77이 드러낸 결함: acceptance_criteria(run/sim:trace)가 *특정 증거 필드/불변식*
+# (wall_crossings·overlap_pairs·spawn_attempts·route_cost_samples 등)을 요구하는데, 빌더가 만든
+# 트레이스 하니스는 *다른 필드*를 내서 적대 run-judge가 필요 증거를 못 찾아 무조건 fail(게이트가
+# 텅 빔). 한 뿌리: **하니스가 무엇을 내야 하는지 계약이 명시·강제되지 않음.**
+#
+# 해법(파생만 — 바 추가/완화 아님):
+#   - run-type 기준의 pass/desc에서 *요구 증거 필드*(스네이크케이스 식별자)를 결정적으로 추출.
+#   - desc가 *트레이스 하니스* 성격인 decomposition 유닛(들)에 evidence_contract로 부착.
+#   - 이후 (2) 빌더 작업지시서 주입 + (3) 게이트 결정적 필드-존재 체크로 강제(loop/gate).
+# anti-erosion: 계약은 criteria가 *이미 요구하는* 증거의 명시화일 뿐 — 바를 한 글자도 안 바꾼다.
+# graceful: run 기준 없음 / 추출 필드 없음 / 하니스 유닛 없음 → 무변경(무계약·기존 동작).
+
+# 검증 하니스(트레이스/sim:trace 산출) 유닛 탐지 키워드. run-type *증거를 생산*하는 유닛에 집중.
+# 보수적: trace/sim:trace 계열만(대시보드·e2e 등 폭넓은 통합어는 제외 — 계약은 트레이스 증거 전용).
+_TRACE_HARNESS_KEYWORDS = (
+    "sim:trace", "sim-trace", "simtrace",
+    "trace", "트레이스",
+    "headless", "헤드리스",
+)
+
+# 스네이크케이스 식별자(밑줄 ≥1) = 계약 증거 필드 후보. JSON/stdout 같은 일반어·숫자·한국어
+# 산문은 자연히 제외된다(밑줄 있는 ascii 토큰만). criteria가 *명시적으로* 든 필드명만 잡는 게 목표.
+_FIELD_RE = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b")
+
+# 필드명이 아닌 흔한 스네이크 토큰(추출 잡음 제거). 보수적으로 최소만.
+_FIELD_STOPWORDS = frozenset({"e_g", "i_e", "exit_code"})
+
+
+def _extract_required_fields(text: str | None) -> list[str]:
+    """criterion의 pass/desc 텍스트에서 요구 증거 필드(스네이크케이스)를 결정적으로 추출(순서보존·중복제거)."""
+    out: list[str] = []
+    for m in _FIELD_RE.findall(text or ""):
+        if m in _FIELD_STOPWORDS or m in out:
+            continue
+        out.append(m)
+    return out
+
+
+def _is_trace_harness_unit(desc: str | None) -> bool:
+    """desc 키워드로 검증 트레이스 하니스 유닛인지 보수적 판정(영어 소문자·한국어 부분일치)."""
+    low = (desc or "").lower()
+    return any(k in low for k in _TRACE_HARNESS_KEYWORDS)
+
+
+def extract_required_evidence_fields(spec: ProjectSpec) -> list[str]:
+    """run-type acceptance_criteria가 요구하는 증거 필드 union(정렬·중복제거). 순수 함수.
+
+    run 기준 없음 / 필드 없음 → 빈 리스트. pass(기대값 명세)와 desc 둘 다에서 스네이크케이스
+    식별자를 모은다 — 바가 *이미 요구*하는 증거 키만 잡는다(파생, 바 불변).
+    """
+    fields: list[str] = []
+    for ac in spec.acceptance_criteria:
+        if ac.check.type != CheckType.run:
+            continue
+        for src in (ac.check.pass_, ac.desc):
+            for f in _extract_required_fields(src):
+                if f not in fields:
+                    fields.append(f)
+    return sorted(fields)
+
+
+def extract_evidence_contracts(spec: ProjectSpec) -> ProjectSpec:
+    """run-type 기준이 요구하는 증거 필드를 추출해 트레이스-하니스 유닛에 evidence_contract로 부착.
+
+    **파생만(바 불변)** — acceptance_criteria/done_when/goal/constraints/non_goals를 한 글자도
+    안 바꾼다. 부착 대상은 desc가 트레이스 하니스 키워드인 decomposition 유닛(들). graceful:
+    run 기준 없음 / 추출 필드 없음 / 하니스 유닛 없음 → 원본 그대로(무계약·기존 동작). 순수 함수.
+    """
+    fields = extract_required_evidence_fields(spec)
+    if not fields:
+        return spec  # run 기준 없음 / 필드 없음 → 무계약(graceful)
+    harness = {u.unit for u in spec.decomposition if _is_trace_harness_unit(u.desc)}
+    if not harness:
+        return spec  # 트레이스 하니스 유닛 없음 → 부착 대상 없음(graceful)
+    merged = spec.model_copy(deep=True)
+    for u in merged.decomposition:
+        if u.unit in harness:
+            u.evidence_contract = list(fields)  # 결정적·정렬된 계약(바에서 파생)
+    return merged

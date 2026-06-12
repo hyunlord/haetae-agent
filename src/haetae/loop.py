@@ -20,6 +20,7 @@ from haetae.deps import Runner as DepsRunner, ensure_deps
 from haetae.executors import Tier, tier_label
 from haetae.intake import (
     SynthesisError,
+    extract_evidence_contracts,
     nudge_disjoint_scope,
     nudge_integration_deps,
     synthesize,
@@ -763,6 +764,33 @@ def run_loop(
             return order
         return order.model_copy(update={"scope": inject_skills(order.scope or "", matched)})
 
+    # WO#78: 검증 증거 계약(빌더 전용 주입). 합성 후 spec.decomposition에서 채운다(아래). 빈 동안엔
+    # no-op(무계약·기존 동작). apply_skills와 동형 — *executor 복사본에만* 주입(critic/judge 무수신).
+    contract_of: dict[str, list[str]] = {}
+
+    def apply_evidence_contract(order: NextOrder) -> NextOrder:
+        """하니스 유닛 work order에 evidence-contract를 주입한 *복사본*(executor 전용, 바 불변).
+
+        열린 "트레이스 하니스 만들어라" 대신 **"sim:trace는 정확히 이 필드를 emit하라"**는 타이트한
+        계약을 scope에 명시(부정합·폭주 동시 완화). 원본 order는 불변 → critic/judge 미수신(분리).
+        """
+        contract = contract_of.get(order.unit or "")
+        if not contract:
+            return order
+        section = (
+            "\n\n## 검증 증거 계약 (필수 — 트레이스 출력 스키마)\n"
+            "이 유닛은 *검증 하니스*다. sim:trace(헤드리스 트레이스) 산출 JSON은 acceptance_criteria가\n"
+            "요구하는 아래 증거 필드를 **정확히 이 키 이름으로, 이 의미로** 포함해야 한다 — 다른 이름/\n"
+            "형태(예: 자체 lifecycle 카운트·congestion 통계)로 대체하지 마라. 게이트가 트레이스에 이\n"
+            "키들이 *존재*하는지 결정적으로 검사하며, 누락 시 유닛은 fail→재빌드된다(필드를 내게):\n"
+            + "\n".join(f"  - {f}" for f in contract)
+        )
+        return order.model_copy(update={"scope": (order.scope or "") + section})
+
+    def apply_builder(order: NextOrder) -> NextOrder:
+        """빌더 전용 주입 합성: 스킬(#32) + 증거 계약(#78). 둘 다 executor 복사본에만(분리 보존)."""
+        return apply_evidence_contract(apply_skills(order))
+
     # 분해 critic(WO#40, Phase C): replan이 낸 work order의 *진전성*을 독립 critic이 판정.
     # **적대적 분리**: 독립 client(critic-model)만 쓰고, 스킬 미주입 *원본* order를 본다
     #   (apply_skills는 executor로 가는 복사본에만 — critic은 raw order). 빌더/검증 분리.
@@ -835,6 +863,19 @@ def run_loop(
         spec = nudge_disjoint_scope(
             order, spec, m_client, context=synth_context, prompt_path=syn_prompt
         )
+
+        # WO#78: 검증 증거 계약 — acceptance_criteria(run/sim:trace)가 요구하는 증거 필드를
+        # 결정적으로 추출해 트레이스-하니스 유닛에 부착한다(바에서 *파생*, 추가/완화 아님). 이후
+        # 빌더 작업지시서에 주입(apply_builder)되고 게이트가 결정적 필드-존재 체크로 강제한다
+        # (누락→재빌드) → 하니스가 틀린 필드로 통과 못 함 = 적대 run-judge가 *유효 증거*를 받음.
+        # graceful: run 기준/필드/하니스 유닛 없으면 무변경(무계약·기존 동작). LLM 호출 0(순수).
+        spec = extract_evidence_contracts(spec)
+        contract_of.update(
+            {u.unit: list(u.evidence_contract) for u in spec.decomposition if u.evidence_contract}
+        )
+        if contract_of:
+            n_fields = len(next(iter(contract_of.values())))
+            emit(f"증거 계약 부착: {', '.join(sorted(contract_of))} ({n_fields} 필드 — criteria 파생)")
 
         state = _init_state(spec)
         save_spec(spec)  # WO#58: 검증된 spec을 spec.yaml 사이드카로(이어가기·대시보드 보강 원천)
@@ -938,7 +979,7 @@ def run_loop(
                 install_deps=install_deps,
                 deps_runner=deps_runner,
                 seeded=seeded,
-                apply_skills=apply_skills,
+                apply_skills=apply_builder,  # WO#78: 스킬 + 증거 계약 합성(빌더 전용)
                 pricing=pricing,
                 now=now,
                 account=account,
@@ -1099,7 +1140,7 @@ def run_loop(
                 emit(f"작업 실행 중: {no.unit} — {_truncate(no.goal)}")
                 try_save()  # 증분: in-flight activity가 대시보드 폴링에 보이도록
                 hb("빌드", no.unit)  # WO#55: 빌드 codex 호출 라이브 표면화
-                result = executor.run(apply_skills(no))  # 스킬 주입은 executor에만(빌더 전용)
+                result = executor.run(apply_builder(no))  # 스킬+증거계약 주입은 executor에만(빌더 전용)
                 exec_cost = _executor_cost(executor, pricing)  # 읽기만(best-effort)
                 # WO#70: 빌더 비용 태그 — retry면 kind=retry, 아니면 build. 순차 경로는 단일
                 # tier라 tier=None(날조 금지). unit 귀속.

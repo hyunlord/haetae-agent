@@ -142,6 +142,13 @@ class DecompositionUnit(BaseModel):
     # 없으면 base=0(사다리 맨 앞=싼 tier). optional·비파괴(scope 패턴). 사다리 미지정이면
     # 무시된다(단일 tier). bar는 불변 — 시작 강도만 바꾼다(anti-erosion).
     start_tier: str = ""
+    # WO#78: 이 유닛이 검증 하니스(sim:trace/헤드리스 트레이스 등)일 때, acceptance_criteria가
+    # 요구하는 *증거 필드* 계약. 합성 후 결정적으로 criteria에서 **파생**해 부착한다(새 요구 추가/
+    # 완화 아님 — 바가 *이미 요구하는* 증거를 명시화). 빌더 작업지시서에 "정확히 이 필드를 emit
+    # 하라"로 주입되고, 게이트가 트레이스 출력(JSON)에 그 키가 다 있는지 *결정적*으로 검사한다
+    # (누락→재빌드). **행동 판정(적대 run-judge)과 무관** — 적대 게이트에 *유효 증거*를 보장할 뿐.
+    # optional·비파괴(scope/start_tier/reuse_of 패턴): 없으면 빈 리스트(무계약·기존 동작 그대로).
+    evidence_contract: list[str] = Field(default_factory=list)
     # WO#71(②b 깊은 증분): 증분 합성(continue-from)에서 이 유닛이 *부모 run의 검증된 유닛*과
     # 동일(불변)함을 표식하는 부모 unit-id. 합성기가 단다(신규/변경 유닛은 생략). 루프가 부모
     # manifest와 acceptance_criteria·scope 동등성을 *직접 대조*해 검증한 뒤에만 done으로 시드해

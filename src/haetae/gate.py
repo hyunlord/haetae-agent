@@ -18,6 +18,7 @@ v1은 exit-code 기반:
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -74,6 +75,88 @@ def aggregate_verdict(reports: list[CheckReport]) -> Verdict:
     if any_skipped:
         return Verdict.ambiguous
     return Verdict.pass_
+
+
+# ──────────────── WO#78: 검증 증거 계약 — 결정적 필드-존재 체크 ────────────────
+#
+# acceptance_criteria(run/sim:trace)가 요구하는 증거 필드(evidence_contract, intake에서 criteria
+# 파생)가 트레이스 출력(JSON)에 *실제로 키로 존재*하는지 **결정적·저비용**으로 검사한다. 누락이면
+# 하니스가 틀린 필드를 내고 있다는 뜻 → fail → 재빌드. **행동 판정이 아니다**(겹침이 진짜 0인가 등은
+# 여전히 적대 run-judge=LLM이 판정) — 적대 게이트에 *유효 증거*가 들어가도록 보장할 뿐(분리 유지).
+
+
+def _collect_keys(obj, keys: set[str]) -> None:
+    """JSON 구조에서 모든 dict 키를 재귀 수집(리스트 원소도 탐색). 필드-존재 검사용."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            keys.add(k)
+            _collect_keys(v, keys)
+    elif isinstance(obj, list):
+        for x in obj:
+            _collect_keys(x, keys)
+
+
+def check_evidence_contract(
+    contract: list[str], traces: list[str]
+) -> CheckReport | None:
+    """트레이스(JSON)들에 계약 필드 키가 *전부* 있나 — 결정적 필드-존재 체크(LLM 아님).
+
+    contract 비면 None(무계약·무회귀). traces의 union 키 집합(재귀)에 모든 계약 필드가 있으면
+    pass, 하나라도 없으면 fail(누락 목록 detail). 어떤 트레이스도 JSON 파싱 안 되면 fail(하니스가
+    구조화 JSON을 안 냄 = 증거 검증 불가). **필드 키 존재만 본다** — 값/행동은 적대 run-judge 몫.
+    """
+    if not contract:
+        return None
+    base: dict = {
+        "ac_id": "(evidence-contract)", "check_type": CheckType.schema, "cmd": None,
+    }
+    keys: set[str] = set()
+    parsed_any = False
+    for t in traces:
+        try:
+            obj = json.loads(t)
+        except (ValueError, TypeError):
+            continue
+        parsed_any = True
+        _collect_keys(obj, keys)
+    if not parsed_any:
+        return CheckReport(
+            **base, status="fail", exit_code=None,
+            detail=(
+                "증거 계약 위반: 트레이스가 구조화 JSON을 내지 않아 요구 필드를 검증할 수 없음 "
+                f"(요구: {', '.join(contract)})"
+            ),
+        )
+    missing = [f for f in contract if f not in keys]
+    if missing:
+        return CheckReport(
+            **base, status="fail", exit_code=None,
+            detail=(
+                f"증거 계약 위반: 트레이스에 요구 증거 필드 누락 {missing} — acceptance가 요구하는 "
+                "키를 정확한 이름으로 emit해야 함(다른 필드로 대체 불가). 적대 판정 전에 차단."
+            ),
+        )
+    return CheckReport(
+        **base, status="pass", exit_code=None,
+        detail=f"증거 계약 충족: 요구 필드 {len(contract)}개 전부 트레이스에 존재",
+    )
+
+
+def contract_for_unit(spec: ProjectSpec, unit: str | None) -> list[str]:
+    """게이트가 강제할 evidence_contract를 고른다. per-unit=그 유닛 계약 / 통합(None)=전 유닛 union.
+
+    통합 게이트(unit=None)는 모든 트레이스가 합쳐진 결과를 보므로 선언된 모든 하니스 계약의
+    union을 요구한다. 무계약이면 빈 리스트(체크 스킵 → 무회귀). 순수 함수.
+    """
+    if unit is None:
+        fields: list[str] = []
+        for u in spec.decomposition:
+            for f in (u.evidence_contract or []):
+                if f not in fields:
+                    fields.append(f)
+        return fields
+    u = next((x for x in spec.decomposition if x.unit == unit), None)
+    return list(u.evidence_contract) if u and u.evidence_contract else []
 
 
 class CheckRunner:
@@ -244,6 +327,22 @@ class CompositeGate:
                 report.append(judged[ac.id])
             else:
                 report.append(self._runner._run_check(ac.id, ac.check))
+
+        # WO#78: 검증 증거 계약 강제(결정적·LLM 아님). 이 게이트 호출에서 run-type 체크가 실제로
+        # 실행돼 트레이스를 캡처했고, 판정 대상 유닛(또는 통합 union)에 evidence_contract가 있으면,
+        # 트레이스 JSON에 요구 필드 키가 다 있는지 검사한다. 누락→fail 체크 추가→aggregate가 pass를
+        # 못 냄→재빌드. **run 체크가 없었으면(traces 비) 스킵**(그 게이트가 강제할 트레이스 없음 →
+        # run을 돌리는 게이트=통합/하니스 per-unit에서 강제, 무회귀). 행동 판정(run-judge)은 불변.
+        contract = contract_for_unit(spec, unit)
+        traces = [
+            r.run_evidence.trace
+            for r in run_reports.values()
+            if r.run_evidence is not None
+        ]
+        if contract and traces:
+            cr = check_evidence_contract(contract, traces)
+            if cr is not None:
+                report.append(cr)
 
         # WO#25 Part B: 매니페스트가 있었고 호스트 install이 *실제로 실패*하면(skipped/none
         # 아님) 명시적 fail 체크를 추가 → aggregate_verdict가 pass를 못 내고 replan이
