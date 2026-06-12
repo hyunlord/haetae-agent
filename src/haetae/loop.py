@@ -78,6 +78,7 @@ STAGE_DONE = "done"
 STAGE_ESCALATE = "escalate"
 STAGE_DECOMP_REJECT = "decomp-reject"  # WO#40: 분해 critic이 무진전 work order를 reject→재replan
 STAGE_OR_ALTERNATIVE = "or-alternative"  # WO#41: gate 실패 소진 → 다른 접근으로 백트래킹·재시도
+STAGE_ANTI_FIXATION = "anti-fixation"  # WO#79: 같은 사유 반복 실패 조기 감지 → OR 前 구조적 대안 nudge
 STAGE_AUTO_CONFIG = "auto-config"  # WO#65: --auto가 해석한 운영 config(사다리·critic·scaffold 등) 기록
 STAGE_REUSE = "reuse"  # WO#71: continue-from서 검증된 부모 유닛을 done으로 시드(재빌드 생략)
 STAGE_REBUILD = "rebuild"  # WO#71: reuse_of 있으나 바 변경/부모 미검증 → 재사용 거부·정상 빌드(anti-erosion)
@@ -89,7 +90,10 @@ from haetae.decomp_critic import (
 )
 from haetae.or_node import (
     build_alternative_feedback,
+    build_anti_fixation_feedback,
     build_integration_feedback,
+    fixation_fail_digest,
+    is_fixated,
     summarize_gate_evidence,
 )
 from haetae.replan import ReplanError, replan
@@ -549,6 +553,7 @@ def run_loop(
     max_tokens: int | None = None,
     unit_attempt_budget: int | None = None,
     unit_token_budget: int | None = None,
+    fixation_threshold: int = 2,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -999,6 +1004,7 @@ def run_loop(
                 unit_attempt_budget=unit_attempt_budget,
                 unit_token_budget=unit_token_budget,
                 reuse_events=reuse_events,  # WO#71: 재사용 시드 이벤트(materialize가 포함)
+                fixation_threshold=fixation_threshold,  # WO#79: 고착 조기 감지 임계
             )
 
         # WO#71: 순차 경로는 materialize가 없어 재사용 이벤트를 여기서 직접 events에 싣는다.
@@ -1354,6 +1360,7 @@ def _parallel_loop(
     unit_attempt_budget: int | None = None,
     unit_token_budget: int | None = None,
     reuse_events: list[Event] | None = None,
+    fixation_threshold: int = 2,
 ) -> State:
     """결정적 DAG 스케줄러 + git worktree 격리로 ready unit들을 동시에 굴린다.
 
@@ -1390,6 +1397,9 @@ def _parallel_loop(
     alt_count: dict[str, int] = {u.unit: 0 for u in spec.decomposition}
     alt_feedback: dict[str, str] = {}
     last_approach: dict[str, str] = {}
+    # WO#79: 유닛별 gate-fail 사유 지문 이력(시간순) — 같은 지문 연속 재발 = 고착(조기 감지).
+    #   분리 신호(독립 gate 산출)로만 채운다(빌더 자기보고 아님 = CRDAL co-regulation). advisory.
+    fail_digests_of: dict[str, list] = {u.unit: [] for u in spec.decomposition}
     integration_alt = 0  # 통합 gate OR 대안 시도 수(bounded by or_alternatives)
     # WO#48: 유닛별 머지 충돌 → *통합 적응 재빌드* 시도 이력(정직한 escalation 첨부용).
     # 각 항목 {attempt, conflict_files, merged_siblings} — 재빌드 경로가 무엇을 시도했는지.
@@ -1691,6 +1701,9 @@ def _parallel_loop(
 
         # gate 실패 → 바운드 *재시도*(같은 접근, 재dispatch). 재시도 소진 후엔 OR 대안.
         wm.discard(unit)  # 백트래킹: 실패 접근 worktree 정리(#21 보장 cleanup)
+        # WO#79: 이 실패의 *결정적 사유 지문*(분리 신호 — 독립 gate 산출, 빌더 자기보고 아님)을
+        #   이력에 적재. 같은 지문이 연속 재발하면 고착(아래 재시도 분기에서 OR 前 구조적 대안 nudge).
+        fail_digests_of.setdefault(unit, []).append(fixation_fail_digest(gr))
         # WO#68 (C): 누적 수렴 ceiling 초과면 재시도/OR로 더 던지지 않고 사람에게 escalate(바 불변).
         #   재시도+OR+통합OR 층 stacking이 무한히 돈을 빨아먹지 않게 *누적*에 천장을 둔다.
         if unit_ceiling_hit(unit):
@@ -1700,6 +1713,23 @@ def _parallel_loop(
             attempts_of[unit] += 1
             escalation_of[unit] += 1  # WO#64: gate 실패 재시도 = 한 tier 상향(top에서 cap)
             account(event_cost)  # 폐기된 시도 비용도 누적
+            # WO#79: proactive anti-fixation(CRDAL co-regulation) — 같은 fail 사유가 threshold회
+            #   연속 재발(고착)이면 *다음 재시도* 작업지시서에 "구조적으로 다른 접근" nudge를 주입한다.
+            #   **#41 OR / #68C ceiling 진입 前**에 작동해 낭비 재시도를 줄인다. 빌더 전용(replan
+            #   feedback 채널 — gen_order가 pop, judge/run-judge 무수신) · 바 불변(접근만) · OR 대안
+            #   *미소비*(alt_count 불변 → #41 OR은 백업 유지) · advisory(불확실/진전이면 미발동).
+            #   이미 통합(#48)/OR(#41) 피드백이 걸려 있으면 안 덮는다(그 경로 우선).
+            if unit not in alt_feedback and is_fixated(
+                fail_digests_of.get(unit, []), fixation_threshold
+            ):
+                alt_feedback[unit] = build_anti_fixation_feedback(
+                    last_approach.get(unit) or order.goal,
+                    summarize_gate_evidence(gr),
+                    recurrences=fixation_threshold,
+                )
+                record_transition(STAGE_ANTI_FIXATION, unit)
+                emit(f"고착 조기 감지({fixation_threshold}회 동일 사유) → 구조적 대안 nudge"
+                     f"(OR 前·bar 불변): {unit}")
             emit(f"unit gate 실패({verdict.value}) → 재시도: {unit} ({attempts_of[unit]})")
             _set_plan_state(state, unit, PlanState.pending)
             return

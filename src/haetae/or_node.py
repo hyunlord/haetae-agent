@@ -107,3 +107,75 @@ def build_alternative_feedback(
         lines.append(f"- 실패 증거(독립 gate): {evidence}")
     lines.append(_ALTERNATIVE_DIRECTIVE)
     return "\n".join(lines)
+
+
+# ──────────────── WO#79: proactive anti-fixation (CRDAL co-regulation) ────────────────
+#
+# 현 메커니즘은 다 *사후*다: #41 OR은 재시도 소진 *後* 대안 분해, #68C는 누적 ceiling *後* escalate.
+# 둘 다 *고착을 다 태운 뒤* 작동. CRDAL(2603.24768): 에이전트 *자기* 모니터(self-regulation)는
+# 개선 없음, *별도* 감지(co-regulation)는 개선. → 빌더 자기평가가 아니라 *분리된 신호*(gate fail
+# 사유 = judge 산출 + 시도 이력)로 고착을 **조기** 감지해 #41 OR / #68C ceiling *前*에 대안 nudge.
+#
+# **bar 불변**: nudge는 *접근*만 바꾸지 기준을 안 낮춘다(_ALTERNATIVE_DIRECTIVE와 동일 규율).
+# **빌더 전용**: replan feedback 채널로만 주입(judge/run-judge 무수신, #41과 동일 분리).
+# **advisory·bounded**: 불확실(실패 체크 0)하면 감지 안 함(no-op). 못 깨면 #41 OR / #68C가 받음.
+
+_ANTI_FIXATION_DIRECTIVE = (
+    "직전 시도들이 **같은 사유로 반복 실패**하고 있다(진전 없음 — 고착 신호).\n"
+    "같은 접근의 변형(파라미터 튜닝·사소한 수정)을 또 반복하지 마라. 이번엔 **구조적으로 다른 접근**"
+    "(다른 알고리즘/자료구조/설계)으로 같은 목표를 재구현하라.\n"
+    "- **acceptance_criteria / done_when은 절대 바꾸지 마라**(같은 bar에서 경쟁한다 — 기준 약화 금지).\n"
+    "- 같은 독립 gate가 이 접근도 판정한다. 기준의 字面만이 아니라 *취지*를 충족하라."
+)
+
+
+def fixation_fail_digest(gr: Any) -> tuple | None:
+    """gate 실패의 *결정적* 사유 지문 — 실패한 (ac_id, check_type) 정렬 튜플 (분리 신호).
+
+    빌더 자기보고가 아니라 *독립 gate가 산출한* 실패 사유로 만든 지문(CRDAL co-regulation).
+    같은 지문이 연속 재발 = 같은 문제로 진전 없음 = 고착. 실패 check가 0이면 None(정보 부족 →
+    감지 보류, advisory). 순수 함수(LLM/IO 없음) — 결정적·저비용.
+    """
+    checks = getattr(gr, "checks", None) or []
+    fails = []
+    for c in checks:
+        if getattr(c, "status", None) != "fail":
+            continue
+        ct = getattr(c, "check_type", None)
+        ctv = ct.value if hasattr(ct, "value") else (str(ct) if ct is not None else "")
+        fails.append((str(getattr(c, "ac_id", "") or ""), ctv))
+    if not fails:
+        return None  # 실패 사유 불명 → 고착 판정 보류(advisory no-op)
+    return tuple(sorted(fails))
+
+
+def is_fixated(history: list, threshold: int = 2) -> bool:
+    """같은 fail 지문이 threshold회 *연속* 재발하면 고착(결정적). threshold<2면 비활성(off).
+
+    history: 시간순 fail 지문 목록(None=정보부족 항목은 고착 판정을 깬다). 마지막 threshold개가
+    전부 동일(그리고 None 아님)이면 True. advisory — 불확실/진전이면 False(nudge 안 함).
+    """
+    if threshold < 2 or len(history) < threshold:
+        return False
+    window = history[-threshold:]
+    first = window[0]
+    return first is not None and all(d == first for d in window)
+
+
+def build_anti_fixation_feedback(
+    approach: str | None, reason: str | None, *, recurrences: int = 2
+) -> str:
+    """고착 조기 감지 → 구조적 대안 nudge 텍스트(replan feedback으로 주입, 빌더 전용).
+
+    approach: 폐기할 직전 접근 요약. reason: 반복된 실패 사유 요약(분리 신호). bar 불변 directive 포함
+    — *접근*만 바꾸고 기준은 안 낮춘다. #41 build_alternative_feedback의 *조기* 버전(OR 소비 없음).
+    """
+    lines = ["[고착 조기 감지 — 구조적 대안 nudge (재시도 소진 前)]"]
+    if reason:
+        lines.append(f"- 직전 {recurrences}회 연속 *같은 사유*로 실패: {reason}")
+    else:
+        lines.append(f"- 직전 {recurrences}회 연속 같은 방식으로 실패(진전 없음)")
+    if approach:
+        lines.append(f"- 폐기할 직전 접근: {' '.join(str(approach).split())[:200]}")
+    lines.append(_ANTI_FIXATION_DIRECTIVE)
+    return "\n".join(lines)
