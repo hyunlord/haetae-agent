@@ -235,6 +235,69 @@ def test_nudge_resynthesizes_once_and_adopts_deps():
     assert "엮는" in client.calls[0]["user"] and "u5" in client.calls[0]["user"]
 
 
+def test_nudge_uses_scope_only_preamble_not_criteria_strengthen():
+    """WO#74 신호 정합: #51은 scope_only preamble(바 그대로·scope/deps만)로 재합성한다 —
+    deps 넛지에 'criteria 강화' 메시지를 주던 부정합을 끊는다."""
+    spec = _underspec()
+    client = MockClient([_spec_yaml("[u1, u2, u3]")])
+    nudge_integration_deps("주문", spec, client, prompt_path=PROMPT_PATH)
+    user = client.calls[0]["user"]
+    # scope_only preamble 표식이 실린다("바는 한 글자도 바꾸지 마라").
+    assert "분해 재배치 요청" in user
+    assert "한 글자도 바꾸지 마라" in user
+    # criteria_strengthen preamble('물렁하다'/'더 엄격하게 강화')은 *안* 실린다.
+    assert "물렁하다" not in user
+    assert "더 엄격하게" not in user
+
+
+def test_nudge_scope_only_still_adopts_deps_only_not_scope():
+    """preamble은 scope_only지만 채택은 여전히 _adopt_deps_only — deps만 채택, scope는 원본 불변."""
+    spec = ProjectSpec(
+        spec_id="t-001", version=1, order_raw="주문", goal="원본 goal",
+        task_type=TaskType.feature_impl, verifiability=Verifiability.objective, mode=Mode.normal,
+        acceptance_criteria=[AcceptanceCriterion(id="ac1", desc="기준", check=Check(type="test", cmd="pytest"))],
+        non_goals=["ng1", "ng2"], done_when="원본 done_when",
+        decomposition=[
+            DecompositionUnit(unit="u1", desc="코어", deps=[], scope=["src/u1.py"]),
+            DecompositionUnit(unit="u2", desc="로직", deps=[], scope=["src/u2.py"]),
+            DecompositionUnit(unit="u3", desc="모델", deps=[], scope=["src/u3.py"]),
+            DecompositionUnit(unit="u5", desc="통합 대시보드", deps=[], scope=["src/u5.py"]),
+        ],
+    )
+    # 재합성 LLM이 u5 deps를 교정하면서 *scope도 멋대로 바꿈* → 채택은 deps만, scope는 원본.
+    resynth = """\
+spec_id: t-001
+version: 1
+order_raw: "주문"
+goal: "원본 goal"
+task_type: feature_impl
+verifiability: objective
+mode: normal
+constraints: []
+acceptance_criteria:
+  - id: ac1
+    desc: "기준"
+    check: { type: test, cmd: "pytest" }
+assumptions: []
+non_goals: ["ng1", "ng2"]
+done_when: "원본 done_when"
+decomposition:
+  - { unit: u1, desc: "코어", deps: [], scope: ["src/CHANGED1.py"] }
+  - { unit: u2, desc: "로직", deps: [], scope: ["src/CHANGED2.py"] }
+  - { unit: u3, desc: "모델", deps: [], scope: ["src/CHANGED3.py"] }
+  - { unit: u5, desc: "통합 대시보드", deps: [u1, u2, u3], scope: ["src/CHANGED5.py"] }
+open_questions: []
+"""
+    out = nudge_integration_deps("주문", spec, MockClient([resynth]), prompt_path=PROMPT_PATH)
+    scopes = {u.unit: u.scope for u in out.decomposition}
+    # scope는 원본 그대로(_adopt_deps_only는 scope 미채택, #51 의미 불변)
+    assert scopes == {
+        "u1": ["src/u1.py"], "u2": ["src/u2.py"], "u3": ["src/u3.py"], "u5": ["src/u5.py"],
+    }
+    # deps는 재합성 채택
+    assert set({u.unit: u.deps for u in out.decomposition}["u5"]) >= {"u1", "u2", "u3"}
+
+
 def test_nudge_preserves_criteria_done_when_invariant():
     """재합성 LLM이 done_when을 바꿔도 채택 안 함 — deps만 채택, criteria/done_when 불변."""
     spec = _underspec()

@@ -292,9 +292,12 @@ def nudge_integration_deps(
     if feedback is None:
         return spec  # 통합 의존 충분 — no-op(추가 LLM 호출 없음)
     try:
+        # WO#74: scope_only preamble로 신호 정합 — deps 넛지인데 "criteria 강화" 메시지를
+        # 주던 부정합을 끊는다("바는 그대로, scope/deps만 조정"). 채택은 여전히 deps만
+        # (_adopt_deps_only — scope 미채택, #51 의미 불변). 바는 항상 원본(anti-erosion 구성적).
         restructured = synthesize(
             order, client, context=context, prompt_path=prompt_path,
-            feedback=feedback, synth_retries=synth_retries,
+            feedback=feedback, feedback_mode="scope_only", synth_retries=synth_retries,
         )
     except Exception:  # noqa: BLE001 — 넛지는 advisory: 어떤 실패도 run을 막지 않는다(원본 진행)
         return spec
