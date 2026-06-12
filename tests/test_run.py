@@ -291,3 +291,112 @@ def test_main_help_lists_capability_search(capsys):
     with pytest.raises(SystemExit):
         main(["--help"])
     assert "--capability-search" in capsys.readouterr().out
+
+
+# ──────────────── WO#76 (A): #68 캡이 run() 래퍼 seam을 통과하는지(재발 방지) ────────────────
+# #68 버그: arg 파서·main()→run() 전달·run_loop 캡 로직은 다 됐는데 *중간 얇은 래퍼 run()*에
+# 두 파라미터(max_tokens/unit_attempt_budget, +unit_token_budget)를 빠뜨려, 캡 플래그를 켠
+# 모든 호출이 합성 시작 전 `TypeError: run() got an unexpected keyword argument 'max_tokens'`로
+# 즉사했다. 단위 테스트는 run_loop을 *직접* 호출(캡 args 받음)하고 main 테스트는 run을 mock해
+# 와이어를 끊어서, full main→run→run_loop 경로를 캡 켜고 돈 적이 없었다 → seam 미검증. 아래
+# 테스트들이 그 전체 경로를 한 번은 탄다.
+
+_STOP = "verdict: done\naction: stop\nrationale: \"done\"\n"
+
+
+class _CostGate:
+    """매 judge가 토큰 cost를 실어 누적 budget을 쌓는다(전역 cap 발동 검증용)."""
+
+    def __init__(self, tokens: int = 1000):
+        self.tokens = tokens
+
+    def judge(self, result, spec, unit=None):
+        from haetae.models import Cost, GateResult
+
+        return GateResult(verdict=Verdict.pass_, judge_cost=Cost(tokens=self.tokens))
+
+
+def test_run_wrapper_plumbs_max_tokens_cap_fires():
+    """전체 경로 통합: run() 래퍼를 통해 max_tokens가 run_loop까지 도달해 *실제로 발동*한다.
+
+    #68 버그 그대로면 run('x', ..., max_tokens=500)에서 TypeError로 즉사한다. 여기선 누적 토큰이
+    500을 넘으면 stopped_budget으로 clean stop 되는지까지 확인 → 캡이 엔진에 도달해 작동함을 입증.
+    """
+    from haetae.loop import MockExecutor
+
+    client = MockClient([SPEC_YAML, _next_order("u1"), _next_order("u2"), _STOP])
+    state = run(
+        "x",
+        client=client,
+        executor=MockExecutor("ok"),
+        gate=_CostGate(tokens=1000),
+        prompt_dir=PROMPT_DIR,
+        max_tokens=500,  # tokens(1000) > 500 → 첫 유닛 judge 후 다음 호출 전 stop
+    )
+    assert state.status is Status.stopped_budget
+    assert (state.budget.spent.tokens or 0) >= 500
+
+
+def _capture_main_run_loop(monkeypatch):
+    """main→run(실물 래퍼)→run_loop 전체 경로를 타되, run_loop만 mock해 kwargs를 캡처한다.
+
+    run()을 mock하지 않으므로 래퍼 seam이 실제로 검증된다(이전 버그면 run() 호출에서 TypeError).
+    """
+    captured: dict = {}
+
+    def fake_run_loop(order, client, executor, gate, **kwargs):
+        captured["order"] = order
+        captured.update(kwargs)
+        return State(spec_ref="x", spec_version=1, status=Status.done)
+
+    monkeypatch.setattr(run_mod, "run_loop", fake_run_loop)
+    return captured
+
+
+def test_main_caps_reach_run_loop_through_run_wrapper(monkeypatch):
+    """argv→main→run→run_loop 전체 경로를 세 캡 플래그 켜고 탄다: TypeError 없이 값이 도달."""
+    captured = _capture_main_run_loop(monkeypatch)
+    rc = main([
+        "--order", "x",
+        "--max-tokens", "1000000",
+        "--unit-attempt-budget", "6",
+        "--unit-token-budget", "7777",
+    ])
+    assert rc == 0  # 이전 버그면 run() 호출에서 TypeError로 여기 도달 못 함
+    assert captured["max_tokens"] == 1000000
+    assert captured["unit_attempt_budget"] == 6
+    assert captured["unit_token_budget"] == 7777
+
+
+def test_main_caps_unset_default_off_back_compat(monkeypatch):
+    """미지정이면 세 캡 모두 None으로 run_loop에 도달(기존 무제한 동작 불변)."""
+    captured = _capture_main_run_loop(monkeypatch)
+    rc = main(["--order", "x"])
+    assert rc == 0
+    assert captured["max_tokens"] is None
+    assert captured["unit_attempt_budget"] is None
+    assert captured["unit_token_budget"] is None
+
+
+def test_run_wrapper_forwards_all_three_caps_to_run_loop(monkeypatch):
+    """run() 직접 호출도 세 캡을 run_loop으로 forward(미지정 시 None 기본 — back-compat)."""
+    captured: dict = {}
+
+    def fake_run_loop(order, client, executor, gate, **kwargs):
+        captured.update(kwargs)
+        return State(spec_ref="x", spec_version=1, status=Status.done)
+
+    monkeypatch.setattr(run_mod, "run_loop", fake_run_loop)
+    client = MockClient([SPEC_YAML])
+    executor = HumanRelayExecutor(present=lambda t: None, collect=lambda: "r")
+    run("x", client=client, executor=executor, gate=MockGate([Verdict.done]),
+        max_tokens=42, unit_attempt_budget=3, unit_token_budget=99)
+    assert captured["max_tokens"] == 42
+    assert captured["unit_attempt_budget"] == 3
+    assert captured["unit_token_budget"] == 99
+    # 미지정 호출은 None 기본
+    captured.clear()
+    run("x", client=MockClient([SPEC_YAML]), executor=executor, gate=MockGate([Verdict.done]))
+    assert captured["max_tokens"] is None
+    assert captured["unit_attempt_budget"] is None
+    assert captured["unit_token_budget"] is None

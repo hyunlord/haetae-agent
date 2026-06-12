@@ -41,6 +41,9 @@ def run(
     decomp_critic: bool = True,
     decomp_retries: int = 1,
     or_alternatives: int = 1,
+    max_tokens: int | None = None,
+    unit_attempt_budget: int | None = None,
+    unit_token_budget: int | None = None,
     state_path: str | Path | None = None,
     prompt_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
@@ -85,6 +88,9 @@ def run(
         decomp_critic=decomp_critic,
         decomp_retries=decomp_retries,
         or_alternatives=or_alternatives,
+        max_tokens=max_tokens,                      # WO#68 (B) — main()이 넘기는데 래퍼가 빠뜨렸던 구멍
+        unit_attempt_budget=unit_attempt_budget,    # WO#68 (C)
+        unit_token_budget=unit_token_budget,        # WO#68 (C, 토큰 기준)
         state_path=state_path,
         prompt_dir=prompt_dir,
         progress=progress,

@@ -861,8 +861,13 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
     WO#66 ①: state.yaml은 *합성 후* 생성된다. 합성 중엔 state가 아직 없어 FileNotFoundError가
     나는데, 그걸 빨간 에러로 보이면 "정상 부재"가 "고장"처럼 읽힌다. 그래서 **state.yaml이 아직
     없고(파일 부재) 하트비트에 활성 활동이 있으면** 에러가 아니라 `{synthesizing}` 정상 부재로
-    구분한다(프런트가 차분한 "합성/준비 중" 패널을 띄움). 진짜 죽은 run(하트비트도 없고 state도
-    없음)이나 파싱 에러(파일은 있는데 깨짐)는 그대로 {error}.
+    구분한다(프런트가 차분한 "합성/준비 중" 패널을 띄움). 파싱 에러(파일은 있는데 깨짐)는 그대로 {error}.
+
+    WO#76 ②: state.yaml이 없고 하트비트도 비활성인데 **meta.json은 있는**(=실제 런칭/추적된) run은
+    합성/시작 *전* 사망이다 — #66은 합성 *중*만 덮어 이 케이스가 raw FileNotFoundError로 떴다. 이제
+    `{pre_synth_failed}` graceful 패널로 덮고 원 주문(meta)은 그대로 표시(#57). meta조차 없는 진짜
+    추적 안 된 빈/죽은 run은 그대로 {error}(무회귀). 구분: heartbeat 활성=준비 중(#66) · 비활성+meta=
+    합성 전 실패(신규) · state 존재+파싱 실패=에러(기존).
     """
     heartbeat = load_heartbeat(state_path)
     transcripts = load_transcripts(state_path)  # WO#67: 라이브 호출 트랜스크립트 사이드카(별도 파일)
@@ -890,6 +895,25 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
             if meta is not None:
                 syn["meta"] = meta  # WO#75: 합성 중에도 원 주문(무엇을 시켰나) 표시
             return syn
+        # WO#76 ②: 합성/시작 *전* 실패 — state.yaml이 아직 없고(파일 부재) 하트비트도 비활성인데
+        #   meta.json은 있다(= 실제 런칭/추적된 run). #66은 *합성 중*(heartbeat 활성)만 덮어서
+        #   이런 합성-전-사망 run이 raw FileNotFoundError로 떴다(사용자가 "맨날 뜬다"고 지적). meta가
+        #   있으면(status failed 또는 meta만 존재) graceful 패널로 덮는다 — 원 주문은 그대로 표시(#57).
+        #   meta가 없으면(추적 안 된 빈 dir) 기존 {error} 분기 유지(무회귀: dead-run 테스트들).
+        if not state_exists and meta is not None:
+            pre: dict[str, Any] = {
+                "pre_synth_failed": True,
+                "reason": (
+                    "이 run은 시작/합성 중 실패 — state.yaml 생성 전입니다. 원인은 run.log를 확인하세요."
+                ),
+                "state_path": str(state_path),
+                "meta": meta,  # WO#57: 원 주문(무엇을 시켰나)은 그대로 표시
+            }
+            if heartbeat is not None:
+                pre["heartbeat"] = heartbeat  # 비활성/stale이라도 멈춤 진단 위해 동봉
+            if transcripts is not None:
+                pre["transcripts"] = transcripts
+            return pre
         err: dict[str, Any] = {"error": f"{type(e).__name__}: {e}", "state_path": str(state_path)}
         if heartbeat is not None:
             err["heartbeat"] = heartbeat

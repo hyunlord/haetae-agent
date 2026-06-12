@@ -1765,6 +1765,119 @@ def test_html_synthesis_panel_not_error():
     assert "에러가 아닙니다" in src                     # 정상 부재임을 명시
 
 
+# ──────────────── WO#76 ②: 합성/시작 *전* 실패 graceful 패널(#66 갭) ────────────────
+# #66은 *합성 중*(heartbeat 활성)만 "준비 중"으로 덮었다. state.yaml 생성 *전*에 죽은 run(상태
+# 없음 + heartbeat 비활성, 단 meta는 존재)은 여전히 raw `FileNotFoundError ... state.yaml`로 떴고,
+# 사용자가 "실패 아니어도 맨날 뜬다"고 지적했다. 이제 graceful 패널로 덮되 원 주문(meta)은 그대로
+# 표시한다(#57). meta조차 없는 진짜 추적 안 된 빈 dir은 그대로 {error}(무회귀).
+
+
+def _write_meta(state_path: Path, status: str = "failed", order: str = "전투 추가") -> Path:
+    """state.yaml 옆 meta.json 사이드카를 쓴다(테스트 헬퍼, RunManager/CLI 공통 형식)."""
+    mp = Path(state_path).parent / "meta.json"
+    mp.write_text(
+        json.dumps({"id": "r1", "order": order, "status": status,
+                    "started_at": "2026-06-11T10:00:00Z"}),
+        encoding="utf-8",
+    )
+    return mp
+
+
+def test_load_view_pre_synth_failed_when_state_absent_meta_failed(tmp_path: Path):
+    """state.yaml 부재 + heartbeat 비활성 + meta(status failed) → graceful pre_synth_failed(에러 아님)."""
+    sp = tmp_path / "state.yaml"  # 합성 전 사망 — 파일 자체가 없음
+    _write_meta(sp, status="failed", order="전투 추가")
+    v = load_view(sp)
+    assert v.get("pre_synth_failed") is True
+    assert "error" not in v                       # 빨간 raw FileNotFoundError 아님
+    assert not v.get("synthesizing")              # 준비 중 아님(heartbeat 비활성)
+    assert v["meta"]["order"] == "전투 추가"        # WO#57: 원 주문 그대로 표시
+    assert "run.log" in v.get("reason", "")        # 원인 안내
+
+
+def test_load_view_pre_synth_failed_meta_only_no_heartbeat(tmp_path: Path):
+    """meta만 존재(status running·heartbeat 없음·state 없음) → graceful pre_synth_failed(raw 에러 아님)."""
+    sp = tmp_path / "state.yaml"
+    _write_meta(sp, status="running", order="x")  # 시작했으나 합성 전 멈춤(heartbeat·state 무)
+    v = load_view(sp)
+    assert v.get("pre_synth_failed") is True
+    assert "error" not in v
+    assert v.get("meta", {}).get("order") == "x"
+
+
+def test_load_view_pre_synth_failed_inactive_heartbeat_with_meta(tmp_path: Path):
+    """heartbeat는 있지만 활동이 비었고(비활성) state 없음 + meta 존재 → pre_synth_failed(에러 아님)."""
+    sp = tmp_path / "state.yaml"
+    _write_heartbeat(sp, [])  # 활동 0 = 비활성
+    _write_meta(sp, status="failed")
+    v = load_view(sp)
+    assert v.get("pre_synth_failed") is True
+    assert "error" not in v
+    assert v.get("heartbeat") is not None          # 멈춤 진단용 하트비트 동봉(비활성이라도)
+
+
+def test_load_view_synthesizing_wins_over_pre_synth_failed_when_heartbeat_active(tmp_path: Path):
+    """#66 무회귀: state 없음 + heartbeat *활성* + meta 존재 → '준비 중'(synthesizing), pre_synth_failed 아님."""
+    sp = tmp_path / "state.yaml"
+    _write_heartbeat(sp, [{"call_kind": "합성", "unit": None, "elapsed_s": 2.0,
+                           "idle_seconds": 0.5}])
+    _write_meta(sp, status="running")
+    v = load_view(sp)
+    assert v.get("synthesizing") is True
+    assert not v.get("pre_synth_failed")           # 활성 heartbeat가 우선(준비 중)
+    assert "error" not in v
+
+
+def test_load_view_dead_run_no_meta_still_error(tmp_path: Path):
+    """무회귀: state·heartbeat·meta 전부 없는 추적 안 된 run → 그대로 {error}(pre_synth_failed 아님)."""
+    sp = tmp_path / "state.yaml"  # meta도 없음 → graceful 패널 조건 불충족
+    v = load_view(sp)
+    assert "error" in v
+    assert not v.get("pre_synth_failed")
+    assert not v.get("synthesizing")
+
+
+def test_load_view_parse_error_not_pre_synth_failed(tmp_path: Path):
+    """무회귀: state 파일은 존재하나 깨짐 + meta 존재 → 그대로 {error}(합성 전 부재 아님)."""
+    sp = tmp_path / "state.yaml"
+    sp.write_text("status: not_a_valid_enum\nplan: [\n", encoding="utf-8")  # 깨진 YAML
+    _write_meta(sp, status="failed")
+    v = load_view(sp)
+    assert "error" in v                            # 파일 존재 → 합성 전 부재 아님(파싱 에러)
+    assert not v.get("pre_synth_failed")
+
+
+def test_server_pre_synth_failed_is_not_red_error(tmp_path: Path):
+    """스모크: 합성 전 죽은 run(meta 존재·state·heartbeat 없음) → /api/state 200 + pre_synth_failed(에러 아님)."""
+    rm = RunManager(tmp_path / "runs", allow_run=True)
+    rid = "20260611-120000-pre"
+    d = rm.runs_dir / rid
+    d.mkdir(parents=True)  # state·heartbeat 없음
+    (d / "meta.json").write_text(
+        json.dumps({"id": rid, "order": "합성 전 실패한 주문", "status": "failed",
+                    "started_at": "2026-06-11T12:00:00Z"}),
+        encoding="utf-8",
+    )
+    httpd, port = _serve_ctl(rm)
+    try:
+        code, body = _get(port, f"/api/state?run={rid}")
+        assert code == 200
+        v = json.loads(body)
+        assert v.get("pre_synth_failed") is True
+        assert "error" not in v                    # 빨간 raw 에러 아님
+        assert v["meta"]["order"] == "합성 전 실패한 주문"  # 원 주문 표시
+    finally:
+        httpd.shutdown()
+
+
+def test_html_pre_synth_failed_panel_branch():
+    """HTML: 합성 전 실패용 차분한 패널 분기·문구가 존재(raw 에러 분기와 별개)."""
+    src = HTML.read_text(encoding="utf-8")
+    assert "v.pre_synth_failed" in src                  # 렌더 분기
+    assert "합성 전 실패 (state 생성 전)" in src           # 차분한 패널 문구
+    assert "run.log" in src                              # 원인 안내
+
+
 # ──────────────────── ② live↔확정 화해: 라이브 배지 + 구분 라벨 ────────────────────
 
 
