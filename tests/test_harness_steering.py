@@ -131,3 +131,32 @@ def test_skill_does_not_lower_bar():
     # 행동 판정은 여전히 독립 run-judge(자가채점 금지) — 바 약화 아님
     assert "run-judge" in body
     assert "자가채점" in body and ("금지" in body or "채점은 게이트 몫" in body)
+
+
+# ════════════════════ WO#88: test·빌드 cmd 위생 유도 ════════════════════
+# #87 핀포인트: vitest 스캐폴드에 Jest 전용 플래그(--runInBand)를 붙여 러너 크래시 → 미수렴.
+
+
+def test_synthesizer_steers_test_cmd_hygiene():
+    """합성기가 test/빌드 cmd를 스캐폴드 러너에 맞추고 임의 플래그를 금지하도록 유도한다."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    # 러너-특정 플래그 금지 명시
+    assert "플래그를 임의로 더하지 마라" in src
+    # 실제 크래시 플래그 사례 언급
+    assert "--runInBand" in src
+    # 스캐폴드 러너 참조 (vitest)
+    assert "vitest" in src
+    # package.json devDeps 확인 지시
+    assert "devDeps" in src
+
+
+def test_skill_teaches_test_cmd_hygiene():
+    """verification-harness 스킬에 test·빌드 cmd 위생(스택-맞는 러너, 임의 플래그 금지)이 있다."""
+    skills = {s.name: s for s in load_skills(SKILLS_DIR)}
+    body = skills["verification-harness"].body
+    # 섹션 헤더
+    assert "test·빌드 cmd 위생" in body
+    # 실제 크래시 플래그 사례 언급
+    assert "--runInBand" in body
+    # 스캐폴드 러너 참조 (vitest)
+    assert "vitest" in body

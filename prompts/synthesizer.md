@@ -143,6 +143,13 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
   (`evidence_fields`는 acceptance_criterion 최상위 키 — `check` 안이 아님. 산문이 든 불변식의
   *키 이름*만 적어라; 값/임계는 적지 마라.)
 
+- **test·빌드 명령은 스캐폴드(package.json `scripts`·`devDeps`)가 정하는 러너를 쓰라 — 러너-특정
+  플래그를 임의로 더하지 마라.** 스캐폴드가 깐 러너(예: `vitest`)에 *다른* 프레임워크(예: Jest)의
+  플래그를 붙이면(`--runInBand`·`--testNamePattern` 등 Jest 전용) 러너가 인식 못 해 크래시한다
+  (캡스톤 #87 snake u2: vitest 스캐폴드에 `--runInBand` → exit≠0 → 미수렴). 기본은 package.json의
+  `test`/`build` 스크립트를 *그대로* 호출하라(`npm test`, `npm run build`). 추가 플래그가 꼭 필요하면
+  *그 러너의 네이티브 플래그*만 써라(vitest: `run`·`--reporter`·`--run <file>` 등; Jest 플래그 금지).
+
 정적 `test`만으로는 "통과는 하는데 행동은 틀림"을 못 잡는다 — 그게 `run`의 존재 이유다.
 
 **스캐폴드된 진짜 스택이 있으면 run/build 기준은 *그 실제 앱*을 행사하라.** director가

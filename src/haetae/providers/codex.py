@@ -495,7 +495,10 @@ def exec_codex_with_usage(
             f"허용되지 않은 reasoning_effort: {reasoning_effort!r} "
             f"(허용: {ALLOWED_REASONING_EFFORTS})"
         )
-    with tempfile.TemporaryDirectory(prefix="haetae-codex-") as tmp:
+    # WO#88: ignore_cleanup_errors — oh-my-codex MCP가 codex temp cwd에 .omx/state를 비동기로 써서
+    # TemporaryDirectory cleanup의 rmtree와 경합(OSError: Directory not empty) → 합성 크래시. 임시폴더라
+    # 잔여는 무해(OS가 정리). cleanup 인자 1개만 — 실행/네트워크/sandbox 로직 무관.
+    with tempfile.TemporaryDirectory(prefix="haetae-codex-", ignore_cleanup_errors=True) as tmp:
         run_cwd = cwd or tmp
         # 최종 메시지 캡처 파일은 tmp에 둬서 작업 디렉토리(cwd)를 오염시키지 않는다.
         out_path = Path(tmp) / "last_message.txt"

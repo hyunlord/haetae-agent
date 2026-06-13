@@ -197,6 +197,18 @@ def test_allowed_sandboxes_unchanged():
     assert "danger-full-access" not in codex_mod.ALLOWED_SANDBOXES
 
 
+def test_codex_tempdir_ignores_cleanup_errors():
+    """WO#88: codex temp cleanup이 .omx/state 비동기 쓰기와 경합해도 크래시 안 함(ignore_cleanup_errors).
+    ALLOWED_SANDBOXES·실행 로직 불변 — temp cleanup 인자만."""
+    import inspect
+    src = inspect.getsource(codex_mod.exec_codex_with_usage)
+    assert "ignore_cleanup_errors=True" in src
+    assert 'TemporaryDirectory(prefix="haetae-codex-"' in src
+    # 안전 가드: 이 변경이 sandbox 화이트리스트를 건드리지 않았다
+    assert codex_mod.ALLOWED_SANDBOXES == ("read-only", "workspace-write")
+    assert "danger-full-access" not in codex_mod.ALLOWED_SANDBOXES
+
+
 # ──────────────────── reasoning-effort (WO#38 — sandbox 권한과 무관) ────────────────────
 
 

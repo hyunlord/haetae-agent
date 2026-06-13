@@ -55,3 +55,12 @@ triggers: [trace, 트레이스, headless, 헤드리스, e2e, harness, 하니스,
   또는 acceptance `cmd`를 아예 `"node --import tsx scripts/trace/behavior.ts"`로. (md-editor가 간 길.)
 - **자가검증 팁**: 로컬에서 `npm run --silent trace:x 1>out.json 2>err.log`로 돌려
   `JSON.parse(read(out.json))`가 성공하는지 확인하라 — stdout에 노이즈가 있으면 여기서 깨진다.
+
+## test·빌드 cmd 위생 (스택-맞는 러너 — 임의 플래그 금지)
+test/빌드 명령은 **스캐폴드(package.json `scripts`·`devDeps`)가 정한 러너**를 그대로 쓴다.
+- **러너-특정 플래그를 임의로 더하지 마라.** vitest 스캐폴드에 Jest 플래그(`--runInBand`·
+  `--testNamePattern`·`--ci` 등)를 붙이면 러너가 인식 못 해 크래시한다(캡스톤 #87 snake: vitest에
+  `--runInBand` → exit≠0 → 미수렴·escalate).
+- 기본은 **package.json 스크립트 그대로**: `npm test`, `npm run build`. 추가가 필요하면 *그 러너의
+  네이티브 플래그*만(vitest: `run`·`--reporter`·`--run <file>`·`-t <name>`). 어느 러너인지 모르면
+  package.json `devDependencies`를 보고 확인하라(vitest vs jest).
