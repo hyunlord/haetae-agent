@@ -122,6 +122,16 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
     (캡스톤 #83: 브라우저 하니스가 전체 비용 66~89% 태우고 미수렴; node 트레이스는 완주).
   - UI 앱이면 **로직을 렌더링에서 분리**하라 — 엔진/상태/규칙을 DOM·canvas 없이 import해 node서
     trace한다(canvas 픽셀이 아니라 *로직*이 검증 대상). DOM 이벤트/rect가 필요하면 JSDOM으로 가볍게.
+- **하니스는 stdout에 *오직 단일 유효 JSON 객체(evidence)* 만 출력하라 — stdout 위생이 핵심이다.**
+  게이트는 트레이스 stdout을 **그대로 `JSON.parse`** 해 `evidence_fields` 존재를 검사한다. stdout에
+  JSON 외 *한 글자라도* 섞이면(npm 배너·`console.log`·진행 메시지·경고) 파싱 실패 → 하니스가
+  *실행은 되어도(exit 0)* "구조화 JSON 아님"으로 fail한다(캡스톤 #85: node 하니스가 0.37s에 깨끗이
+  부팅했으나 stdout 노이즈로 미파싱→미수렴).
+  - **모든 로그·진단·진행은 `stderr`로**(`console.error`/`process.stderr.write`). stdout엔
+    최종 `JSON.stringify(evidence)` *한 번만*.
+  - **npm/툴 배너 억제**: `npm run` 경유면 `--silent`(예: `cmd: "npm run --silent trace:behavior"`),
+    또는 더 안전하게 **트레이스 스크립트를 `node`/`tsx`로 직접 실행**(npm 래퍼 자체를 우회 —
+    `cmd: "node --import tsx scripts/trace/x.ts"`). 완주한 마크다운 에디터가 간 길이다.
 - `build`/렌더/부팅 성공*만*으로는 행동이 틀려도 통과한다(콩나물 뭉침·데드락·정지). 절대
   거기에 의존하지 말고, 트레이스 기반 `run` 기준으로 *동적 행동 자체*를 검증하라.
 - **`run` 기준엔 `evidence_fields`를 *반드시* 명시하라**(구조화 필드 목록). desc/pass에 산문으로

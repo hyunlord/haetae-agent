@@ -39,6 +39,33 @@ def test_synthesizer_keeps_evidence_fields_and_bar():
     assert "run-judge가 한다" in src or "run-judge가 그런" in src  # 채점=독립 게이트(바 불변)
 
 
+# ════════════════════ WO#86: stdout JSON 위생 유도 ════════════════════
+# #85 핀포인트: node 하니스가 exit 0으로 깨끗이 *실행*되나 stdout에 노이즈(npm 배너·console.log)가
+# 섞여 게이트의 JSON.parse 계약 체크가 실패(미수렴). md-editor는 깨끗한 JSON-only stdout으로 통과.
+
+
+def test_synthesizer_steers_stdout_json_hygiene():
+    """합성기가 하니스에 stdout=단일 JSON only·stderr=로그·배너 억제를 유도한다."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "stdout 위생" in src
+    assert "단일 유효 JSON" in src or "단일 JSON" in src
+    assert "JSON.parse" in src                              # 게이트가 stdout을 parse
+    assert "stderr" in src                                  # 로그는 stderr로
+    assert "--silent" in src                                # npm 배너 억제
+    assert "node" in src and "tsx" in src                   # 직접 node 실행 대안
+
+
+def test_skill_teaches_stdout_json_hygiene():
+    """verification-harness 스킬에 stdout-위생 패턴(JSON only·stderr 로그·배너 억제)이 있다."""
+    skills = {s.name: s for s in load_skills(SKILLS_DIR)}
+    body = skills["verification-harness"].body
+    assert "stdout 위생" in body
+    assert "JSON.parse" in body
+    assert "console.error" in body or "process.stderr" in body  # 로그는 stderr
+    assert "--silent" in body                                   # npm 배너 억제
+    assert "단일 JSON" in body or "stdout = 단일 JSON" in body
+
+
 # ════════════════════ 2. #32 verification-harness 스킬 ════════════════════
 
 

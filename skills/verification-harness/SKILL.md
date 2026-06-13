@@ -38,3 +38,20 @@ triggers: [trace, 트레이스, headless, 헤드리스, e2e, harness, 하니스,
   구조화 JSON에 담아 stdout에 emit하라(시나리오별 before/after 상태·좌표·불변식 위반 수 등).
 - 값/행동이 *맞는지*는 독립 run-judge가 판정한다 — 너는 **실행되는 하니스 + 유효 증거**를 만들면 된다.
   자가채점(빌드가 스스로 `pass:true` 선언) 금지 — 채점은 게이트 몫.
+
+## stdout 위생 (가장 흔한 실패 — 하니스가 *돌지만* 미파싱)
+게이트는 트레이스 **stdout을 그대로 `JSON.parse`** 한다. stdout에 JSON 외 *한 글자라도* 섞이면
+(npm 배너·`console.log`·진행 메시지·경고·스택) 파싱 실패 → 하니스가 **exit 0으로 깨끗이 실행돼도**
+"구조화 JSON 아님"으로 fail한다. (캡스톤 #85: node 하니스가 0.37s에 부팅 성공했으나 stdout 노이즈로
+계약 체크 미파싱 → 미수렴. 완주한 md-editor는 깨끗한 JSON-only stdout으로 통과.)
+
+- **stdout = 단일 JSON만.** 트레이스 끝에 `process.stdout.write(JSON.stringify(evidence))` *한 번*.
+  중간 상태를 stdout에 흘리지 마라(JSON 객체 하나가 통째로 `JSON.parse` 가능해야 한다).
+- **로그·진단·진행 = `stderr`.** `console.log`(→stdout) 대신 **`console.error`/`process.stderr.write`**.
+  디버그 출력도 전부 stderr. stdout은 *오직 결과 JSON* 전용.
+- **npm 배너 억제.** `npm run` 경유면 **`npm run --silent <script>`** 로 npm 자체 출력을 끈다.
+  더 안전하게는 **트레이스 스크립트를 `node`/`tsx`로 직접 실행**(npm 래퍼 우회):
+  `"trace:behavior": "node --import tsx scripts/trace/behavior.ts"` → `cmd: "npm run --silent trace:behavior"`
+  또는 acceptance `cmd`를 아예 `"node --import tsx scripts/trace/behavior.ts"`로. (md-editor가 간 길.)
+- **자가검증 팁**: 로컬에서 `npm run --silent trace:x 1>out.json 2>err.log`로 돌려
+  `JSON.parse(read(out.json))`가 성공하는지 확인하라 — stdout에 노이즈가 있으면 여기서 깨진다.
