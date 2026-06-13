@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-11 · WO#1–68 · 744 tests · main @734b42f · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · Loop Engineering 수렴 검증(§5)**
+> **최종 갱신: 2026-06-14 · WO#1–89 · 864 tests · main @3022039 · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · 하니스 검증 사슬(§6) · 길 B 복수 완주**
 
 ---
 
@@ -122,3 +122,33 @@
 
 > 안티패턴 확인: "exit hook으로 세션 hijack해 무한 강제 지속"은 RWL 비판이 명시한 나쁜 패턴(= 로컬 CC 매직키워드 stop-hook 류). haetae는 graceful stop·bounded·사람 escalate로 회피.
 > 참고: addyosmani.com/blog/loop-engineering · github.com/cobusgreyling/loop-engineering · arxiv 2603.24768(CRDAL) · arxiv 2509.06216(Agentic Loop Engineering).
+
+---
+
+## 6. 하니스 검증 사슬 + 길 B 완주 검증 (WO#77–89)
+
+### 배경: 검증 역전 (verification inversion)
+crowd-sim 캡스톤이 반복적으로 통합 run-judge에 *닿지 못함* — 매번 **검증 하니스 유닛**이 비용을 독식(crowd-sim u7 13M, kanban u6 14.9M, snake u4 21.6M = 전체의 66~89%). 게이트는 건전했으나(가짜 done 거부), 하니스 자체가 (a) 틀린 증거를 내거나 (b) 게이트 환경서 못 돌거나 (c) 노이즈로 미파싱이라, *검증기가 검증 안 됨* = hollow verification.
+
+### 4레버로 하니스를 검증기답게 (전부 실루프 검증됨)
+- **#78 evidence-contract**: acceptance 기준에서 요구 증거 필드를 추출해 하니스 작업지시서에 주입 + 게이트서 결정적 필드존재 체크. (단 초기엔 산문 criteria에 brittle — #82-A가 해소.)
+- **#82 하니스 자기검증**: (A) 합성기가 run 기준에 구조화 `evidence_fields` 명시 → 계약 항상 부착(산문 brittle 해소). (B) 하니스 *per-unit 게이트*가 sim:trace를 clean-install서 *실제 실행* → 깨진/틀린 하니스를 통합 기다릴 것 없이 조기 fail. **결정적 체크(필드존재·exit)만 — 값/행동 판정은 적대 run-judge(LLM) 그대로 = 분리 보존.**
+- **#84 하니스 종류 유도**: 하니스를 **게이트 오프라인 환경서 도는 가벼운 node 트레이스**(엔진 import + 순수 JS/JSDOM + JSON emit)로 유도, 실브라우저 E2E(playwright/chromium) 회피. 검증 역전의 근본 — 빌더가 게이트서 못 도는 브라우저 하니스 고집하던 것. 비용 −53~56%, governed escalate(캡 태우기 탈출).
+- **#86 stdout JSON 위생**: 하니스가 stdout에 *단일 유효 JSON만*(로그는 stderr, npm 배너 억제). node 하니스가 *돌지만* stdout 노이즈로 미파싱되던 마지막 병목.
+- 원칙: **검증 하니스는 게이트의 오프라인 clean-install 환경서 runnable이어야 한다** + 모든 하니스 유도는 *빌더-측*(apply_builder 채널) — 게이트·적대 run-judge·바 불변.
+
+### #88 루프 위생
+(A) test/빌드 cmd를 스캐폴드 러너에 맞게 유도(vitest에 Jest `--runInBand` 금지 — #86 stdout 위생의 test판, 빌더-측). (B) codex.py `TemporaryDirectory(ignore_cleanup_errors=True)` 1줄 — oh-my-codex의 .omx/state 비동기 쓰기 ↔ rmtree 경합 합성 크래시 차단(ALLOWED_SANDBOXES·실행 로직 불변).
+
+### 길 B — 완주 검증 캡스톤 (전 사슬 최초·복수 완주)
+crowd-sim은 빌더 역량 벽(군중 충돌회피·그리드락)이라 *완주 테스트론* 부적합 → codex 완주 가능 중간 과제로 **order→합성→빌드→통합 run-judge→done 전 사슬을 처음으로 검증**.
+- **md-editor ✅ done** (14.7M) — haetae 최초 전 사슬 완주. u6 하니스 생애에서 #82-A 계약부착→#82-B self-check 누락 적발→#79 anti-fixation nudge→빌더 피벗→pass가 *연쇄 합성*으로 작동.
+- **snake ✅ done** (7.6M) — 2번째 완주. 통합 run-judge가 *실제 행동을 유효 증거로* 판정(충돌 게임오버·점수·속도증가·high_score 영속 + 34필드). logic-render 분리된 실 Canvas 게임 산출.
+- **kanban ⚠️ budget** — 7유닛+하니스 > 20M캡, 통합 前 소진. fix 실패 아닌 plan-size/budget.
+- **결론**: haetae 전 사슬 건전성 = *복수 과제서 입증*. 누적 하니스-검증 레버가 fresh서 끝까지 작동.
+
+### 남은 갭 (운영/후속 — 검증 인프라 결함 아님)
+1. **continue-from 재사용 거부 → rebuild-all** (반복 #81·r2·r3): 재합성이 criteria/분해를 매번 바꿔 #71 reuse 거부 → done 유닛 재빌드로 절약 0 + plan 비대. *비용 효율 재개*의 핵심 — resume이 부모 plan/criteria를 보존하게 안정화 필요.
+2. **큰 plan budget**: 7유닛+하니스 검증이 20M 초과(kanban). 캡 상향 또는 plan-trim/재시도 효율.
+3. **하니스 키워드 과매칭**: 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐→계약 부착됐으나 트레이스 미생산→fail. 탐지서 준비 유닛 제외 정교화.
+4. **병렬 fresh 빌드 회피**: 동시 npm install이 cache 경합 → fresh 캡스톤 순차.

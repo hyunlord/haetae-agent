@@ -22,6 +22,10 @@
 | **합성-전-실패 raw 에러** | state 생기기 전 죽은 run이 빨간 raw FileNotFoundError | #66은 합성 *중*(heartbeat 활성)만 graceful, 합성 *전* 실패 미처리 | #76B graceful "합성 전 실패" 패널 + 원 주문 | ✅ |
 | **검증 역전(effort inversion)** | *검증기*가 검증 대상 전부보다 비쌈(캡스톤 #77: u7 하니스 13.21M > 앞 7유닛 합 12.25M, **데이터 확정**) | "트레이스 하니스" 열린 명세 → 빌더 과대 구현 (+ codex 고-input 재전송) | #78 계약으로 하니스 *부분* 좁힘(잔여 codex 고-input은 §3) | 🟡 부분 |
 | **stale-status** | 죽은 run이 `running`+가짜 경과로 뜸 | state-status vs 실제 생존 미대조 | #75 heartbeat-age(2×idle)+launched-PID stale 표시 + `stopped_interrupted` | ✅ |
+| **하니스가 게이트서 못 돎** | 빌더가 실브라우저 E2E(playwright/chromium) 선택 → 오프라인 게이트서 exit 1, 하니스가 전체 비용 66~89% 독식·미수렴(캡스톤 #83/#85) | "트레이스 하니스" 열린 명세 → 빌더가 게이트 환경(오프라인·브라우저 바이너리 없음)서 못 도는 하니스 고집 | #84 하니스를 *node 트레이스*로 유도(엔진 import+순수 JS/JSDOM, 실브라우저 회피) — 비용 −53~56%·governed escalate | ✅ |
+| **하니스 stdout 노이즈 = 미파싱** | node 하니스가 *돌지만*(exit 0, 0.37s) stdout에 npm 배너·console.log 혼입 → 게이트 JSON.parse 실패 → 계약 fail(캡스톤 #85) | stdout이 결과 JSON 전용이 아님(로그·배너가 같이 stdout으로) | #86 stdout=단일 JSON-only·로그는 stderr·npm 배너 억제(`--silent`/직접 node) — 빌더-측 유도 | ✅ |
+| **test-cmd 스택 불일치** | vitest 스캐폴드에 Jest 플래그(`--runInBand`·`--testNamePattern`) → 러너 크래시 → 미수렴(캡스톤 #87 snake u2) | 재합성 test cmd가 스캐폴드 러너(devDeps=vitest)와 불일치 | #88A test/빌드 cmd를 스캐폴드 러너에 맞게 유도(러너-특정 플래그 임의추가 금지) — 빌더-측 | ✅ |
+| **합성 temp-race 크래시** | 합성 중 `OSError: Directory not empty: .omx/state` → run 크래시(transient, 캡스톤 #87) | oh-my-codex MCP의 .omx/state 비동기 쓰기 ↔ codex temp `TemporaryDirectory` rmtree cleanup 경합 | #88B `TemporaryDirectory(ignore_cleanup_errors=True)` 1줄(ALLOWED_SANDBOXES·실행 로직 불변) | ✅ |
 
 ## 2. 코어 차별점 (자기-게이밍 방어 — 가드가 아니라 *존재 이유*)
 
@@ -39,6 +43,9 @@
 | **빌더 행동 품질(그리드락)** | sim이 빌드·실행되나 혼잡서 에이전트 상호 차단(96~98% blocked, 캡스톤 #77) | **게이트는 정확히 잡음(가드 작동)** — 빌더 역량 레버: #79 anti-fixation + #32 충돌회피(RVO/flow-field) 스킬. 게이트 그리드락 fail→재빌드 루프 |
 | **검증 역전 잔여(codex 고-input)** | 하니스 단일 build 13.16M *input*(agentic 전체맥락 재전송) | #78이 계약으로 좁혔으나 codex 측 컨텍스트 재전송은 director 밖 — 하니스 분해 더 잘게 / right-size 후속 |
 | **바 비례성** | ac8 `sample≥200`·ac7 거의-전원-spawn이 데모치곤 공격적(비구속) | right-size: 임계를 stakes에 맞게 trim(부차, 캡스톤 #77) |
+| **continue-from reuse-거부 → rebuild-all** | 재합성이 criteria/분해를 매번 바꿔 #71 reuse 거부 → done 유닛 재빌드로 resume 절약 0 + plan 비대(반복 #81·kanban-r2/r3·snake-r2/r3) | resume이 부모 plan/criteria를 보존해 reuse를 살리는 안정화(비용 효율 재개의 핵심) |
+| **하니스 키워드 과매칭** | 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐 → 트레이스 미생산인데 계약 부착 → 못 채워 fail(캡스톤 #89 snake u0) | 하니스 탐지에서 준비/스캐폴드 유닛 제외 정교화(트레이스를 *생산*하는 유닛만) |
+| **큰 plan budget 초과** | 다유닛+하니스 검증(per-unit self-check+재시도)이 통합 run-judge 前 전역 캡 소진(캡스톤 #87·#89 kanban 7유닛 >20M) | 캡 상향 또는 plan-trim·재시도 효율·하니스-특화 비용 ceiling |
 
 ## 4. 안티패턴 (하지 말 것)
 
