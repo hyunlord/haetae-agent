@@ -22,7 +22,7 @@ from haetae.llm import CodexClient
 from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
 from haetae.metering import MeteredClient
-from haetae.models import State
+from haetae.models import PlanState, ProjectSpec, State
 
 # 기본 스킬 디렉토리 = 이 repo의 skills/ (src/haetae/run.py → parents[2] = repo 루트).
 _DEFAULT_SKILLS_DIR = str(Path(__file__).resolve().parents[2] / "skills")
@@ -64,6 +64,8 @@ def run(
     capability_searcher=None,
     heartbeat=None,
     synth_context: str | None = None,
+    resume_spec: ProjectSpec | None = None,
+    resume_state: State | None = None,
     seeded: bool = False,
     reuse_manifest: dict | None = None,
     reuse: bool = True,
@@ -77,6 +79,8 @@ def run(
         critic_client=critic_client,
         heartbeat=heartbeat,
         synth_context=synth_context,
+        resume_spec=resume_spec,            # WO#91: 순수 재개 시 부모 spec(재합성 skip)
+        resume_state=resume_state,          # WO#91: 부모 plan-state(done 시드/미완 재빌드)
         seeded=seeded,
         reuse_manifest=reuse_manifest,
         reuse=reuse,
@@ -366,12 +370,40 @@ def build_reuse_manifest(parent_spec, parent_state) -> dict:
     부모 spec/state 없으면(옛 부모·crashed) 빈 dict → 재사용 0(전부 정상 빌드, graceful).
     """
     from haetae.intake import unit_bar_signature
-    from haetae.models import PlanState
 
     if parent_spec is None or parent_state is None:
         return {}
     done = {p.unit for p in parent_state.plan if p.state == PlanState.done}
     return {uid: unit_bar_signature(parent_spec, uid) for uid in done}
+
+
+def _load_parent_spec(parent_dir: Path) -> ProjectSpec | None:
+    """부모 spec.yaml 사이드카 로드(없거나 깨졌으면 None — graceful degrade)."""
+    sp = parent_dir / "spec.yaml"
+    if not sp.exists():
+        return None
+    try:
+        return ProjectSpec.from_yaml(sp)
+    except Exception:  # noqa: BLE001 — 깨진 사이드카는 degrade(None)
+        return None
+
+
+def _load_parent_state(parent_dir: Path) -> State | None:
+    """부모 state.yaml 로드(없거나 깨졌으면 None — graceful degrade)."""
+    try:
+        return State.from_yaml(parent_dir / "state.yaml")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_parent_order(parent_dir: Path) -> str | None:
+    """부모 meta.json의 원 주문(order) 로드(없으면 None). 런처/CLI가 verbatim으로 쓴 값."""
+    try:
+        import json
+        meta = json.loads((parent_dir / "meta.json").read_text(encoding="utf-8"))
+        return meta.get("order")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str | Path):
@@ -383,7 +415,6 @@ def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str
     검증 done 유닛의 바 지문(WO#71) — 새 run의 reuse_of 검증·done 시드용(없으면 빈 dict).
     """
     from haetae.intake import build_continuation_context
-    from haetae.models import ProjectSpec, State as _State
 
     parent_dir = resolve_parent_dir(continue_from, runs_dir)
     parent_work = parent_dir / "work"
@@ -391,29 +422,100 @@ def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str
     seed_src = parent_work if parent_work.is_dir() else parent_dir
     seeded_n = seed_workdir_from_parent(seed_src, Path(new_workdir))
 
-    parent_spec = None
-    sp = parent_dir / "spec.yaml"
-    if sp.exists():
-        try:
-            parent_spec = ProjectSpec.from_yaml(sp)
-        except Exception:  # noqa: BLE001 — 깨진 사이드카는 degrade(order로)
-            parent_spec = None
-    parent_state = None
-    try:
-        parent_state = _State.from_yaml(parent_dir / "state.yaml")
-    except Exception:  # noqa: BLE001
-        parent_state = None
-    parent_order = None
-    try:
-        import json
-        meta = json.loads((parent_dir / "meta.json").read_text(encoding="utf-8"))
-        parent_order = meta.get("order")
-    except Exception:  # noqa: BLE001
-        parent_order = None
+    parent_spec = _load_parent_spec(parent_dir)
+    parent_state = _load_parent_state(parent_dir)
+    parent_order = _load_parent_order(parent_dir)
 
     ctx = build_continuation_context(parent_spec, parent_state, parent_order=parent_order)
     reuse_manifest = build_reuse_manifest(parent_spec, parent_state)
     return ctx, parent_dir, seeded_n, reuse_manifest
+
+
+# ──────────────────── WO#91: 순수 재개(부모 plan/criteria 보존) vs 증분 연속 분기 ────────────────────
+
+
+@dataclass
+class ResumePlan:
+    """`--continue-from` 재개 페이로드. mode로 *순수 재개* vs *증분 연속*을 구분한다(WO#91).
+
+    - "pure_resume": 같은 order로 미완 run을 마저 끝낸다 — 부모 plan/criteria를 *보존*(부모
+      spec.yaml/state.yaml 로드, 재합성 skip). resume_spec/resume_state를 채운다. 부모 done 유닛은
+      보존(시드)되고 미완만 재빌드된다(anti-erosion by construction — 바가 변할 여지 없음).
+    - "incremental": 부모 + 새 order/요구 — 기존대로 증분 재합성(새 작업이라 합성 필요, 무변경).
+      synth_context/reuse_manifest를 채운다(기존 #58/#71 경로 그대로, back-compat).
+    """
+
+    mode: str  # "pure_resume" | "incremental"
+    parent_dir: Path
+    seeded_n: int
+    synth_context: str | None = None
+    reuse_manifest: dict | None = None
+    resume_spec: ProjectSpec | None = None
+    resume_state: State | None = None
+
+
+def is_pure_resume(
+    new_order: str | None,
+    parent_order: str | None,
+    parent_spec: ProjectSpec | None,
+    *,
+    resynthesize: bool = False,
+) -> bool:
+    """순수 재개 판별(WO#91): `--continue-from`인데 *새 요구 없음*(부모와 같은 order)이면 True.
+
+    부모 order 출처: meta.json order(런처/CLI가 쓴 verbatim) 우선, 없으면 부모 spec.order_raw로
+    폴백. 새 order가 부모와 *정확히* 같을 때만 순수 재개로 분기한다(요구가 바뀌면 증분 합성이
+    필요하므로 False). 보수적: 부모 order/spec를 알 수 없으면 False=증분(back-compat 안전).
+    `--resynthesize`(opt-in)면 순수 재개여도 항상 False(강제 재합성 — 부모 plan이 나쁠 때 escape).
+    """
+    if resynthesize or parent_spec is None:
+        return False
+    ref = parent_order if parent_order is not None else parent_spec.order_raw
+    if not ref:
+        return False
+    return (new_order or "").strip() == ref.strip()
+
+
+def load_resume(
+    continue_from: str,
+    runs_dir: str | Path,
+    new_workdir: str | Path,
+    *,
+    order: str,
+    resynthesize: bool = False,
+) -> ResumePlan:
+    """부모 해석 + workdir 시딩 후 *순수 재개 vs 증분 연속*을 판별해 페이로드를 만든다(WO#91).
+
+    순수 재개(같은 order · 부모 spec.yaml 존재 · not --resynthesize): 부모 spec/state를 *직접
+    로드*해 재합성을 skip한다 → done 유닛 보존·미완만 *부모 criteria 그대로* 재빌드(rebuild-all
+    회피, #71 reuse가 매칭할 것도 없이 보존). 그 외(새 order/spec.yaml 부재/--resynthesize)는
+    기존 증분 합성 context + 재사용 manifest(무변경, back-compat). 부모 해석/시딩 실패는
+    ContinuationError(명확 — 부모는 명시 입력). 부모 spec.yaml 손상/부재는 graceful 증분 폴백.
+    """
+    from haetae.intake import build_continuation_context
+
+    parent_dir = resolve_parent_dir(continue_from, runs_dir)
+    parent_work = parent_dir / "work"
+    seed_src = parent_work if parent_work.is_dir() else parent_dir
+    seeded_n = seed_workdir_from_parent(seed_src, Path(new_workdir))
+
+    parent_spec = _load_parent_spec(parent_dir)
+    parent_state = _load_parent_state(parent_dir)
+    parent_order = _load_parent_order(parent_dir)
+
+    if is_pure_resume(order, parent_order, parent_spec, resynthesize=resynthesize):
+        # 순수 재개: 부모 plan/criteria 보존(재합성 skip). 미완만 부모 criteria로 재빌드.
+        return ResumePlan(
+            mode="pure_resume", parent_dir=parent_dir, seeded_n=seeded_n,
+            resume_spec=parent_spec, resume_state=parent_state,
+        )
+    # 증분 연속(새 order/spec.yaml 부재/--resynthesize) — 기존 경로 그대로(무변경).
+    ctx = build_continuation_context(parent_spec, parent_state, parent_order=parent_order)
+    reuse_manifest = build_reuse_manifest(parent_spec, parent_state)
+    return ResumePlan(
+        mode="incremental", parent_dir=parent_dir, seeded_n=seeded_n,
+        synth_context=ctx, reuse_manifest=reuse_manifest,
+    )
 
 
 def format_summary(state: State) -> str:
@@ -537,7 +639,19 @@ def main(argv: list[str] | None = None) -> int:
             "이어가기(②b) 시 검증된 부모 유닛 재사용을 끄고 *전부 재빌드*한다(escape). 기본은 "
             "ON(continue-from에서만 동작) — 부모서 done이고 acceptance_criteria·scope가 불변인 "
             "유닛을 done으로 시드해 재빌드를 생략한다(토큰 절약). 바가 바뀐 유닛은 재사용 안 됨 "
-            "(재빌드+재gate, anti-erosion). 통합 gate는 재사용 run서도 항상 최종 결과에 실행."
+            "(재빌드+재gate, anti-erosion). 통합 gate는 재사용 run서도 항상 최종 결과에 실행. "
+            "**증분 연속(새 order)에만 적용** — 순수 재개(같은 order)서 전부 재빌드하려면 --resynthesize."
+        ),
+    )
+    parser.add_argument(
+        "--resynthesize",
+        action="store_true",
+        default=False,
+        help=(
+            "순수 재개(WO#91)서도 *강제 재합성*한다(opt-in escape, 기본 OFF). 기본은 --continue-from"
+            "에 *부모와 같은 order*를 주면 순수 재개로 분기해 부모 plan/criteria를 보존(재합성 skip, "
+            "done 유닛 시드·미완만 재빌드)한다. 부모 plan 자체가 나빠 멈춘 경우 이 플래그로 부모 "
+            "spec을 버리고 증분 재합성 경로로 돌린다. (새 order면 어차피 증분 연속 — 이 플래그 불필요.)"
         ),
     )
     parser.add_argument("--max-iters", type=int, default=30, help="최대 루프 횟수 (기본 30)")
@@ -842,26 +956,55 @@ def main(argv: list[str] | None = None) -> int:
     synth_context: str | None = None
     seeded = False
     reuse_manifest: dict | None = None
+    resume_spec: ProjectSpec | None = None
+    resume_state: State | None = None
     if args.continue_from:
+        # WO#91: 순수 재개(같은 order · 부모 spec.yaml 존재 · not --resynthesize)면 부모
+        #   plan/criteria를 *보존*(재합성 skip)하고, 그 외(새 order/spec 부재/--resynthesize)는
+        #   기존 증분 연속(재합성)으로 분기한다. 둘 다 부모 코드는 workdir에 시딩(scaffold 스킵).
         try:
-            ctx, parent_dir, seeded_n, reuse_manifest = load_continuation(
-                args.continue_from, args.runs_dir, args.workdir
+            rp = load_resume(
+                args.continue_from, args.runs_dir, args.workdir,
+                order=args.order, resynthesize=args.resynthesize,
             )
         except ContinuationError as e:
             print(f"이어가기 실패: {e}", file=sys.stderr, flush=True)
             return 2  # 명확한 에러(조용한 폴백 아님) — 부모는 명시적 입력
-        synth_context = ctx
         seeded = True
         scaffold_client = None  # 이어가기 = scaffold 스킵(스택 이미 시딩됨)
         if args.state_path:
-            _write_lineage(args.state_path, parent_dir.name)  # 계보 사이드카(best-effort)
-        reuse_n = 0 if (args.no_reuse or not reuse_manifest) else len(reuse_manifest)
-        print(
-            f"… 이어가기: 부모 {parent_dir.name}에서 {seeded_n}개 파일 시딩 + scaffold 스킵 + "
-            f"증분 합성 (재사용 후보 done 유닛 {reuse_n}개"
-            + (", --no-reuse로 끔" if args.no_reuse else "") + ")",
-            file=sys.stderr, flush=True,
-        )
+            _write_lineage(args.state_path, rp.parent_dir.name)  # 계보 사이드카(best-effort)
+        if rp.mode == "pure_resume":
+            resume_spec = rp.resume_spec
+            resume_state = rp.resume_state
+            n_done = sum(
+                1 for p in (resume_state.plan if resume_state else [])
+                if p.state == PlanState.done
+            )
+            n_units = len(resume_spec.decomposition) if resume_spec else 0
+            print(
+                f"… 순수 재개(WO#91): 부모 {rp.parent_dir.name} plan/criteria 보존(재합성 skip) — "
+                f"{rp.seeded_n}개 파일 시딩 + done {n_done}/{n_units} 유닛 시드(미완만 재빌드)",
+                file=sys.stderr, flush=True,
+            )
+            if args.no_reuse:
+                # 순수 재개는 done을 _init_resume_state로 시드한다(evaluate_reuse 미경유) — --no-reuse
+                # 무효. 전부 재빌드를 원하면 --resynthesize(증분 재합성 경로서 --no-reuse 적용).
+                print(
+                    "… 참고: --no-reuse는 순수 재개엔 적용되지 않는다(done 유닛 보존). "
+                    "전부 재빌드하려면 --resynthesize를 쓰라.",
+                    file=sys.stderr, flush=True,
+                )
+        else:
+            synth_context = rp.synth_context
+            reuse_manifest = rp.reuse_manifest
+            reuse_n = 0 if (args.no_reuse or not reuse_manifest) else len(reuse_manifest)
+            print(
+                f"… 이어가기(증분): 부모 {rp.parent_dir.name}에서 {rp.seeded_n}개 파일 시딩 + "
+                f"scaffold 스킵 + 증분 합성 (재사용 후보 done 유닛 {reuse_n}개"
+                + (", --no-reuse로 끔" if args.no_reuse else "") + ")",
+                file=sys.stderr, flush=True,
+            )
 
     # WO#75: CLI run의 원 주문을 meta.json 사이드카로 기록(런처 형식 호환) → 대시보드 #57 주문
     # 뷰가 CLI run도 커버. 런처가 spawn한 경우 이미 meta가 있어 안 덮는다(추가형·best-effort).
@@ -917,6 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
             pricing=pricing,
             heartbeat=heartbeat,
             synth_context=synth_context,
+            resume_spec=resume_spec,                  # WO#91: 순수 재개 시 부모 spec(재합성 skip)
+            resume_state=resume_state,                # WO#91: 부모 plan-state(done 시드/미완 재빌드)
             seeded=seeded,
             reuse_manifest=reuse_manifest,            # WO#71 ②b: 부모 검증 done 유닛 manifest
             reuse=not args.no_reuse,                  # --no-reuse면 전부 재빌드(escape)

@@ -305,6 +305,37 @@ def _init_state(spec: ProjectSpec) -> State:
     )
 
 
+def _init_resume_state(spec: ProjectSpec, parent_state: "State | None") -> State:
+    """순수 재개(WO#91): spec=부모 spec, plan-state를 부모서 *보존*한다.
+
+    부모 done 유닛 → done(시드, 재빌드 생략). 그 외(in_progress/failed/pending/미상) → pending
+    (미완만 재빌드, 부모 criteria 그대로). 결정적 DAG 스케줄러가 done을 자연히 skip하므로 done
+    재빌드 0(토큰 절약) + 미완만 빌드된다. 부모 state 없음/손상이면 전부 pending(graceful —
+    전체 재빌드, 크래시 0). anti-erosion by construction: spec=부모 spec이라 criteria가 불변이다.
+    """
+    parent_by_unit = (
+        {p.unit: p.state for p in parent_state.plan} if parent_state is not None else {}
+    )
+    plan = [
+        PlanItem(
+            unit=u.unit,
+            state=(
+                PlanState.done
+                if parent_by_unit.get(u.unit) == PlanState.done
+                else PlanState.pending
+            ),
+            deps=(u.deps or None),
+        )
+        for u in spec.decomposition
+    ]
+    return State(
+        spec_ref=spec.spec_id,
+        spec_version=spec.version,
+        status=Status.running,
+        plan=plan,
+    )
+
+
 def _escalated_no_spec(reason: str, raw_response: str | None) -> State:
     """spec이 없을 때(합성 실패) 구성하는 최소 escalated State.
 
@@ -537,6 +568,8 @@ def run_loop(
     install_deps: bool = True,
     deps_runner: DepsRunner | None = None,
     synth_context: str | None = None,
+    resume_spec: ProjectSpec | None = None,
+    resume_state: State | None = None,
     seeded: bool = False,
     reuse_manifest: dict | None = None,
     reuse: bool = True,
@@ -825,64 +858,87 @@ def run_loop(
         # 게이트는 여기서 안 건드린다(운영 knob 가시화만).
         if auto_config_note:
             emit(auto_config_note)
-        emit("합성 중…")
-        hb("합성")
         critique: SpecCritique | None = None
-        try:
-            if critic_client is not None:
-                # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
-                # synth_context(이어가기 ②a)는 *합성기에만* 주입 — critique_spec엔 안 감(적대 분리).
-                spec, critique = synthesize_with_critique(
-                    order, m_client, m_critic,
-                    context=synth_context,
-                    syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
+        if resume_spec is not None:
+            # ── 순수 재개(WO#91): 부모 plan/criteria 보존 — 재합성(synthesize) skip ──
+            # 부모 run의 spec.yaml을 resume plan으로 *그대로* 쓴다(LLM 합성 0회). 부모 done 유닛은
+            # 보존(시드)되고 미완 유닛만 *부모 criteria 그대로* 재빌드된다 → 재합성이 criteria를
+            # drift시켜 #71 reuse가 reject되고 전부 재빌드(rebuild-all)되던 회귀를 끊는다.
+            # anti-erosion by construction: spec=부모 spec이라 바가 변할 여지가 없다(drift/완화 0 —
+            # #71 reject-guard보다 강함). 증분 연속(새 order)은 아래 else 경로 그대로(무변경).
+            spec = resume_spec
+            emit("순수 재개(WO#91): 부모 plan/criteria 보존 — 재합성 skip")
+        else:
+            emit("합성 중…")
+            hb("합성")
+            try:
+                if critic_client is not None:
+                    # opt-in 적대적 critic: 비평 surface + 구체 gap이면 바운드 1회 재합성.
+                    # synth_context(이어가기 ②a)는 *합성기에만* 주입 — critique_spec엔 안 감(적대 분리).
+                    spec, critique = synthesize_with_critique(
+                        order, m_client, m_critic,
+                        context=synth_context,
+                        syn_prompt_path=syn_prompt, critic_prompt_path=critic_prompt,
+                    )
+                else:
+                    spec = synthesize(order, m_client, context=synth_context, prompt_path=syn_prompt)
+            except SynthesisError as e:
+                state = _escalated_no_spec(
+                    "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
                 )
-            else:
-                spec = synthesize(order, m_client, context=synth_context, prompt_path=syn_prompt)
-        except SynthesisError as e:
-            state = _escalated_no_spec(
-                "spec 합성 실패 (synthesize 출력 검증 불통과)", e.raw_response
+                record_transition(STAGE_SYNTHESIZE)
+                # 합성 실패라도 거기까지 든 비용은 정직하게 누적(state 생성 후 — budget 존재).
+                account(tag_cost(combine_costs(m_client.drain()), kind="synth"))
+                if m_critic is not None:
+                    account(tag_cost(combine_costs(m_critic.drain()), kind="critic"))
+                emit(_final_label(state))
+                try_save()
+                return state
+
+        if resume_spec is None:
+            # WO#51: 통합 유닛 deps 추론 넛지 — 통합 성격 유닛(대시보드·진입점·e2e·트레이스)이
+            # 자기가 엮는 빌더 유닛에 의존하도록 deps를 교정한다. 과소 지정 시에만 #31 재합성
+            # 피드백 채널로 *바운드 1회* 보정 → DAG 말단 직렬화 → 통합 시점 머지 충돌 근본 차단.
+            # deps만 바꾸고 criteria/done_when 불변. best-effort(실패→원본 진행). 비용은 아래 drain.
+            hb("합성")
+            spec = nudge_integration_deps(
+                order, spec, m_client, context=synth_context, prompt_path=syn_prompt
             )
-            record_transition(STAGE_SYNTHESIZE)
-            # 합성 실패라도 거기까지 든 비용은 정직하게 누적(state 생성 후 — budget 존재).
-            account(tag_cost(combine_costs(m_client.drain()), kind="synth"))
-            if m_critic is not None:
-                account(tag_cost(combine_costs(m_critic.drain()), kind="critic"))
-            emit(_final_label(state))
-            try_save()
-            return state
 
-        # WO#51: 통합 유닛 deps 추론 넛지 — 통합 성격 유닛(대시보드·진입점·e2e·트레이스)이
-        # 자기가 엮는 빌더 유닛에 의존하도록 deps를 교정한다. 과소 지정 시에만 #31 재합성
-        # 피드백 채널로 *바운드 1회* 보정 → DAG 말단 직렬화 → 통합 시점 머지 충돌 근본 차단.
-        # deps만 바꾸고 criteria/done_when 불변. best-effort(실패→원본 진행). 비용은 아래 drain.
-        hb("합성")
-        spec = nudge_integration_deps(
-            order, spec, m_client, context=synth_context, prompt_path=syn_prompt
+            # WO#59: disjoint-scope 넛지(#51의 형제) — 병렬 형제 유닛이 *같은 파일 scope*를 공유하면
+            # bounded 1회 재합성으로 disjoint하게 재배치(머지 충돌 선제 예방). bar 불변 가드로 채택
+            # (criteria 변경이면 reject·원본 유지). 겹침/미선언 없으면 no-op(추가 호출 0). advisory.
+            hb("합성")
+            spec = nudge_disjoint_scope(
+                order, spec, m_client, context=synth_context, prompt_path=syn_prompt
+            )
+
+            # WO#78: 검증 증거 계약 — acceptance_criteria(run/sim:trace)가 요구하는 증거 필드를
+            # 결정적으로 추출해 트레이스-하니스 유닛에 부착한다(바에서 *파생*, 추가/완화 아님). 이후
+            # 빌더 작업지시서에 주입(apply_builder)되고 게이트가 결정적 필드-존재 체크로 강제한다
+            # (누락→재빌드) → 하니스가 틀린 필드로 통과 못 함 = 적대 run-judge가 *유효 증거*를 받음.
+            # graceful: run 기준/필드/하니스 유닛 없으면 무변경(무계약·기존 동작). LLM 호출 0(순수).
+            spec = extract_evidence_contracts(spec)
+            contract_of.update(
+                {u.unit: list(u.evidence_contract) for u in spec.decomposition if u.evidence_contract}
+            )
+            if contract_of:
+                n_fields = len(next(iter(contract_of.values())))
+                emit(f"증거 계약 부착: {', '.join(sorted(contract_of))} ({n_fields} 필드 — criteria 파생)")
+        else:
+            # WO#91 순수 재개: 넛지(통합 deps·disjoint scope)는 *재합성*이라 skip — 부모 plan 보존.
+            # 증거 계약(#78)은 부모 spec에 이미 부착돼 있으므로 빌더 주입용으로 읽기만 한다(LLM 0·파생 0).
+            contract_of.update(
+                {u.unit: list(u.evidence_contract) for u in spec.decomposition if u.evidence_contract}
+            )
+
+        # WO#91: 순수 재개면 부모 plan-state 보존(_init_resume_state — done 시드/미완 pending),
+        # 아니면 기존 그린필드/증분 init(전부 pending). 둘 다 spec.yaml 사이드카로 저장(byte 보존).
+        state = (
+            _init_resume_state(spec, resume_state)
+            if resume_spec is not None
+            else _init_state(spec)
         )
-
-        # WO#59: disjoint-scope 넛지(#51의 형제) — 병렬 형제 유닛이 *같은 파일 scope*를 공유하면
-        # bounded 1회 재합성으로 disjoint하게 재배치(머지 충돌 선제 예방). bar 불변 가드로 채택
-        # (criteria 변경이면 reject·원본 유지). 겹침/미선언 없으면 no-op(추가 호출 0). advisory.
-        hb("합성")
-        spec = nudge_disjoint_scope(
-            order, spec, m_client, context=synth_context, prompt_path=syn_prompt
-        )
-
-        # WO#78: 검증 증거 계약 — acceptance_criteria(run/sim:trace)가 요구하는 증거 필드를
-        # 결정적으로 추출해 트레이스-하니스 유닛에 부착한다(바에서 *파생*, 추가/완화 아님). 이후
-        # 빌더 작업지시서에 주입(apply_builder)되고 게이트가 결정적 필드-존재 체크로 강제한다
-        # (누락→재빌드) → 하니스가 틀린 필드로 통과 못 함 = 적대 run-judge가 *유효 증거*를 받음.
-        # graceful: run 기준/필드/하니스 유닛 없으면 무변경(무계약·기존 동작). LLM 호출 0(순수).
-        spec = extract_evidence_contracts(spec)
-        contract_of.update(
-            {u.unit: list(u.evidence_contract) for u in spec.decomposition if u.evidence_contract}
-        )
-        if contract_of:
-            n_fields = len(next(iter(contract_of.values())))
-            emit(f"증거 계약 부착: {', '.join(sorted(contract_of))} ({n_fields} 필드 — criteria 파생)")
-
-        state = _init_state(spec)
         save_spec(spec)  # WO#58: 검증된 spec을 spec.yaml 사이드카로(이어가기·대시보드 보강 원천)
         # WO#65: auto 해석 config를 진짜 state에 transition으로 기록(투명성 — 대시보드/감사).
         if auto_config_note:
@@ -931,16 +987,31 @@ def run_loop(
         # 빌드+gate(anti-erosion — 부모 통과로 도장 금지). 통합 gate는 재사용 유닛도 머지된 main
         # 통합 스코프에 포함돼 최종 결과에 항상 실행된다(개별 재사용≠통합 생략). 결정은 이벤트+transition.
         reuse_events: list[Event] = []
-        for d in evaluate_reuse(spec, reuse_manifest, reuse_on=reuse):
-            record_transition(STAGE_REUSE if d.reused else STAGE_REBUILD, d.unit)
-            emit(("재사용: " if d.reused else "재빌드: ") + f"{d.unit} — {d.reason}")
-            if d.reused:
-                _set_plan_state(state, d.unit, PlanState.done)
-                reuse_events.append(Event(
-                    seq=0, unit=d.unit, work_order_ref=f"reuse_of={d.parent}",
-                    result=d.reason, verdict=Verdict.pass_, learnings=d.reason,
-                    ts=now(), stage=STAGE_REUSE,
-                ))
+        if resume_spec is not None:
+            # WO#91 순수 재개: 부모 done 유닛을 시드 이벤트로 기록(투명성·#71과 동형 stage=reuse).
+            # state는 이미 _init_resume_state가 done으로 봉인 → 결정적 스케줄러가 자연히 skip(done
+            # 재빌드 0). 도장(검증 우회) 아님 — 통합 gate는 머지된 main 전체에 그대로 실행된다(아래).
+            for p in state.plan:
+                if p.state == PlanState.done:
+                    record_transition(STAGE_REUSE, p.unit)
+                    emit(f"순수 재개 시드(done 보존): {p.unit} — 부모 criteria 그대로(재빌드 생략)")
+                    reuse_events.append(Event(
+                        seq=0, unit=p.unit, work_order_ref="resume(parent-done)",
+                        result="부모 done 유닛 시드(재빌드 생략) — 순수 재개(부모 criteria 보존)",
+                        verdict=Verdict.pass_, learnings="순수 재개: 부모 plan/criteria 보존",
+                        ts=now(), stage=STAGE_REUSE,
+                    ))
+        else:
+            for d in evaluate_reuse(spec, reuse_manifest, reuse_on=reuse):
+                record_transition(STAGE_REUSE if d.reused else STAGE_REBUILD, d.unit)
+                emit(("재사용: " if d.reused else "재빌드: ") + f"{d.unit} — {d.reason}")
+                if d.reused:
+                    _set_plan_state(state, d.unit, PlanState.done)
+                    reuse_events.append(Event(
+                        seq=0, unit=d.unit, work_order_ref=f"reuse_of={d.parent}",
+                        result=d.reason, verdict=Verdict.pass_, learnings=d.reason,
+                        ts=now(), stage=STAGE_REUSE,
+                    ))
         if reuse_events or reuse_manifest:
             try_save()  # 증분: 재사용/재빌드 결정을 즉시 감사 로그에 보존
 
