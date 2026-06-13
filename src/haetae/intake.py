@@ -595,13 +595,24 @@ def _is_trace_harness_unit(desc: str | None) -> bool:
 def extract_required_evidence_fields(spec: ProjectSpec) -> list[str]:
     """run-type acceptance_criteria가 요구하는 증거 필드 union(정렬·중복제거). 순수 함수.
 
-    run 기준 없음 / 필드 없음 → 빈 리스트. pass(기대값 명세)와 desc 둘 다에서 스네이크케이스
-    식별자를 모은다 — 바가 *이미 요구*하는 증거 키만 잡는다(파생, 바 불변).
+    WO#82 (A) 견고화: **구조화 `evidence_fields` 슬롯을 우선** 읽는다(합성기가 명시한 필드 목록 —
+    산문 criteria에도 견고, #81의 brittle no-op 해소). 어느 run 기준에도 구조화 슬롯이 없으면
+    기존 동작대로 pass/desc의 **스네이크케이스 스크레이프로 폴백**(back-compat). 둘 다 바가
+    *이미 요구*하는 증거 키일 뿐(파생, 바 불변).
     """
+    run_acs = [ac for ac in spec.acceptance_criteria if ac.check.type == CheckType.run]
+    # 1순위: 구조화 evidence_fields(어느 run 기준이든 선언했으면 그것을 권위로 — 견고·결정적).
+    structured: list[str] = []
+    for ac in run_acs:
+        for f in getattr(ac, "evidence_fields", None) or []:
+            f = str(f).strip()
+            if f and f not in structured:
+                structured.append(f)
+    if structured:
+        return sorted(structured)
+    # 폴백(구조화 슬롯 전무): pass/desc snake_case 스크레이프(기존 #78 동작 — back-compat).
     fields: list[str] = []
-    for ac in spec.acceptance_criteria:
-        if ac.check.type != CheckType.run:
-            continue
+    for ac in run_acs:
         for src in (ac.check.pass_, ac.desc):
             for f in _extract_required_fields(src):
                 if f not in fields:

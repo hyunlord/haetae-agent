@@ -120,6 +120,12 @@ class AcceptanceCriterion(BaseModel):
     desc: str
     check: Check
     unit: str | None = None
+    # WO#82 (A): run/sim:trace 기준이 *요구하는 증거 필드*의 구조화 선언(예:
+    # [wall_crossings, overlap_pairs, route_cost_samples]). 합성기가 산문(desc/pass)과 *함께*
+    # 명시한다 → #78 계약 추출이 이 슬롯을 *우선* 읽어 산문에도 견고(brittle no-op 해소, #81).
+    # 없으면 #78이 desc/pass의 snake_case 스크레이프로 폴백(back-compat). 추가형·비파괴:
+    # 바(성공 기준)가 *이미 요구*하는 증거의 구조화일 뿐 — 새 요구/완화 아님(anti-erosion).
+    evidence_fields: list[str] = Field(default_factory=list)
 
 
 class Assumption(BaseModel):

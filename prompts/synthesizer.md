@@ -114,6 +114,14 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
   `run` 기준은 충족 불가능한 죽은 기준이 된다.
 - `build`/렌더/부팅 성공*만*으로는 행동이 틀려도 통과한다(콩나물 뭉침·데드락·정지). 절대
   거기에 의존하지 말고, 트레이스 기반 `run` 기준으로 *동적 행동 자체*를 검증하라.
+- **`run` 기준엔 `evidence_fields`를 *반드시* 명시하라**(구조화 필드 목록). desc/pass에 산문으로
+  "벽 통과 0건·겹침 0건"을 적더라도, 트레이스 JSON이 내야 하는 **정확한 키 이름**을 함께
+  나열한다. 게이트가 이 키들의 *존재*를 결정적으로 강제하고, 빌더 작업지시서에 "정확히 이 필드를
+  emit하라"로 주입된다(틀린 필드로 통과 불가). 값/행동 판정은 여전히 run-judge가 한다.
+  예: `check: { type: run, cmd: "npm run sim:trace -- --ticks 300 --spawn high" }`,
+  `evidence_fields: [wall_crossings, overlap_pairs, completed_agents, route_cost_samples]`
+  (`evidence_fields`는 acceptance_criterion 최상위 키 — `check` 안이 아님. 산문이 든 불변식의
+  *키 이름*만 적어라; 값/임계는 적지 마라.)
 
 정적 `test`만으로는 "통과는 하는데 행동은 틀림"을 못 잡는다 — 그게 `run`의 존재 이유다.
 

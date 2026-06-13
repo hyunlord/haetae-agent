@@ -282,7 +282,12 @@ class CompositeGate:
         # 자기 기준이 하나도 없으면 install/run/judge 모두 건너뛰고 executor-ok(pass).
         # 통합 gate·순차 경로는 unit=None → 전체 검사(권위 있는 done 판정, 무회귀).
         acs = select_criteria(spec, unit)
-        if unit is not None and not acs:
+        # WO#82 (B): 하니스 유닛(evidence_contract 부착됨)은 자기 per-unit 게이트에서 sim:trace를
+        # *실제 실행*해 자기검증한다 — unit-tagged 기준이 없어도(run 기준은 통합-태그) early-return
+        # 하지 않고 self-check로 흘려보낸다(#81의 hollow "u7 build pass" 차단).
+        contract = contract_for_unit(spec, unit)
+        is_harness = unit is not None and bool(contract)
+        if unit is not None and not acs and not is_harness:
             return GateResult(verdict=Verdict.pass_, checks=[])
 
         # 호스트-사이드 install(WO#23): 기계 체크(npm test)·run-harness가 설치된 deps로
@@ -328,18 +333,25 @@ class CompositeGate:
             else:
                 report.append(self._runner._run_check(ac.id, ac.check))
 
+        # WO#82 (B): 하니스 유닛 per-unit 게이트 자기검증 — spec의 run 기준(sim:trace)을 *실제 실행*
+        # (clean-install된 worktree)해 (a) 크래시/exit≠0(미선언 dep 127 류) → fail, (b) 트레이스에
+        # evidence_contract 필드 존재(#78 결정적) → 누락 fail. 통합 미도달이어도 깨진/틀린 하니스를
+        # *여기서* 잡아 재빌드. **결정적만**(실행+필드) — 값/행동(겹침 진짜 0?)은 적대 run-judge(통합).
+        if is_harness:
+            report.extend(self._harness_self_check(spec, contract))
+
         # WO#78: 검증 증거 계약 강제(결정적·LLM 아님). 이 게이트 호출에서 run-type 체크가 실제로
         # 실행돼 트레이스를 캡처했고, 판정 대상 유닛(또는 통합 union)에 evidence_contract가 있으면,
         # 트레이스 JSON에 요구 필드 키가 다 있는지 검사한다. 누락→fail 체크 추가→aggregate가 pass를
         # 못 냄→재빌드. **run 체크가 없었으면(traces 비) 스킵**(그 게이트가 강제할 트레이스 없음 →
         # run을 돌리는 게이트=통합/하니스 per-unit에서 강제, 무회귀). 행동 판정(run-judge)은 불변.
-        contract = contract_for_unit(spec, unit)
+        # is_harness면 self-check(B)가 이미 계약을 검사했으므로 여기선 스킵(중복 방지).
         traces = [
             r.run_evidence.trace
             for r in run_reports.values()
             if r.run_evidence is not None
         ]
-        if contract and traces:
+        if contract and traces and not is_harness:
             cr = check_evidence_contract(contract, traces)
             if cr is not None:
                 report.append(cr)
@@ -386,6 +398,39 @@ class CompositeGate:
             return combine_costs(drain())
         except Exception:  # noqa: BLE001 — best-effort 계측
             return None
+
+    # ── WO#82 (B): 하니스 per-unit 자기검증(sim:trace 실제 실행 + 계약, 결정적) ──
+    def _harness_self_check(self, spec: ProjectSpec, contract: list[str]) -> list[CheckReport]:
+        """하니스 유닛이 *자기 게이트*에서 sim:trace를 실제 실행해 자기검증(결정적·LLM 아님).
+
+        spec의 run-type 기준(sim:trace cmd)을 run_artifact로 실행해:
+          - exit≠0/크래시/타임아웃(미선언 dep로 인한 127 포함) → fail(깨진 하니스 조기 차단, #81).
+          - 캡처 트레이스(union)에 evidence_contract 필드가 다 있나(#78 결정적) → 누락 fail.
+        값/행동(겹침이 *진짜* 0인가 등)은 여전히 적대 run-judge(통합, LLM)가 판정 — 여기선 "실행되나
+        + 계약 필드 emit하나"(필드 존재·exit)까지만. run 기준 없으면 빈 리스트(no-op).
+        """
+        run_acs = [
+            ac for ac in spec.acceptance_criteria
+            if ac.check.type == CheckType.run and ac.check.cmd
+        ]
+        reports: list[CheckReport] = []
+        traces: list[str] = []
+        for ac in run_acs:
+            ev = run_artifact(ac.check.cmd, workdir=self.workdir, timeout=self.run_timeout)
+            reports.append(
+                CheckReport(
+                    ac_id=f"(harness-run:{ac.id})", check_type=CheckType.run, cmd=ac.check.cmd,
+                    status=("pass" if ev.booted else "fail"), exit_code=ev.exit_code,
+                    detail="하니스 자기검증(실행): " + _run_degrade_detail(ev), run_evidence=ev,
+                )
+            )
+            traces.append(ev.trace)
+        # 계약 필드-존재 체크(union 트레이스). 라벨로 통합 계약 체크와 구분(감사).
+        if contract and traces:
+            cr = check_evidence_contract(contract, traces)
+            if cr is not None:
+                reports.append(cr.model_copy(update={"ac_id": "(harness-evidence-contract)"}))
+        return reports
 
     # ── run 타입 라우팅: harness 실행 + (judge | booted degrade) ─────────
     def _judge_run_acs(

@@ -203,7 +203,8 @@ def test_gate_fails_when_harness_emits_wrong_fields(tmp_path):
     spec = _harness_spec_with_run(bad)
     gr = _gate(tmp_path, client=None).judge("결과", spec, unit="u1")
     assert gr.verdict is Verdict.fail_recoverable  # 누락 → fail → 재빌드
-    ec = [c for c in gr.checks if c.ac_id == "(evidence-contract)"]
+    # WO#82 (B): 하니스 per-unit 게이트의 계약 체크는 self-check가 (harness-evidence-contract)로 단다.
+    ec = [c for c in gr.checks if c.ac_id == "(harness-evidence-contract)"]
     assert ec and ec[0].status == "fail"
     assert ec[0].check_type is CheckType.schema  # 결정적 스키마 체크(LLM 아님)
 
@@ -216,7 +217,7 @@ def test_gate_passes_when_harness_emits_contract_fields(tmp_path):
     )
     spec = _harness_spec_with_run(good)
     gr = _gate(tmp_path, client=None).judge("결과", spec, unit="u1")
-    ec = [c for c in gr.checks if c.ac_id == "(evidence-contract)"]
+    ec = [c for c in gr.checks if c.ac_id == "(harness-evidence-contract)"]  # WO#82 (B) self-check 라벨
     assert ec and ec[0].status == "pass"
     assert gr.verdict is Verdict.pass_
 
@@ -287,7 +288,8 @@ def test_run_judge_still_judges_behavior_when_fields_present(tmp_path):
     gr = _gate(tmp_path, client=client).judge("결과", spec, unit="u1")
     run_rep = [c for c in gr.checks if c.ac_id == "ac1"][0]
     assert run_rep.status == "fail" and "그리드락" in run_rep.detail  # 행동 판정 살아있음
-    ec = [c for c in gr.checks if c.ac_id == "(evidence-contract)"][0]
+    # WO#82 (B): 결정적 계약 체크(하니스 self-check)는 필드 존재로 pass — 행동 fail과 *공존*(분리).
+    ec = [c for c in gr.checks if c.ac_id == "(harness-evidence-contract)"][0]
     assert ec.status == "pass"  # 스키마는 통과(필드 존재), 행동은 별도로 fail
 
 
