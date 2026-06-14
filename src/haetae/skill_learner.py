@@ -22,10 +22,12 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
+from haetae.metering import MeteredClient
 from haetae.skills import SKILL_FILENAME, _split_frontmatter
 
 CANDIDATES_DIRNAME = "_candidates"  # 비활성 staging(skills.load_skills가 `_` 접두로 제외)
@@ -63,6 +65,12 @@ def _slugify(name: str) -> str:
     return s or "candidate"
 
 
+def _today() -> str:
+    """오늘 날짜(UTC, YYYY-MM-DD). **프로덕션 클록** — 라이브러리/테스트는 직접 호출하지 말고
+    extract_candidate의 learned_date/today_fn 인자로 주입해 결정성을 유지한다(WO#106)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def extract_candidate(
     client,
     *,
@@ -70,28 +78,57 @@ def extract_candidate(
     solution_summary: str,
     scenarios: str = "",
     run_id: str,
-    learned_date: str,
+    learned_date: str | None = None,
+    today_fn=None,
+    source: str = "orchestration",
+    pricing: dict | None = None,
 ) -> str:
     """완주 run 입력(spec/해법/시나리오)에서 후보 SKILL.md 텍스트를 추출(경계된 LLM 1패스).
 
-    LLM이 패턴 본문 + triggers를 주고, **provenance(status=candidate·source_run·learned_date)는
-    *시스템이* frontmatter에 강제 주입**한다(LLM에 맡기지 않음 — 거버넌스 보장). 반환은 최종 텍스트.
+    LLM이 패턴 본문 + triggers를 주고, **provenance(status=candidate·source_run·learned_date·
+    extraction_tokens)는 *시스템이* frontmatter에 강제 주입**한다(LLM에 맡기지 않음 — 거버넌스 보장).
+
+    WO#106:
+      - **learned_date 스탬프(주입형)**: 인자로 주면 그대로, 미주입(None)이면 `today_fn()`(기본
+        `_today`)로 *오늘 날짜*를 스탬프한다. 라이브러리 내부에서 datetime.now를 직접 부르지 않는다
+        (today_fn 주입으로 테스트 결정성 — 빈값 '' 제거).
+      - **추출 비용 계측**: LLM 콜을 MeteredClient로 래핑해 토큰을 포착하고 provenance에
+        extraction_tokens로 노출(미상이면 미기록). *메타일 뿐 채택 게이트와 무관*(거버넌스 불변).
     """
+    if learned_date is None:
+        learned_date = (today_fn or _today)()
     user = (
         f"# 완주 spec 요약\n{spec_summary}\n\n"
         f"# 승리 해법 요약\n{solution_summary}\n\n"
         f"# 통과 시나리오\n{scenarios}\n\n"
         "위에서 재사용 패턴을 뽑아 SKILL.md 후보를 출력하라(규칙 준수)."
     )
-    raw = client.complete(LEARN_PROMPT, user)
-    return _stamp_provenance(raw, run_id=run_id, learned_date=learned_date, status="candidate")
+    metered = MeteredClient(client, source=source, pricing=pricing)
+    raw = metered.complete(LEARN_PROMPT, user)
+    tokens = None
+    for cost in metered.drain():  # best-effort 토큰 포착(usage 미노출이면 빈 리스트 → None)
+        if getattr(cost, "tokens", None) is not None:
+            tokens = (tokens or 0) + cost.tokens
+    return _stamp_provenance(
+        raw, run_id=run_id, learned_date=learned_date, status="candidate",
+        extraction_tokens=tokens,
+    )
 
 
-def _stamp_provenance(text: str, *, run_id: str, learned_date: str, status: str) -> str:
-    """SKILL.md frontmatter에 provenance(status·source_run·learned_date)를 *강제* 주입/갱신.
+def _stamp_provenance(
+    text: str,
+    *,
+    run_id: str,
+    learned_date: str,
+    status: str,
+    extraction_tokens: int | None = None,
+) -> str:
+    """SKILL.md frontmatter에 provenance(status·source_run·learned_date·extraction_tokens)를
+    *강제* 주입/갱신.
 
     LLM이 준 name/triggers/body는 보존하고 provenance 키만 시스템 값으로 덮어쓴다(거버넌스 권위).
-    frontmatter가 없으면 최소 frontmatter를 만든다(triggers는 lint가 따로 강제).
+    extraction_tokens는 포착됐을 때만 기록(미상이면 키 생략 — 날조 금지). frontmatter가 없으면
+    최소 frontmatter를 만든다(triggers는 lint가 따로 강제).
     """
     fm, body = _split_frontmatter(text)
     meta = {}
@@ -105,6 +142,8 @@ def _stamp_provenance(text: str, *, run_id: str, learned_date: str, status: str)
     meta["status"] = status
     meta["source_run"] = run_id
     meta["learned_date"] = learned_date
+    if extraction_tokens is not None:
+        meta["extraction_tokens"] = extraction_tokens
     fm_out = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False).strip()
     return f"---\n{fm_out}\n---\n{body.strip()}\n"
 
@@ -250,15 +289,24 @@ def main(argv: list[str] | None = None) -> int:
         from haetae.llm import CodexClient  # 지연 import(테스트 무관)
 
         name = args.name or run_dir.name
+        # WO#106: learned_date 미주입 → _today()로 *오늘 날짜* 스탬프. 추출 콜은 MeteredClient로
+        # 래핑돼 토큰을 포착하고 provenance.extraction_tokens로 노출된다.
         text = extract_candidate(
             CodexClient(),
             spec_summary=spec_summary,
             solution_summary=solution_summary,
             run_id=run_dir.name,
-            learned_date="",  # CLI는 날짜 미스탬프(결정성)·director가 frontmatter 보강 가능
         )
         p = write_candidate(args.skills_dir, name, text)
-        print(f"candidate staged → {p}  (활성 아님 — `--approve {_slugify(name)}` 로 승인)")
+        # 포착된 추출 토큰을 CLI에도 노출(있으면).
+        tok = ""
+        try:
+            meta = yaml.safe_load(_split_frontmatter(text)[0] or "") or {}
+            if meta.get("extraction_tokens") is not None:
+                tok = f"  (추출 {meta['extraction_tokens']} 토큰)"
+        except Exception:
+            pass
+        print(f"candidate staged → {p}{tok}  (활성 아님 — `--approve {_slugify(name)}` 로 승인)")
         return 0
     parser.print_help()
     return 2

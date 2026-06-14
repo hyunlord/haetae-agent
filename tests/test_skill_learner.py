@@ -209,3 +209,55 @@ def test_candidates_dir_excluded_from_active(tmp_path):
     (tmp_path / CANDIDATES_DIRNAME / "SKILL.md").write_text(
         "---\nname: sneaky\ntriggers: [x]\n---\n## a\n- y\n", encoding="utf-8")
     assert all(s.name != "sneaky" for s in load_skills(tmp_path))
+
+
+# ════════════════════ 6. WO#106 폴리시: learned_date 스탬프 + 추출 비용 계측 ════════════════════
+
+
+def test_learned_date_stamped_from_injected():
+    """주입한 learned_date가 provenance에 그대로 스탬프(결정적·빈값 '' 제거)."""
+    text = extract_candidate(_client(), spec_summary="s", solution_summary="w",
+                             run_id="md-001", learned_date="2026-06-14")
+    assert "2026-06-14" in text
+    assert "learned_date: ''" not in text          # 빈값 사라짐
+    assert "status: candidate" in text and "source_run: md-001" in text
+
+
+def test_learned_date_defaults_to_today_via_injectable_clock():
+    """learned_date 미주입 → today_fn()로 오늘 날짜 스탬프(내부 datetime.now 직접호출 아님)."""
+    text = extract_candidate(_client(), spec_summary="s", solution_summary="w",
+                             run_id="r", today_fn=lambda: "2099-01-01")
+    assert "2099-01-01" in text
+
+
+def test_extraction_tokens_captured_via_metered():
+    """추출 LLM 콜이 MeteredClient로 래핑돼 토큰을 포착 → provenance.extraction_tokens."""
+    from haetae.metering import Usage
+    client = MockClient(_GOOD_CANDIDATE, usages=[Usage(input_tokens=100, output_tokens=40, model="m")])
+    text = extract_candidate(client, spec_summary="s", solution_summary="w",
+                             run_id="r", learned_date="2026-06-14")
+    import yaml as _yaml
+    from haetae.skills import _split_frontmatter
+    meta = _yaml.safe_load(_split_frontmatter(text)[0])
+    assert meta["extraction_tokens"] == 140        # input+output
+
+
+def test_extraction_tokens_omitted_when_no_usage():
+    """usage 미노출(토큰 미상) → extraction_tokens 키 생략(날조 금지) — lint/back-compat 무영향."""
+    text = extract_candidate(_client(), spec_summary="s", solution_summary="w",
+                             run_id="r", learned_date="2026-06-14")
+    assert "extraction_tokens" not in text         # 키 없음(미상)
+    ok, reasons = lint_candidate(text)
+    assert ok, reasons                              # lint 여전히 통과
+
+
+def test_metadata_does_not_affect_governance(tmp_path):
+    """learned_date/extraction_tokens는 *메타*일 뿐 — 후보는 여전히 staging·활성 미편입(자동채택 0)."""
+    from haetae.metering import Usage
+    client = MockClient(_GOOD_CANDIDATE, usages=[Usage(input_tokens=10, output_tokens=5, model="m")])
+    text = extract_candidate(client, spec_summary="s", solution_summary="w",
+                             run_id="r", learned_date="2026-06-14")
+    write_candidate(tmp_path, "live-preview-editor", text)
+    names = {s.name for s in load_skills(tmp_path)}
+    assert "browser-markdown-editor-pattern" not in names   # 메타 있어도 미편입
+    assert "live-preview-editor" in list_candidates(tmp_path)  # staging 유지
