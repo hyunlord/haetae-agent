@@ -156,10 +156,10 @@ def test_main_max_iters_default_is_30(monkeypatch):
     assert captured["max_iters"] == 30  # 캡스톤 헤드룸: 10/20 → 30
 
 
-def test_main_unit_retries_default_is_2(monkeypatch):
+def test_main_unit_retries_default_is_3(monkeypatch):
     captured = _capture_main_run(monkeypatch)
     main(["--order", "x"])
-    assert captured["unit_retries"] == 2  # 큰 빌드: 유닛 한 번 더 시도 후 escalate
+    assert captured["unit_retries"] == 3  # WO#108-C: 2→3 — 어려운 유닛에 escalate 전 한 번 더 여유
 
 
 def test_main_unit_retries_override(monkeypatch):

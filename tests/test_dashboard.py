@@ -494,7 +494,7 @@ def test_validate_options_defaults():
     assert o["max_parallel"] == 4
     assert o["run_timeout"] == 120.0
     assert o["max_iters"] == 30
-    assert o["unit_retries"] == 2
+    assert o["unit_retries"] == 3  # WO#108-C: 2→3 상향
     assert o["scaffold"] is True and o["skills"] is True
     assert o["critic_model"] is None
     assert o["reasoning_effort"] is None  # 미설정 = codex 기본(기존 동작 불변)

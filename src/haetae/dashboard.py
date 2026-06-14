@@ -1087,7 +1087,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
         "skills": _bool("skills", True),
         "critic_model": critic_model,
         "max_iters": _int("max_iters", 30, 1, 200),
-        "unit_retries": _int("unit_retries", 2, 0, 10),
+        "unit_retries": _int("unit_retries", 3, 0, 10),  # WO#108-C: 2→3 상향(CLI 기본과 일치)
         "reasoning_effort": reasoning_effort,
         "model": model,
         "auto": _bool("auto", False),  # WO#65: 기본 OFF(back-compat). 켜면 run.py가 운영 knob 자동 해석.

@@ -178,10 +178,15 @@ def test_gate_no_self_check_for_prep_unit(tmp_path):
 
 
 def test_gate_self_check_still_runs_for_real_harness(tmp_path):
-    """진짜 하니스(계약 부착) → #82-B self-check *여전히* 실행(검증 깊이 유지). 누락 필드 → fail."""
+    """진짜 하니스(계약 부착) → #82-B self-check *여전히* 실행(검증 깊이 유지).
+
+    WO#108-A: per-unit은 *대표 시나리오 구조 smoke*(≥1 계약 어휘 + 깨끗한 JSON)로 right-size됨 —
+    계약 어휘를 *하나도* 안 내는 트레이스(다른 필드로 대체)는 여전히 per-unit fail(잘못된 증거 차단).
+    전-필드 union 강제는 통합 게이트가 한다(test_loop_robustness).
+    """
     spec = _spec(
         [{"id": "ac1", "desc": "동선 trace", "unit": "u1",
-          "check": {"type": "run", "cmd": "echo '{\"wall_crossings\":0}'",  # overlap_pairs 누락
+          "check": {"type": "run", "cmd": "echo '{\"my_own_count\":42}'",  # 계약 어휘 0개
                     "pass": "wall_crossings==0, overlap_pairs==0"}}],
         [{"unit": "u1", "desc": "헤드리스 sim:trace 하니스"}],
     )
@@ -189,7 +194,7 @@ def test_gate_self_check_still_runs_for_real_harness(tmp_path):
     assert contract_for_unit(spec, "u1") == _RUN_FIELDS  # 계약 부착됨(깊이 유지)
     gr = _gate(tmp_path, client=None).judge("결과", spec, unit="u1")
     ec = [c for c in gr.checks if c.ac_id == "(harness-evidence-contract)"]
-    assert ec and ec[0].status == "fail"  # 누락 → self-check fail(검사 내용 불변)
+    assert ec and ec[0].status == "fail"  # 계약 어휘 0개 → 구조 smoke fail(잘못된 증거 차단)
     assert gr.verdict is Verdict.fail_recoverable
 
 

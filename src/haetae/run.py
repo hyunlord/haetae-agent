@@ -51,7 +51,7 @@ def run(
     workdir: str | Path | None = None,
     executor_factory: Callable | None = None,
     gate_factory: Callable | None = None,
-    unit_retries: int = 2,
+    unit_retries: int = 3,  # WO#108-C: 2→3 상향 — 어려운 유닛에 escalate 전 한 번 더 여유.
     tier_ladder: list[Tier] | None = None,
     auto_config_note: str | None = None,
     scaffold_client: LLMClient | None = None,
@@ -335,12 +335,18 @@ def _write_lineage(state_path: str | Path, parent_run_id: str) -> None:
         pass
 
 
-def _write_cli_meta(state_path: str | Path, order: str, *, status: str = "running") -> None:
+def _write_cli_meta(
+    state_path: str | Path, order: str, *, status: str = "running",
+    workdir: str | Path | None = None,
+) -> None:
     """CLI run의 원 주문을 state.yaml 옆 meta.json 사이드카에 best-effort 기록 (WO#75).
 
     웹 런처(RunManager)와 *동일 형식*({id, order, started_at, status}) → 대시보드 `/api/runs`
     (meta.json 스캔)·#57 주문 뷰가 CLI run도 커버한다. **이미 meta.json이 있으면 안 덮는다** —
     런처가 spawn한 경우 옵션/argv/계보가 든 더 풍부한 meta를 잃지 않기 위함(추가형·비파괴).
+
+    WO#108-B: workdir(코드 위치)를 *절대경로*로 기록 → 이어가기(continue-from) 시드가 부모
+    코드 위치를 자동 해소한다(부모가 별도 --workdir여도 수동 symlink 불필요). 추가형 키.
     """
     try:
         import json
@@ -350,15 +356,36 @@ def _write_cli_meta(state_path: str | Path, order: str, *, status: str = "runnin
         if p.exists():
             return  # 런처가 이미 더 풍부한 meta를 씀 — 클로버 금지
         started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rec = {"id": d.name, "order": order, "started_at": started_at, "status": status}
+        if workdir is not None:
+            rec["workdir"] = str(Path(workdir).resolve())  # 절대경로(다른 cwd서 재개해도 유효)
         p.write_text(
-            json.dumps(
-                {"id": d.name, "order": order, "started_at": started_at, "status": status},
-                ensure_ascii=False, indent=2,
-            ),
+            json.dumps(rec, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception:  # noqa: BLE001 — 사이드카 기록 실패가 run을 죽이지 않는다(best-effort)
         pass
+
+
+def _resolve_seed_src(parent_dir: Path) -> Path:
+    """이어가기 시드의 *부모 코드 위치*를 자동 해소 (WO#108-B). 수동 symlink 불필요.
+
+    후보를 순서대로: (1) 부모 meta.json의 `workdir`(#75·#108-B, 존재하면) →
+    (2) `<run-dir>/work` → (3) `<run-dir>`. 첫 *존재하는 디렉토리*를 반환. 아무것도 없으면
+    `<run-dir>`(seed_workdir_from_parent가 디렉토리 부재 시 명확 ContinuationError를 낸다 — 크래시 0).
+    """
+    try:
+        import json
+        meta = json.loads((parent_dir / "meta.json").read_text(encoding="utf-8"))
+        wd = meta.get("workdir")
+        if wd and Path(wd).is_dir():
+            return Path(wd)
+    except Exception:  # noqa: BLE001 — meta 없음/깨짐 → 후보 폴백(best-effort)
+        pass
+    work = parent_dir / "work"
+    if work.is_dir():
+        return work
+    return parent_dir
 
 
 def build_reuse_manifest(parent_spec, parent_state) -> dict:
@@ -417,9 +444,9 @@ def load_continuation(continue_from: str, runs_dir: str | Path, new_workdir: str
     from haetae.intake import build_continuation_context
 
     parent_dir = resolve_parent_dir(continue_from, runs_dir)
-    parent_work = parent_dir / "work"
-    # 부모 workdir이 없으면(레이아웃 다름) 부모 디렉터리 자체를 시딩원으로 폴백.
-    seed_src = parent_work if parent_work.is_dir() else parent_dir
+    # WO#108-B: 부모 코드 위치 자동 해소(meta.json workdir → <run-dir>/work → <run-dir>) — 부모가
+    # 별도 --workdir를 썼어도 수동 symlink 없이 시딩원을 찾는다. 못 찾으면 seed가 명확 에러.
+    seed_src = _resolve_seed_src(parent_dir)
     seeded_n = seed_workdir_from_parent(seed_src, Path(new_workdir))
 
     parent_spec = _load_parent_spec(parent_dir)
@@ -690,9 +717,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--unit-retries",
         type=int,
-        default=2,
+        default=3,
         help=(
-            "병렬 경로: 유닛 gate 실패/머지 충돌 시 그 유닛 재dispatch 최대 횟수 (기본 2). "
+            "병렬 경로: 유닛 gate 실패/머지 충돌 시 그 유닛 재dispatch 최대 횟수 (기본 3, WO#108-C). "
             "소진 후 escalate. (LLM 출력 재시도 replan_retries와는 별개.)"
         ),
     )
@@ -1009,7 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
     # WO#75: CLI run의 원 주문을 meta.json 사이드카로 기록(런처 형식 호환) → 대시보드 #57 주문
     # 뷰가 CLI run도 커버. 런처가 spawn한 경우 이미 meta가 있어 안 덮는다(추가형·best-effort).
     if args.state_path:
-        _write_cli_meta(args.state_path, args.order)
+        _write_cli_meta(args.state_path, args.order, workdir=args.workdir)  # WO#108-B: 시드 자동해소용 workdir 기록
 
     # 스킬 주입(빌더 전용): --skills(기본 on)면 --skills-dir에서 로드. --no-skills면 None.
     skills_dir = args.skills_dir if args.skills else None

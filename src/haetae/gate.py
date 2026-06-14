@@ -403,34 +403,71 @@ class CompositeGate:
     def _harness_self_check(self, spec: ProjectSpec, contract: list[str]) -> list[CheckReport]:
         """하니스 유닛이 *자기 게이트*에서 sim:trace를 실제 실행해 자기검증(결정적·LLM 아님).
 
-        spec의 run-type 기준(sim:trace cmd)을 run_artifact로 실행해:
-          - exit≠0/크래시/타임아웃(미선언 dep로 인한 127 포함) → fail(깨진 하니스 조기 차단, #81).
-          - 캡처 트레이스(union)에 evidence_contract 필드가 다 있나(#78 결정적) → 누락 fail.
-        값/행동(겹침이 *진짜* 0인가 등)은 여전히 적대 run-judge(통합, LLM)가 판정 — 여기선 "실행되나
-        + 계약 필드 emit하나"(필드 존재·exit)까지만. run 기준 없으면 빈 리스트(no-op).
+        WO#108-A **right-size**: per-unit self-check는 **대표 시나리오 1개**의 *구조 smoke*만 한다 —
+          - 하니스가 실행되나(exit/크래시/타임아웃 → fail; 깨진 하니스 조기 차단 #81 보존),
+          - stdout이 깨끗한 JSON인가(#86), 계약 *어휘* 필드를 최소 하나 emit하나(구조화 증거 #78).
+        **전 시나리오 실행 + 시나리오별 행동 정확성 + 전-필드 union 강제는 통합 run-judge(unit=None)**
+        가 전부 본다(커버리지 보존). per-unit은 매 시도 N개 subprocess 대신 1개 — *결정적 체크 범위*
+        축소일 뿐 적대 판정/#82-B 의미 불변. run 기준 없으면 빈 리스트(no-op).
         """
         run_acs = [
             ac for ac in spec.acceptance_criteria
             if ac.check.type == CheckType.run and ac.check.cmd
         ]
         reports: list[CheckReport] = []
-        traces: list[str] = []
-        for ac in run_acs:
-            ev = run_artifact(ac.check.cmd, workdir=self.workdir, timeout=self.run_timeout)
-            reports.append(
-                CheckReport(
-                    ac_id=f"(harness-run:{ac.id})", check_type=CheckType.run, cmd=ac.check.cmd,
-                    status=("pass" if ev.booted else "fail"), exit_code=ev.exit_code,
-                    detail="하니스 자기검증(실행): " + _run_degrade_detail(ev), run_evidence=ev,
-                )
+        if not run_acs:
+            return reports
+        rep = run_acs[0]  # 대표 시나리오(결정적: 선언 순서 첫 run 기준)
+        ev = run_artifact(rep.check.cmd, workdir=self.workdir, timeout=self.run_timeout)
+        reports.append(
+            CheckReport(
+                ac_id=f"(harness-run:{rep.id})", check_type=CheckType.run, cmd=rep.check.cmd,
+                status=("pass" if ev.booted else "fail"), exit_code=ev.exit_code,
+                detail="하니스 자기검증(실행·대표 시나리오): " + _run_degrade_detail(ev),
+                run_evidence=ev,
             )
-            traces.append(ev.trace)
-        # 계약 필드-존재 체크(union 트레이스). 라벨로 통합 계약 체크와 구분(감사).
-        if contract and traces:
-            cr = check_evidence_contract(contract, traces)
-            if cr is not None:
-                reports.append(cr.model_copy(update={"ac_id": "(harness-evidence-contract)"}))
+        )
+        smoke = self._harness_contract_smoke(contract, ev.trace)
+        if smoke is not None:
+            reports.append(smoke)
         return reports
+
+    def _harness_contract_smoke(
+        self, contract: list[str], trace: str
+    ) -> CheckReport | None:
+        """대표 트레이스의 **구조 smoke**(WO#108-A): 깨끗한 JSON인가 + 계약 *어휘* 필드를 최소
+        하나 emit하나(구조화 증거를 내는가). 전-필드 union 강제는 통합 게이트가 전 시나리오로 한다
+        — 단일 대표 시나리오는 union을 다 못 낼 수 있으므로(시나리오별 필드 분리) per-unit은 어휘
+        존재만 본다(거짓 fail 방지). 무계약이면 None(무회귀). 라벨로 통합 계약 체크와 구분(감사)."""
+        if not contract:
+            return None
+        base: dict = {
+            "ac_id": "(harness-evidence-contract)", "check_type": CheckType.schema, "cmd": None,
+        }
+        try:
+            obj = json.loads(trace)
+        except (ValueError, TypeError):
+            return CheckReport(
+                **base, status="fail", exit_code=None,
+                detail=(
+                    "하니스 구조 smoke 실패: 대표 트레이스가 구조화 JSON 아님(stdout 위생 #86) — "
+                    f"요구 어휘: {', '.join(contract)}"
+                ),
+            )
+        keys: set[str] = set()
+        _collect_keys(obj, keys)
+        if not any(f in keys for f in contract):
+            return CheckReport(
+                **base, status="fail", exit_code=None,
+                detail=(
+                    f"하니스 구조 smoke 실패: 대표 트레이스에 계약 어휘 필드 0개(요구: "
+                    f"{', '.join(contract)}) — 다른 필드로 대체 불가. 전-필드 union은 통합서 강제."
+                ),
+            )
+        return CheckReport(
+            **base, status="pass", exit_code=None,
+            detail="하니스 구조 smoke 충족: 실행+깨끗한 JSON+계약 어휘 emit(전-필드 union은 통합서 강제)",
+        )
 
     # ── run 타입 라우팅: harness 실행 + (judge | booted degrade) ─────────
     def _judge_run_acs(
