@@ -587,9 +587,68 @@ def _extract_required_fields(text: str | None) -> list[str]:
 
 
 def _is_trace_harness_unit(desc: str | None) -> bool:
-    """desc 키워드로 검증 트레이스 하니스 유닛인지 보수적 판정(영어 소문자·한국어 부분일치)."""
+    """desc 키워드로 검증 트레이스 하니스 유닛인지 보수적 판정(영어 소문자·한국어 부분일치).
+
+    WO#99: 키워드는 *보조* 신호 — 단독으론 하니스 분류에 불충분하다(준비/스캐폴드 유닛이 "trace"를
+    *언급*만 해도 매칭되는 과매칭). 주 게이트는 `harness_units`의 *증거-생산* 판정.
+    """
     low = (desc or "").lower()
     return any(k in low for k in _TRACE_HARNESS_KEYWORDS)
+
+
+# WO#99: 준비/스캐폴드/네이밍 유닛 탐지 마커 — 트레이스 키워드를 *언급*하지만 트레이스를 *생산하지
+# 않는* 유닛(예: #89 snake u0 "trace 스크립트 *이름 준비*"). 이런 유닛은 evidence-contract를 채울
+# 트레이스를 안 내므로 하니스로 오분류되면 계약 미충족으로 거짓 fail한다. 보수적: 비-생산을 명확히
+# 시사하는 마커만(바 "준비/구현"처럼 진짜 하니스를 만드는 표현은 제외 — bare "준비"는 마커 아님).
+_PREP_SCAFFOLD_MARKERS = (
+    "이름 준비", "이름/구조", "이름·구조", "이름 및 구조", "스크립트 이름", "이름만", "구조만",
+    "네이밍", "준비만", "뼈대", "스텁", "골격",
+    "scaffold", "scaffolding", "naming", "stub", "placeholder", "skeleton", "boilerplate",
+)
+
+
+def _is_prep_scaffold_unit(desc: str | None) -> bool:
+    """desc가 준비/스캐폴드/네이밍 유닛(트레이스 비-생산)임을 시사하는지 보수적 판정. WO#99."""
+    low = (desc or "").lower()
+    return any(m in low for m in _PREP_SCAFFOLD_MARKERS)
+
+
+def _unit_owns_structured_evidence(spec: ProjectSpec, unit: str | None) -> bool:
+    """이 유닛에 *태그된* 기준이 evidence_fields/scenario_steps를 들고 있는가(구조화 증거 생산 신호). WO#99.
+
+    구조화 증거(필드/시나리오)를 *부착한* 기준을 소유하면 그 유닛은 트레이스를 생산하는 진짜
+    하니스다 — desc 표현(키워드/준비어)과 무관하게 *주 게이트*를 통과(증거-생산 = 하니스).
+    """
+    if unit is None:
+        return False
+    for ac in spec.acceptance_criteria:
+        if ac.unit == unit and (
+            (getattr(ac, "evidence_fields", None) or [])
+            or (getattr(ac, "scenario_steps", None) or [])
+        ):
+            return True
+    return False
+
+
+def harness_units(spec: ProjectSpec) -> set[str]:
+    """검증 하니스(=evidence-contract 부착 + #82-B self-check 대상) 유닛 집합. 순수 함수. WO#99.
+
+    **주 게이트 = 트레이스를 *실제로 생산*하는가**(키워드는 보조). 분류 규칙(유닛이 하니스이려면):
+      (PRIMARY) 그 유닛에 태그된 기준이 evidence_fields/scenario_steps를 들고 있다(증거-생산 확정), 또는
+      (SECONDARY) 트레이스 키워드 매칭 *그리고* 준비/스캐폴드/네이밍 유닛이 *아님*.
+    #87/#89 과매칭(준비 유닛이 "trace" 언급만으로 하니스 오탐 → 계약 못 채워 거짓 fail) 제거.
+    진짜 하니스(run/sim:trace + evidence_fields)는 PRIMARY 또는 SECONDARY로 *여전히* 잡힌다(깊이 유지).
+    """
+    out: set[str] = set()
+    for u in spec.decomposition:
+        # PRIMARY: 구조화 증거를 부착한 기준을 소유 → 증거-생산 확정(준비어 표현이어도 하니스).
+        if _unit_owns_structured_evidence(spec, u.unit):
+            out.add(u.unit)
+            continue
+        # SECONDARY: 키워드 매칭하되 준비/스캐폴드/네이밍 유닛은 제외(비-생산 → 오탐 차단).
+        if _is_trace_harness_unit(u.desc) and not _is_prep_scaffold_unit(u.desc):
+            out.add(u.unit)
+    return out
 
 
 def extract_required_evidence_fields(spec: ProjectSpec) -> list[str]:
@@ -630,7 +689,7 @@ def extract_evidence_contracts(spec: ProjectSpec) -> ProjectSpec:
     fields = extract_required_evidence_fields(spec)
     if not fields:
         return spec  # run 기준 없음 / 필드 없음 → 무계약(graceful)
-    harness = {u.unit for u in spec.decomposition if _is_trace_harness_unit(u.desc)}
+    harness = harness_units(spec)  # WO#99: 증거-생산 게이트(준비/스캐폴드 오탐 제외, 키워드 보조)
     if not harness:
         return spec  # 트레이스 하니스 유닛 없음 → 부착 대상 없음(graceful)
     merged = spec.model_copy(deep=True)
@@ -669,7 +728,7 @@ def harness_scenario_steps(spec: ProjectSpec) -> dict[str, list[str]]:
     steps = extract_scenario_steps(spec)
     if not steps:
         return {}  # 구조화 STEP 없음 → 무유도(graceful)
-    harness = {u.unit for u in spec.decomposition if _is_trace_harness_unit(u.desc)}
+    harness = harness_units(spec)  # WO#99: 증거-생산 게이트(준비/스캐폴드 오탐 제외, 키워드 보조)
     if not harness:
         return {}  # 트레이스 하니스 유닛 없음 → 부착 대상 없음(graceful)
     return {u: list(steps) for u in harness}
