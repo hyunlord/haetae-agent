@@ -100,7 +100,7 @@ from haetae.or_node import (
     summarize_gate_evidence,
 )
 from haetae.replan import ReplanError, replan
-from haetae.scheduler import all_done, ready_units
+from haetae.scheduler import all_done, is_disjoint_from, ready_units
 from haetae.skills import Skill, inject_skills, load_skills, match_skills
 from haetae.spec_change import apply_spec_change
 from haetae.spec_critic import synthesize_with_critique
@@ -564,6 +564,7 @@ def run_loop(
     state_path: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
     max_parallel: int = 1,
+    max_parallel_burst: int = 0,
     workdir: str | Path | None = None,
     executor_factory: ExecutorFactory | None = None,
     gate_factory: GateFactory | None = None,
@@ -1077,7 +1078,9 @@ def run_loop(
 
         # 병렬 모드: worktree 격리 + 결정적 DAG 스케줄러로 분기.
         # max_parallel<=1은 아래 순차 경로 그대로(현행 동작 불변 — 무회귀).
-        if max_parallel > 1:
+        # WO#110: base=1이라도 burst>1이면 병렬 경로로(disjoint 유닛 burst 가능). burst 미지정(0)
+        #   + base=1이면 effective=1 → 순차 경로 그대로(back-compat). effective>1일 때만 병렬.
+        if max(max_parallel, max_parallel_burst) > 1:
             return _parallel_loop(
                 spec,
                 state,
@@ -1087,6 +1090,7 @@ def run_loop(
                 gate_factory=gate_factory or (lambda wt: gate),
                 wm=worktree_manager or WorktreeManager(workdir or "."),
                 max_parallel=max_parallel,
+                max_parallel_burst=max_parallel_burst,  # WO#110: disjoint burst cap(0=보수적 기본)
                 max_iters=max_iters,
                 replan_retries=replan_retries,
                 unit_retries=unit_retries,
@@ -1447,6 +1451,7 @@ def _parallel_loop(
     gate_factory: GateFactory,
     wm: WorktreeManager,
     max_parallel: int,
+    max_parallel_burst: int = 0,
     max_iters: int,
     replan_retries: int,
     unit_retries: int,
@@ -1496,6 +1501,15 @@ def _parallel_loop(
             heartbeat.set_context(call_kind, unit)
         except Exception:  # noqa: BLE001
             pass
+
+    # WO#110(OMC #1): disjoint 병렬 burst — scope 입증 disjoint 유닛엔 cap을 *자원 한계*에만 묶는다.
+    # eff_burst = 동시 실행 하드 상한(자원). 미지정(0)/저설정이면 max_parallel로 클램프 → **기본
+    # 보수적·back-compat**(burst==max_parallel이면 아래 dispatch가 기존 동작과 byte-identical).
+    # scope_of: 유닛별 file-scope(#59/#72). burst 자격 판정(is_disjoint_from)의 입력.
+    eff_burst = max(max_parallel_burst, max_parallel)
+    scope_of: dict[str, list[str]] = {
+        u.unit: list(getattr(u, "scope", None) or []) for u in spec.decomposition
+    }
 
     # ── 상태 봉투(closure로 공유) ──────────────────────────────────────────
     terminal: str | None = None  # None | "done"(brain stop) | "escalated" | "stuck"
@@ -1925,7 +1939,8 @@ def _parallel_loop(
         def run_round() -> None:
             nonlocal terminal, total_attempts
             in_flight: set[str] = set()
-            with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+            # WO#110: 풀 크기 = eff_burst(자원 하드 상한). burst==max_parallel이면 기존과 동일.
+            with ThreadPoolExecutor(max_workers=eff_burst) as pool:
                 futures: dict[Future, tuple[str, NextOrder, Path]] = {}
 
                 def dispatch_ready() -> None:
@@ -1944,8 +1959,19 @@ def _parallel_loop(
                         })
                         return
                     for u in ready_units(state.plan, in_flight):
-                        if terminal or len(futures) >= max_parallel:
+                        if terminal:
                             break
+                        # WO#110: cap 게이팅 — eff_burst가 자원 하드 상한(절대 초과 안 함).
+                        #   base(max_parallel)까지는 무조건 채운다(기존 동작). base 초과(burst 슬롯)는
+                        #   *scope 입증 disjoint* 유닛에만 허용 — 충돌 리스크가 부재할 때만 자원에 묶는다.
+                        #   비-disjoint/미선언 유닛은 burst 슬롯을 못 받고 다음 라운드로 미뤄진다(보수적).
+                        #   burst==max_parallel(기본)이면 첫 조건에서 break → 기존과 byte-identical.
+                        if len(futures) >= eff_burst:
+                            break  # 자원 하드 상한
+                        if len(futures) >= max_parallel and not is_disjoint_from(
+                            u, in_flight, scope_of
+                        ):
+                            continue  # base cap 도달 + u 미입증-disjoint → burst 안 함, 다음 ready 시도
                         order = gen_order(u)  # main 스레드 — 직렬·결정적
                         if order is None:  # escalate/stop/replan-소진 → terminal 세팅됨
                             break

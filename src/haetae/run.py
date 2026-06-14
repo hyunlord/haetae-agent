@@ -48,6 +48,7 @@ def run(
     prompt_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
     max_parallel: int = 1,
+    max_parallel_burst: int = 0,
     workdir: str | Path | None = None,
     executor_factory: Callable | None = None,
     gate_factory: Callable | None = None,
@@ -99,6 +100,7 @@ def run(
         prompt_dir=prompt_dir,
         progress=progress,
         max_parallel=max_parallel,
+        max_parallel_burst=max_parallel_burst,  # WO#110: disjoint burst(0=보수적 기본)
         workdir=workdir,
         executor_factory=executor_factory,
         gate_factory=gate_factory,
@@ -797,6 +799,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--max-parallel-burst",
+        type=int,
+        default=0,
+        help=(
+            "WO#110(OMC #1): scope 입증 disjoint 유닛(#72 — 서로 겹치지 않는 file-scope·의존 없음)에 "
+            "한해 허용할 *상향* 동시 실행 cap. 보수적 cap의 주 이유는 머지충돌 리스크인데 disjoint면 "
+            "그 리스크가 부재하므로 cap을 *자원 한계*에만 묶는다(머신에 맞게 설정). 비-disjoint/미선언 "
+            "유닛은 --max-parallel 한정 유지. 기본 0=opt-out(= --max-parallel, 기존 동작 그대로). "
+            "충돌 backstop(serialize-on-conflict·#48)은 가정이 틀려도 그대로 안전망."
+        ),
+    )
+    parser.add_argument(
         "--skills-dir",
         default=_DEFAULT_SKILLS_DIR,
         help=(
@@ -1075,6 +1089,7 @@ def main(argv: list[str] | None = None) -> int:
             state_path=args.state_path,
             progress=progress,
             max_parallel=args.max_parallel,
+            max_parallel_burst=args.max_parallel_burst,  # WO#110: disjoint burst(0=보수적 기본)
             workdir=args.workdir,
             executor_factory=executor_factory,
             gate_factory=gate_factory,

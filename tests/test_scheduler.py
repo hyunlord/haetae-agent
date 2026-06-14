@@ -1,7 +1,7 @@
-"""결정적 DAG 스케줄러 테스트 — 순수 함수(ready_units/all_done/is_stuck)."""
+"""결정적 DAG 스케줄러 테스트 — 순수 함수(ready_units/all_done/is_stuck/is_disjoint_from)."""
 
 from haetae.models import PlanItem, PlanState
-from haetae.scheduler import all_done, is_stuck, ready_units
+from haetae.scheduler import all_done, is_disjoint_from, is_stuck, ready_units
 
 
 def _plan(spec: dict[str, tuple[str, list[str]]]) -> list[PlanItem]:
@@ -69,3 +69,39 @@ def test_not_stuck_with_inflight_or_ready():
 
 def test_not_stuck_when_all_done():
     assert is_stuck(_plan({"u1": ("done", [])}), set()) is False
+
+
+# ──────────────────── is_disjoint_from (WO#110 disjoint burst 술어) ────────────────────
+
+
+def test_disjoint_scopes_are_disjoint():
+    scope_of = {"u1": ["a.ts"], "u2": ["b.ts"], "u3": ["c.ts"]}
+    assert is_disjoint_from("u3", {"u1", "u2"}, scope_of) is True
+
+
+def test_overlapping_scope_not_disjoint():
+    scope_of = {"u1": ["a.ts", "shared.ts"], "u2": ["shared.ts"]}
+    assert is_disjoint_from("u2", {"u1"}, scope_of) is False
+
+
+def test_missing_own_scope_not_disjoint():
+    # 자기 scope 미선언 → 미입증 → 보수적 False(burst 불가).
+    scope_of = {"u1": ["a.ts"], "u2": []}
+    assert is_disjoint_from("u2", {"u1"}, scope_of) is False
+
+
+def test_missing_other_scope_not_disjoint():
+    # 상대가 scope 미선언 → 그 상대와 겹치는지 입증 불가 → 보수적 False.
+    scope_of = {"u1": [], "u2": ["b.ts"]}
+    assert is_disjoint_from("u2", {"u1"}, scope_of) is False
+
+
+def test_disjoint_from_empty_inflight_with_own_scope():
+    # in-flight 없음 + 자기 scope 선언 → vacuously disjoint(첫 burst 후보).
+    assert is_disjoint_from("u1", set(), {"u1": ["a.ts"]}) is True
+
+
+def test_exact_string_match_no_fuzzy():
+    # 정확-문자열 매칭(퍼지/glob 없음 — intake._scope_overlaps와 동형). 다른 문자열은 겹침 아님.
+    scope_of = {"u1": ["src/a.ts"], "u2": ["src/a.tsx"]}
+    assert is_disjoint_from("u2", {"u1"}, scope_of) is True

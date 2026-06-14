@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–109 · 996 tests · main @4721e17 · 길 B 3/3 · crowd-sim 북극성 첫 완주 · OMC #3(phase 1·2)·#4**
+> **최종 갱신: 2026-06-14 · WO#1–110 · 1009 tests · main @98e0958 · 길 B 3/3 · crowd-sim 북극성 첫 완주 · OMC #1·#3(phase 1·2)·#4**
 
 ---
 
@@ -179,7 +179,7 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 ## 7. OMC 차용 후보 (수렴 분석 — LEAP·Dynamic-Workflows에 이어 3번째 외부 수렴)
 
 OMC(CC-플러그인 오케스트레이터)와 haetae가 또 같은 자리 수렴(병렬+검증루프+영속상태+티어라우팅+스킬주입). haetae에 없거나 약한 4종:
-1. **Disjoint 병렬 burst** [후보] — scope disjoint 입증 시 #72 위에 더 공격적 병렬(유닛 내/독립 수정). 단 병렬 npm 경합 등 격리 비용 주의(#89서 실측).
+1. ✅ **Disjoint 병렬 burst (WO#110)** — ready 유닛 중 *scope 입증 disjoint*(#72 — 서로 file-scope 겹침 0·의존 없음) 집합은 `--max-parallel-burst`(≥--max-parallel)까지 동시 실행 허용 — 보수적 cap의 주 이유인 머지충돌 리스크가 disjoint면 부재하므로 cap을 *자원 한계*에만 묶는다(머신에 맞게 설정). 비-disjoint/scope-미선언은 --max-parallel 한정. **충돌 backstop(#21 serialize-on-conflict·#48 충돌적응 재빌드) 불변** — disjoint 판정이 틀려도 안전망. **opt-in 기본 보수적**(burst 미지정=0 → eff=max_parallel → 기존 동작 byte-identical). 스케줄링만(scheduler.is_disjoint_from 순수 술어 + loop dispatch cap) — gate/judge/run-judge/바/codex/state 스키마/ALLOWED_SANDBOXES 불변. 단 병렬 npm 경합 등 격리 비용은 사용자가 자원 cap으로 조절(#89서 실측).
 2. **스킬 3층 멘탈모델** [후보] — 실행층/강화층/보장층 분리. haetae의 gate=보장층을 명시 레이어로 개념화 → 조합·재사용 사고 또렷.
 3. ✅ **control/data-plane + artifact descriptor (WO#102 phase 1·WO#109 phase 2)** — ArtifactDescriptor 인프라(path·content_hash·size·kind·retention·summary) + bounded-handoff(8KB). 큰 trace를 data-plane(`<run-dir>/artifacts/`)로, state.yaml은 descriptor 참조. **판정 불변**(오프로드는 직렬화에서만·in-memory full trace 보존·gate.py 무접촉) · state 96%↓(41KB→1.5KB) · back-compat. #55 sidecar 일반화. **phase 2(WO#109): 측정-우선 → 정직 no-op** — 실 run 20건 post-#102 측정 결과 trace가 지배적이었고, 그 뒤 8KB 임계를 넘는 단일 write-once 블롭 0건(최대 result 3.3KB), WO 1순위 `prompt`는 state에 미존재(짧은 `work_order_ref` 참조뿐). event=append-only 타임라인·cost=권위/dashboard-live이며 둘 다 임계 미만 → 인라인 유지. 새 오프로드 코드 무추가(speculative 금지), 측정+readiness만 박제(docs/STATE_SIZE_PHASE2.md·tests). artifacts.py는 이미 kind-범용 = 미래 블롭 재사용 가능.
 4. ✅ **스킬 자동 학습 learner (WO#103)** — 완주 캡스톤서 재사용 *패턴* 후보를 staging(`skills/_candidates/`) 추출 + provenance. **F.1 거버넌스: 자동채택 0**(load_skills가 `_`접두 구조적 제외·사람 `--approve` 전 미편입·미주입) · 빌더-측만(judge 무수신)·**독립 적대 gate가 backstop**(나쁜 학습 스킬도 나쁜 산출 통과 불가 = 자기학습 표류 안전망) · lint(자가채점/바완화/구현덤프 차단)·IP 원본. #32(seeded)의 거버넌스형 자동화.

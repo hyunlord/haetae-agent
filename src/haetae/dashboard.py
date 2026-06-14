@@ -1011,7 +1011,7 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
     """
     raw = raw or {}
     allowed = {
-        "executor", "max_parallel", "run_timeout", "scaffold", "skills",
+        "executor", "max_parallel", "max_parallel_burst", "run_timeout", "scaffold", "skills",
         "critic_model", "max_iters", "unit_retries", "reasoning_effort", "model",
         "auto",  # WO#65: 제로-config auto 모드(미설정 운영 knob 자동 해석). 기본 False(back-compat).
     }
@@ -1082,6 +1082,8 @@ def validate_options(raw: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "executor": executor,
         "max_parallel": _int("max_parallel", 4, 1, 16),
+        # WO#110: disjoint burst cap. 0=보수적 기본(= max_parallel). >0이면 scope 입증 disjoint 유닛만 상향.
+        "max_parallel_burst": _int("max_parallel_burst", 0, 0, 16),
         "run_timeout": run_timeout,
         "scaffold": _bool("scaffold", True),
         "skills": _bool("skills", True),
@@ -1115,6 +1117,9 @@ def build_run_argv(
         "--max-iters", str(opts["max_iters"]),
         "--unit-retries", str(opts["unit_retries"]),
     ]
+    # WO#110: burst cap은 >0일 때만 부착(추가형 — 기본 argv는 기존과 동일).
+    if opts.get("max_parallel_burst"):
+        argv += ["--max-parallel-burst", str(opts["max_parallel_burst"])]
     # WO#65: auto 모드면 --auto 부착 → run.py가 미설정 운영 knob 자동 해석(명시 옵션은 그대로 오버라이드).
     if opts.get("auto"):
         argv.append("--auto")
