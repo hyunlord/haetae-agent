@@ -53,6 +53,47 @@ def test_skill_has_continuous_spawn_and_queue():
     assert "점유 슬롯" in body
 
 
+# ──────────────────────────── v2: reciprocal collision-free (#94 v2, #112 대응) ────────────────────────────
+
+
+def test_skill_v2_names_velocity_truncation_weakness():
+    """v2가 #94 비상호 속도-절단의 약점(liveness hack·통과→overlap)을 #112 데이터로 명시 지목한다."""
+    body = _sim_skill().body
+    assert "liveness hack" in body
+    assert "collision-free가 아니" in body              # liveness ≠ collision-free
+    assert "통과" in body and "overlap" in body          # 멈추는 대신 서로 통과 → overlap
+    assert "#112" in body                                # stress sweep 데이터 근거
+    assert "비상호" in body or "non-reciprocal" in body  # 약점의 원인
+
+
+def test_skill_v2_collision_free_priority_stop_not_pass():
+    """충돌-free 후보 없으면 *정지*(통과 금지) — separation > progress, 교착은 비대칭으로 회피."""
+    body = _sim_skill().body
+    assert "통과 금지" in body and "정지" in body         # 정지 허용·통과 금지
+    assert "separation > progress" in body or "separation > 전진" in body
+    # 멈춤이 교착 안 되게 약한 비대칭(우선순위/지터/우측 양보)
+    assert "비대칭" in body and ("지터" in body or "우선순위" in body)
+    # half-plane(ORCA 연속해)로 상호성 강화
+    assert "half-plane" in body
+
+
+def test_skill_v2_density_handling_and_flow_field_coupling():
+    """밀도 대응(이산 샘플 고갈→조밀화/연속 half-plane) + flow-field에 지역 상호분리 결합."""
+    body = _sim_skill().body
+    assert "조밀화" in body                               # 이산 샘플 해상도↑
+    assert "clearance" in body                            # radius+clearance 접촉 전 분리
+    # flow-field 전역 흐름 + 지역 reciprocal 분리 결합
+    assert "flow-field" in body and "지역" in body and "분리" in body
+
+
+def test_skill_v2_preserves_gridlock_removal():
+    """#94 교착-제거는 유지 — v2는 그 위에 collision-free를 얹을 뿐(회귀 방지)."""
+    body = _sim_skill().body
+    assert "그리드락" in body or "gridlock" in body       # 교착 제거 패턴 보존
+    assert "위치-점유" in body                            # naive position-blocking 여전히 금지
+    assert "정지는 허용" in body                          # 멈춤 허용(교착 아님) — liveness 유지
+
+
 def test_skill_has_logic_render_separation():
     """로직-렌더 분리 → node 헤드리스 트레이스 가능(#84/#86 정합)."""
     body = _sim_skill().body
