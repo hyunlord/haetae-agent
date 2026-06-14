@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–92 · 883 tests · main @42254dc · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · 하니스 검증 사슬(§6) · #91 순수 재개 + #92 실루프 검증 · 길 B 복수 완주**
+> **최종 갱신: 2026-06-14 · WO#1–95 · 893 tests · main @1235759 · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · 하니스 검증 사슬(§6) · #91 순수 재개 + #92 실루프 검증 · crowd-sim 북극성 첫 완주(§6) · 길 B 복수 완주**
 
 ---
 
@@ -151,6 +151,14 @@ crowd-sim은 빌더 역량 벽(군중 충돌회피·그리드락)이라 *완주 
 continue-from 순수 재개(같은 order)가 부모 plan/criteria를 *보존*(spec.yaml 로드, 재합성 skip) → #71 reuse 매칭. #92서 실루프 검증: 재합성 0·done 유닛 재빌드 0·미완만 재빌드·**통합 11.5M 도달(#89의 21.2M 대비 반값)**·anti-erosion by construction(부모 criteria byte-보존). 비용 효율 재개 입증.
 - kanban: 통합 도달했으나 run-judge가 하니스 *시나리오* 결함(ac3 DnD 미이동·ac5 persistence 삭제후reload)을 정확히 fail — 5/7+빌드+11테스트 통과. **gate가 하니스 자기 시나리오 버그까지 잡는 가차없는 정확성** = "언제 done이 아닌지 안다" 명제 최강 형태.
 - 길 B 결산: **2/3 완주(md+snake) + 효율 재개 검증 + gate 가차없음**. 명제 입증 완료. kanban 3/3은 완성도(폴리시)로 분류.
+
+### crowd-sim 북극성 첫 완주 (WO#94 스킬 + #95 RUN)
+crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도달 + 10/10 통과 → done**(26.7M/30M, fresh --auto). 이번 세션 전 아크의 페이오프:
+- **#94 충돌회피 스킬 결정적 입증**: 빌더가 속도기반 연속회피(swept-circle, velocity 채택·naive 칸-점유 블로킹 0) + 연속 스폰 + 큐 형성 채택. **그리드락 완전 반전**: overlap 34만→0 · stuck 90~97%→0 · 이동 8%→**28/28 전원 enter→queue→checkout→exit 완주**(통합 ac7 [run] 증거).
+- **검증역전 탈출 실증**: build+retry 25.9M(97%)가 실 sim 빌드. 하니스(u7/u8 헤드리스 트레이스)는 가벼운 node로 흡수 — #81/#87의 "하니스 66~89% 독식"이 사라짐. **#78~#86 하니스 사슬 + #91 효율 재개가 예산을 실 빌드로 해방한 게 실증.**
+- **disjoint 분해(#72)**: 8유닛(layout·agent·navigation·checkout/queue·collision-avoidance·canvas-render·헤드리스트레이스·렌더트레이스), 로직-렌더 분리가 분해에 반영. 머지충돌 2건 #48로 해소, 통합 OR 불필요(첫 시도 통과). #82-B·#78 작동.
+- **명제 확인**: gate가 거친 동선을 거르는 정확성 보존하면서, *빌더가 그 바를 처음으로 정직하게 넘김*(0겹침·0교착·렌더 트레이스 증거 위 적대 판정 pass).
+- **한계(과대해석 금지)**: 빌더 회피는 *속도-절단*이지 완전 RVO/ORCA 상호 사이드스텝 아님. spawn_rate=4·28 에이전트 *중간 부하*서 통과 — 더 무거운 부하/좁은 통로 stress는 미검증("첫 완주 + 한계 미검증"). stress run으로 한계 probe가 후속.
 
 ### 남은 갭 (운영/후속 — 검증 인프라 결함 아님)
 1. ✅ **continue-from 재사용 거부 → rebuild-all — #91 해소(#92 실루프 검증)**: 순수 재개가 부모 plan/criteria를 보존(spec.yaml 로드·재합성 skip) → #71 reuse 매칭·done 재빌드 0. (구 증상: 재합성이 criteria/분해를 매번 바꿔 reuse 거부 → rebuild-all + plan 비대, 반복 #81·r2·r3.) **잔여**: 통합 실패 시 #41/#52 OR-대안이 seeded-done까지 리셋(FAILURE_MODES §3 신규 행 'OR 통합-대안 ↔ #91 비일관').

@@ -20,7 +20,7 @@
 | **계약 불일치 = 텅 빈 검증** | 하니스가 judge가 *못 쓰는* 필드 emit → 게이트가 "증거 없음"으로 fail, *행동* 판정 불가(캡스톤 #77 결정적 발견) | acceptance 요구 증거 필드 ↔ 하니스 출력 불일치; "트레이스 하니스 만들어라"가 열린 명세 | #78 evidence-contract(criteria서 필드 추출→하니스 작업지시서 주입→게이트 *결정적 필드존재* 강제; *행동* 판정은 적대 run-judge 그대로=분리 보존) | ✅ |
 | **CLI 캡 즉사** | `--max-tokens` 주면 합성 전 `TypeError: run() got unexpected keyword` 즉사 | 캡이 파서·main·run_loop엔 있는데 *중간 래퍼 run() 시그니처* 누락; 단위테스트가 main→run 전체경로 미검증 | #76A run() 배선 + 전체경로 통합 테스트(재발 차단) | ✅ |
 | **합성-전-실패 raw 에러** | state 생기기 전 죽은 run이 빨간 raw FileNotFoundError | #66은 합성 *중*(heartbeat 활성)만 graceful, 합성 *전* 실패 미처리 | #76B graceful "합성 전 실패" 패널 + 원 주문 | ✅ |
-| **검증 역전(effort inversion)** | *검증기*가 검증 대상 전부보다 비쌈(캡스톤 #77: u7 하니스 13.21M > 앞 7유닛 합 12.25M, **데이터 확정**) | "트레이스 하니스" 열린 명세 → 빌더 과대 구현 (+ codex 고-input 재전송) | #78 계약으로 하니스 *부분* 좁힘(잔여 codex 고-input은 §3) | 🟡 부분 |
+| **검증 역전(effort inversion)** | *검증기*가 검증 대상 전부보다 비쌈(캡스톤 #77: u7 하니스 13.21M > 앞 7유닛 합 12.25M, **데이터 확정**) | "트레이스 하니스" 열린 명세 → 빌더 과대 구현 (+ codex 고-input 재전송) | #78 계약 + #84 node 트레이스 + #86 stdout 위생 → **#95 실증 해소**: crowd-sim서 build+retry 25.9M(97%)=실 sim 빌드, 하니스(u7/u8 헤드리스 트레이스)는 가벼움(66~89% 독식 사라짐). 잔여 codex 고-input은 §3 | ✅ |
 | **stale-status** | 죽은 run이 `running`+가짜 경과로 뜸 | state-status vs 실제 생존 미대조 | #75 heartbeat-age(2×idle)+launched-PID stale 표시 + `stopped_interrupted` | ✅ |
 | **하니스가 게이트서 못 돎** | 빌더가 실브라우저 E2E(playwright/chromium) 선택 → 오프라인 게이트서 exit 1, 하니스가 전체 비용 66~89% 독식·미수렴(캡스톤 #83/#85) | "트레이스 하니스" 열린 명세 → 빌더가 게이트 환경(오프라인·브라우저 바이너리 없음)서 못 도는 하니스 고집 | #84 하니스를 *node 트레이스*로 유도(엔진 import+순수 JS/JSDOM, 실브라우저 회피) — 비용 −53~56%·governed escalate | ✅ |
 | **하니스 stdout 노이즈 = 미파싱** | node 하니스가 *돌지만*(exit 0, 0.37s) stdout에 npm 배너·console.log 혼입 → 게이트 JSON.parse 실패 → 계약 fail(캡스톤 #85) | stdout이 결과 JSON 전용이 아님(로그·배너가 같이 stdout으로) | #86 stdout=단일 JSON-only·로그는 stderr·npm 배너 억제(`--silent`/직접 node) — 빌더-측 유도 | ✅ |
@@ -48,6 +48,7 @@
 | **큰 plan budget 초과** | 다유닛+하니스 검증(per-unit self-check+재시도)이 통합 run-judge 前 전역 캡 소진(캡스톤 #87·#89 kanban 7유닛 >20M) | 캡 상향 또는 plan-trim·재시도 효율·하니스-특화 비용 ceiling |
 | **OR 통합-대안 ↔ #91 비일관** | 통합 gate 실패 시 #41/#52 OR-대안이 seeded-done 포함 *전체* 유닛 리셋 → #91 reuse 상실·병렬 머지충돌 재발 → escalate(캡스톤 #92 kanban-r4, u1 머지 미수렴) | 통합 실패에 *연루된 유닛만* 리셋(seeded-done 보존) → #91 reuse와 정합 |
 | **하니스 시나리오 결함** | 필드(#78)·종류(#84)·stdout(#86) 다 통과해도 *시나리오 로직*(무엇을 어떻게 구동하나)이 틀리면 run-judge가 정확히 fail(false-negative 아닌 정당 fail; #92 kanban ac3 DnD 같은-카드 미이동·ac5 생성카드 삭제후reload) | 시나리오 계약(#78 필드 계약의 *시나리오*판 — 무엇을 구동할지 명시) |
+| **충돌회피 부하 한계 미검증** | 속도-절단 회피가 *중간 부하*(spawn 4·28체, 캡스톤 #95)서 0겹침·0교착으로 통과했으나, 고부하/좁은 통로서 절단-정지 stall 여지(완전 RVO/ORCA 상호 사이드스텝 아님) | stress run으로 한계 probe(부하·spawn·통로폭 ↑) → 필요 시 #94 스킬에 reciprocal 사이드스텝 강화 |
 
 ## 4. 안티패턴 (하지 말 것)
 
