@@ -21,6 +21,7 @@ from haetae.executors import Tier, tier_label
 from haetae.intake import (
     SynthesisError,
     extract_evidence_contracts,
+    harness_scenario_steps,
     nudge_disjoint_scope,
     nudge_integration_deps,
     synthesize,
@@ -826,9 +827,37 @@ def run_loop(
         )
         return order.model_copy(update={"scope": (order.scope or "") + section})
 
+    # WO#98: 시나리오 STEP 유도(빌더 전용 주입). 합성 후 spec.acceptance_criteria에서 채운다(아래).
+    # evidence_contract(#78)의 시나리오판 — *어떤 필드*가 아니라 *어떤 흐름*을 구동할지 명시한다.
+    # 빈 동안엔 no-op(무유도·기존 동작). apply_evidence_contract와 동형 — executor 복사본에만 주입.
+    scenario_of: dict[str, list[str]] = {}
+
+    def apply_scenario_steps(order: NextOrder) -> NextOrder:
+        """하니스 유닛 work order에 시나리오 STEP을 주입한 *복사본*(executor 전용, 바 불변).
+
+        필드(#78)는 다 emit해도 시나리오 *절차*가 부실하면(#92: 같은 카드 미이동·reload 前 삭제)
+        거짓 음성 증거가 난다. 그래서 "각 기준이 기술하는 *완전한 흐름*을 이 순서로 구동하라"는
+        흐름 계약을 scope에 명시한다. 원본 order는 불변 → critic/judge 미수신(분리). *판정 완화가
+        아니라 무엇을 구동할지 유도* — 행동/값 판정은 여전히 독립 run-judge가 한다(바 불변).
+        """
+        steps = scenario_of.get(order.unit or "")
+        if not steps:
+            return order
+        section = (
+            "\n\n## 검증 시나리오 흐름 (필수 — 하니스가 구동할 STEP)\n"
+            "이 유닛은 *검증 하니스*다. acceptance_criteria가 기술하는 *완전한 사용자 흐름*을 아래\n"
+            "순서대로 끝까지 구동하라(부분 아님). 흔한 실수를 피하라: *같은 엔티티*를 모든 상태로\n"
+            "옮겨라(다른 새 엔티티로 갈아치우지 마라); persistence/reload 검사 *前*에는 대상을\n"
+            "변형·삭제하지 마라; 생성→조작→검증의 현실적 순서를 지켜라. 각 STEP 결과는 위 증거\n"
+            "필드로 emit하라(STEP→field). 이건 *무엇을 구동할지* 유도일 뿐 — 통과/실패 판정은\n"
+            "여전히 독립 run-judge가 한다(바 불변):\n"
+            + "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
+        )
+        return order.model_copy(update={"scope": (order.scope or "") + section})
+
     def apply_builder(order: NextOrder) -> NextOrder:
-        """빌더 전용 주입 합성: 스킬(#32) + 증거 계약(#78). 둘 다 executor 복사본에만(분리 보존)."""
-        return apply_evidence_contract(apply_skills(order))
+        """빌더 전용 주입 합성: 스킬(#32) + 증거 계약(#78) + 시나리오 흐름(#98). 모두 executor 복사본에만(분리 보존)."""
+        return apply_scenario_steps(apply_evidence_contract(apply_skills(order)))
 
     # 분해 critic(WO#40, Phase C): replan이 낸 work order의 *진전성*을 독립 critic이 판정.
     # **적대적 분리**: 독립 client(critic-model)만 쓰고, 스킬 미주입 *원본* order를 본다
@@ -926,12 +955,20 @@ def run_loop(
             if contract_of:
                 n_fields = len(next(iter(contract_of.values())))
                 emit(f"증거 계약 부착: {', '.join(sorted(contract_of))} ({n_fields} 필드 — criteria 파생)")
+            # WO#98: 시나리오 흐름 유도 — criteria(run/행동)가 명시한 scenario_steps를 union해 트레이스-
+            # 하니스 유닛에 매핑(빌더 주입용). spec/criteria 불변(빌더-측만·게이트 무관·바 불변). LLM 0.
+            scenario_of.update(harness_scenario_steps(spec))
+            if scenario_of:
+                n_steps = len(next(iter(scenario_of.values())))
+                emit(f"시나리오 흐름 유도: {', '.join(sorted(scenario_of))} ({n_steps} STEP — criteria 파생)")
         else:
             # WO#91 순수 재개: 넛지(통합 deps·disjoint scope)는 *재합성*이라 skip — 부모 plan 보존.
             # 증거 계약(#78)은 부모 spec에 이미 부착돼 있으므로 빌더 주입용으로 읽기만 한다(LLM 0·파생 0).
             contract_of.update(
                 {u.unit: list(u.evidence_contract) for u in spec.decomposition if u.evidence_contract}
             )
+            # WO#98: 시나리오 흐름도 부모 spec의 criteria.scenario_steps에서 읽기만 한다(파생 0·LLM 0).
+            scenario_of.update(harness_scenario_steps(spec))
 
         # WO#91: 순수 재개면 부모 plan-state 보존(_init_resume_state — done 시드/미완 pending),
         # 아니면 기존 그린필드/증분 init(전부 pending). 둘 다 spec.yaml 사이드카로 저장(byte 보존).

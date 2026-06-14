@@ -638,3 +638,38 @@ def extract_evidence_contracts(spec: ProjectSpec) -> ProjectSpec:
         if u.unit in harness:
             u.evidence_contract = list(fields)  # 결정적·정렬된 계약(바에서 파생)
     return merged
+
+
+def extract_scenario_steps(spec: ProjectSpec) -> list[str]:
+    """run-type acceptance_criteria가 명시한 `scenario_steps`의 union(순서보존·중복제거). 순수 함수.
+
+    WO#98: evidence_fields(#82-A)가 *어떤 증거 필드*를 낼지 명시하듯, scenario_steps는 그 필드를
+    채우려 하니스가 *밟아야 할 흐름*(순서 있는 STEP)을 명시한다. 흐름은 순서가 의미이므로 정렬하지
+    않고(evidence_fields는 정렬) **선언 순서를 보존**한다. 바가 *이미 기술*하는 흐름의 구조화일 뿐
+    (criteria 파생 — 새 요구/완화 아님). 구조화 슬롯 전무면 빈 리스트(무유도·기존 동작, back-compat).
+    """
+    run_acs = [ac for ac in spec.acceptance_criteria if ac.check.type == CheckType.run]
+    steps: list[str] = []
+    for ac in run_acs:
+        for s in getattr(ac, "scenario_steps", None) or []:
+            s = str(s).strip()
+            if s and s not in steps:
+                steps.append(s)
+    return steps
+
+
+def harness_scenario_steps(spec: ProjectSpec) -> dict[str, list[str]]:
+    """run/행동 기준의 scenario_steps를 union해 트레이스-하니스 유닛(들)에 매핑(빌더 주입용). 순수 함수.
+
+    WO#98: #78 evidence_contract의 시나리오판 — 단 **빌더-측 유도 전용**이라 spec/decomposition/
+    criteria를 한 글자도 안 바꾸고(게이트 무관·바 불변), 부착 대상 하니스 유닛 → 흐름 STEP의 매핑만
+    반환한다. 루프가 이 매핑을 빌더 작업지시서(apply_builder)에만 주입한다(critic/judge 미수신).
+    graceful: scenario_steps 없음 / 하니스 유닛 없음 → 빈 매핑(무유도·기존 동작, back-compat).
+    """
+    steps = extract_scenario_steps(spec)
+    if not steps:
+        return {}  # 구조화 STEP 없음 → 무유도(graceful)
+    harness = {u.unit for u in spec.decomposition if _is_trace_harness_unit(u.desc)}
+    if not harness:
+        return {}  # 트레이스 하니스 유닛 없음 → 부착 대상 없음(graceful)
+    return {u: list(steps) for u in harness}

@@ -126,6 +126,15 @@ class AcceptanceCriterion(BaseModel):
     # 없으면 #78이 desc/pass의 snake_case 스크레이프로 폴백(back-compat). 추가형·비파괴:
     # 바(성공 기준)가 *이미 요구*하는 증거의 구조화일 뿐 — 새 요구/완화 아님(anti-erosion).
     evidence_fields: list[str] = Field(default_factory=list)
+    # WO#98: 이 run/행동 기준을 입증하려면 하니스가 *밟아야 할 시나리오 흐름*의 구조화 선언(순서
+    # 있는 STEP 목록, 예: ["todo에 카드 생성", "*같은 카드*를 todo→doing 이동+위치확인",
+    # "doing→done 이동+위치확인"]). evidence_fields(#82-A)가 *어떤 필드*를 낼지 명시하듯, 이건
+    # 그 필드를 채우는 *시나리오 절차*를 명시한다(step→field로 연결). #92에서 필드는 다 emit됐지만
+    # 시나리오 로직이 부실해(같은 카드 미이동·reload 前 삭제) 거짓 음성 증거가 나온 결함을 겨냥.
+    # **빌더-측 유도 전용** — 합성기가 criteria서 *파생*해 명시하고 빌더 작업지시서에만 주입된다.
+    # 게이트/적대 run-judge는 안 읽는다(*무엇을 구동할지* 유도지 *판정 완화* 아님 — 바 불변).
+    # 추가형·비파괴(evidence_fields와 동형): 없으면 빈 리스트(무유도·기존 동작 그대로, back-compat).
+    scenario_steps: list[str] = Field(default_factory=list)
 
 
 class Assumption(BaseModel):

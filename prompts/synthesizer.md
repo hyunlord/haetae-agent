@@ -143,6 +143,23 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
   (`evidence_fields`는 acceptance_criterion 최상위 키 — `check` 안이 아님. 산문이 든 불변식의
   *키 이름*만 적어라; 값/임계는 적지 마라.)
 
+- **`run`/행동 기준엔 `scenario_steps`도 *함께* 명시하라**(그 기준을 입증하려면 하니스가 *밟아야 할
+  흐름*의 구조화 STEP 목록). `evidence_fields`가 *어떤 필드*를 낼지 명시하듯, `scenario_steps`는 그
+  필드를 채우는 *시나리오 절차*를 명시한다 — 각 STEP을 evidence_field로 입증되게 연결하라(step→field).
+  필드는 다 emit돼도 *시나리오 로직이 부실*하면(같은 엔티티를 안 옮김·검사 前 삭제) 트레이스가
+  "행동 없음"의 거짓 음성 증거를 내고 적대 run-judge가 정당하게 fail한다(캡스톤 #92: 칸반 하니스가
+  필드는 다 냈으나 ac3=DnD가 *같은 카드*를 todo→doing→done 안 옮기고 부분만, ac5=persistence가
+  reload *前* 카드를 삭제 → "안 남음" 거짓 음성). `scenario_steps`로 *완전한 흐름*을 유도해 막아라.
+  - 흔한 실수를 피해 STEP을 써라: ① *완전 흐름* 끝까지(부분 금지) ② *같은 엔티티*를 모든 상태로
+    (새 엔티티로 갈아치우지 마라) ③ persistence/reload 검사 *前* 대상 변형·삭제 금지 ④ 생성→조작→
+    검증의 현실적 순서.
+  - 예 "DnD로 카드 컬럼 이동": `scenario_steps: ["todo에 카드 생성", "*같은 카드*를 todo→doing 이동
+    +위치확인", "doing→done 이동+위치확인", "각 전이 후 컬럼 멤버십 기록"]`.
+  - 예 "persistence(reload 후 잔존)": `scenario_steps: ["항목 생성", "reload", "생성한 *그* 항목 존재
+    확인 — reload 前 변형/삭제 금지"]`.
+  (`scenario_steps`도 acceptance_criterion 최상위 키 — `check` 안이 아님. *무엇을 구동할지* 유도일
+  뿐 통과/실패 판정 완화가 아니다 — 값/행동 판정은 여전히 run-judge가 한다. 바 불변, criteria 파생.)
+
 - **test·빌드 명령은 스캐폴드(package.json `scripts`·`devDeps`)가 정하는 러너를 쓰라 — 러너-특정
   플래그를 임의로 더하지 마라.** 스캐폴드가 깐 러너(예: `vitest`)에 *다른* 프레임워크(예: Jest)의
   플래그를 붙이면(`--runInBand`·`--testNamePattern` 등 Jest 전용) 러너가 인식 못 해 크래시한다
