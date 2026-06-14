@@ -43,9 +43,11 @@
 | **빌더 행동 품질(그리드락)** | sim이 빌드·실행되나 혼잡서 에이전트 상호 차단(96~98% blocked, 캡스톤 #77) | **게이트는 정확히 잡음(가드 작동)** — 빌더 역량 레버: #79 anti-fixation + #32 충돌회피(RVO/flow-field) 스킬. 게이트 그리드락 fail→재빌드 루프 |
 | **검증 역전 잔여(codex 고-input)** | 하니스 단일 build 13.16M *input*(agentic 전체맥락 재전송) | #78이 계약으로 좁혔으나 codex 측 컨텍스트 재전송은 director 밖 — 하니스 분해 더 잘게 / right-size 후속 |
 | **바 비례성** | ac8 `sample≥200`·ac7 거의-전원-spawn이 데모치곤 공격적(비구속) | right-size: 임계를 stakes에 맞게 trim(부차, 캡스톤 #77) |
-| **continue-from reuse-거부 → rebuild-all** | 재합성이 criteria/분해를 매번 바꿔 #71 reuse 거부 → done 유닛 재빌드로 resume 절약 0 + plan 비대(반복 #81·kanban-r2/r3·snake-r2/r3) | resume이 부모 plan/criteria를 보존해 reuse를 살리는 안정화(비용 효율 재개의 핵심) |
+| ✅ **continue-from reuse-거부 → rebuild-all** *(#91 해소·#92 검증)* | 재합성이 criteria/분해를 매번 바꿔 #71 reuse 거부 → done 유닛 재빌드로 resume 절약 0 + plan 비대(반복 #81·kanban-r2/r3·snake-r2/r3) | **#91 순수 재개**가 부모 plan/criteria 보존(spec.yaml 로드·재합성 skip)→reuse 매칭으로 해소(#92 실루프: done 재빌드 0·통합 11.5M). 잔여는 신규 행 'OR 통합-대안 ↔ #91 비일관' |
 | **하니스 키워드 과매칭** | 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐 → 트레이스 미생산인데 계약 부착 → 못 채워 fail(캡스톤 #89 snake u0) | 하니스 탐지에서 준비/스캐폴드 유닛 제외 정교화(트레이스를 *생산*하는 유닛만) |
 | **큰 plan budget 초과** | 다유닛+하니스 검증(per-unit self-check+재시도)이 통합 run-judge 前 전역 캡 소진(캡스톤 #87·#89 kanban 7유닛 >20M) | 캡 상향 또는 plan-trim·재시도 효율·하니스-특화 비용 ceiling |
+| **OR 통합-대안 ↔ #91 비일관** | 통합 gate 실패 시 #41/#52 OR-대안이 seeded-done 포함 *전체* 유닛 리셋 → #91 reuse 상실·병렬 머지충돌 재발 → escalate(캡스톤 #92 kanban-r4, u1 머지 미수렴) | 통합 실패에 *연루된 유닛만* 리셋(seeded-done 보존) → #91 reuse와 정합 |
+| **하니스 시나리오 결함** | 필드(#78)·종류(#84)·stdout(#86) 다 통과해도 *시나리오 로직*(무엇을 어떻게 구동하나)이 틀리면 run-judge가 정확히 fail(false-negative 아닌 정당 fail; #92 kanban ac3 DnD 같은-카드 미이동·ac5 생성카드 삭제후reload) | 시나리오 계약(#78 필드 계약의 *시나리오*판 — 무엇을 구동할지 명시) |
 
 ## 4. 안티패턴 (하지 말 것)
 

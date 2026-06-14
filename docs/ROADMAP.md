@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–89 · 864 tests · main @3022039 · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · 하니스 검증 사슬(§6) · 길 B 복수 완주**
+> **최종 갱신: 2026-06-14 · WO#1–92 · 883 tests · main @42254dc · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · 하니스 검증 사슬(§6) · #91 순수 재개 + #92 실루프 검증 · 길 B 복수 완주**
 
 ---
 
@@ -147,8 +147,25 @@ crowd-sim은 빌더 역량 벽(군중 충돌회피·그리드락)이라 *완주 
 - **kanban ⚠️ budget** — 7유닛+하니스 > 20M캡, 통합 前 소진. fix 실패 아닌 plan-size/budget.
 - **결론**: haetae 전 사슬 건전성 = *복수 과제서 입증*. 누적 하니스-검증 레버가 fresh서 끝까지 작동.
 
+### #91 순수 재개 + #92 실루프 검증
+continue-from 순수 재개(같은 order)가 부모 plan/criteria를 *보존*(spec.yaml 로드, 재합성 skip) → #71 reuse 매칭. #92서 실루프 검증: 재합성 0·done 유닛 재빌드 0·미완만 재빌드·**통합 11.5M 도달(#89의 21.2M 대비 반값)**·anti-erosion by construction(부모 criteria byte-보존). 비용 효율 재개 입증.
+- kanban: 통합 도달했으나 run-judge가 하니스 *시나리오* 결함(ac3 DnD 미이동·ac5 persistence 삭제후reload)을 정확히 fail — 5/7+빌드+11테스트 통과. **gate가 하니스 자기 시나리오 버그까지 잡는 가차없는 정확성** = "언제 done이 아닌지 안다" 명제 최강 형태.
+- 길 B 결산: **2/3 완주(md+snake) + 효율 재개 검증 + gate 가차없음**. 명제 입증 완료. kanban 3/3은 완성도(폴리시)로 분류.
+
 ### 남은 갭 (운영/후속 — 검증 인프라 결함 아님)
-1. **continue-from 재사용 거부 → rebuild-all** (반복 #81·r2·r3): 재합성이 criteria/분해를 매번 바꿔 #71 reuse 거부 → done 유닛 재빌드로 절약 0 + plan 비대. *비용 효율 재개*의 핵심 — resume이 부모 plan/criteria를 보존하게 안정화 필요.
+1. ✅ **continue-from 재사용 거부 → rebuild-all — #91 해소(#92 실루프 검증)**: 순수 재개가 부모 plan/criteria를 보존(spec.yaml 로드·재합성 skip) → #71 reuse 매칭·done 재빌드 0. (구 증상: 재합성이 criteria/분해를 매번 바꿔 reuse 거부 → rebuild-all + plan 비대, 반복 #81·r2·r3.) **잔여**: 통합 실패 시 #41/#52 OR-대안이 seeded-done까지 리셋(FAILURE_MODES §3 신규 행 'OR 통합-대안 ↔ #91 비일관').
 2. **큰 plan budget**: 7유닛+하니스 검증이 20M 초과(kanban). 캡 상향 또는 plan-trim/재시도 효율.
 3. **하니스 키워드 과매칭**: 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐→계약 부착됐으나 트레이스 미생산→fail. 탐지서 준비 유닛 제외 정교화.
 4. **병렬 fresh 빌드 회피**: 동시 npm install이 cache 경합 → fresh 캡스톤 순차.
+
+---
+
+## 7. OMC 차용 후보 (수렴 분석 — LEAP·Dynamic-Workflows에 이어 3번째 외부 수렴)
+
+OMC(CC-플러그인 오케스트레이터)와 haetae가 또 같은 자리 수렴(병렬+검증루프+영속상태+티어라우팅+스킬주입). haetae에 없거나 약한 4종:
+1. **Disjoint 병렬 burst** — scope disjoint 입증 시 #72 위에 더 공격적 병렬(유닛 내/독립 수정). 단 병렬 npm 경합 등 격리 비용 주의(#89서 실측).
+2. **스킬 3층 멘탈모델** — 실행층/강화층/보장층 분리. haetae의 gate=보장층을 명시 레이어로 개념화 → 조합·재사용 사고 또렷.
+3. **control/data-plane 분리 + artifact descriptor** — 오케스트레이션 메타는 작게, 큰 산출물(trace·transcript·cost-ledger)은 descriptor(path·contentHash·sizeBytes·retention) 참조(작으면 인라인·크면 descriptor+요약). **#55 "sidecar over state pollution"의 일반화.** state.yaml 비대·파싱비용 방지. [가장 실용적]
+4. **스킬 자동 학습(learner)** — 완주 캡스톤(md/snake) 해법을 스킬로 *자동 추출*+주입. #32(seeded·수동)의 자동화. 진짜 새 능력.
+
+**차별점 유지**: OMC verifier=같은 시스템 opus 에이전트 체크리스트 / haetae gate=적대·독립 + 검증기 자체 검증(#78~#86 사슬). "정직한 실패" 축 우위는 보존하며 차용.
