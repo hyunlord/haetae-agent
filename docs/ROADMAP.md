@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–113 · 1009 tests · main @b72a400 · 길 B 3/3 · crowd-sim *저밀도* 첫 완주(#112 재캘리브레이션) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
+> **최종 갱신: 2026-06-15 · WO#1–116 · 1016 tests · main @a7791ca · 길 B 3/3 · crowd-sim *중밀도 견고 완주*(#116, 적대 gate가 저밀도 아티팩트 차단→재빌드→DONE) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
 
 ---
 
@@ -167,6 +167,14 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - **그러나 속도-절단은 collision-free 아님**: 동시 ~15체 초과 시 overlap 발생·급증(active 96서 에이전트당 매틱 ~2겹침, radius↑ 7.5× 증폭). 비상호적 속도장애물의 약점 — *교착 실패모드를 overlap 실패모드로 맞바꾼 liveness hack*(멈추는 대신 서로 통과).
 - **#95 재캘리브레이션**: #95는 active=12 = overlap onset(~15) 바로 아래 → **overlap=0은 저밀도 아티팩트, "저밀도 첫 완주"**(견고한 완주 아님). #95 caveat 데이터 확증.
 - **다음 후보**: 완전 RVO/ORCA(상호) 스킬(#94 v2) / flow-field 의무화 / 더 강한 분해.
+
+### crowd-sim 견고 완주 재실행 — gate 정직성 실증 (WO#114·#115 스킬 + #116 RUN)
+#114(밀도 시나리오 계약) + #115(#94 v2 stop-not-pass)를 얹어 fresh 재실행 → **중밀도 견고 완주 + 적대 gate의 결정적 정직성 실증**(done, 19.38M, 5유닛).
+- **★gate가 가짜 done 차단★**: 1차 통합서 빌더 하니스가 overlap=0 보고했으나 *spawned=1*(저밀도 아티팩트=#95/#112). 적대 run-judge 거부("단일 고객으론 혼잡·비겹침 입증 불가") → #97 OR 리셋(연루 3·seeded 2 보존·바 불변) → 재빌드 → 2차 DONE 7/7(spawned 24·completed 24·100%·overlap 0·deadlock 0·stuck 0). **"언제 done이 아닌지 아는 governed GATE"가 밀도-stress 하 실루프 작동** — #112→#114 시나리오-커버리지 아크의 페이오프.
+- **#95 승급**: 저밀도 첫 완주(active 12·onset 아래 아티팩트) → **중밀도 견고 완주**(24체·overlap 0·deadlock 0·100%, run-judge 7/7).
+- **v2 부분 채택**: 빌더 u3 = stop-not-pass(충돌-free 없으면 정지·통과 금지, #115 핵심) 채택 → 다중-에이전트 collision-free 달성. 단 완전 ORCA half-plane/reciprocal-share/교착-해소 비대칭은 미채택(이 밀도선 stop으로 충분, 교착 미발현).
+- **정직 caveat**: 통과 트레이스 min_pair_distance=209(대형 월드·24체 *분산*) = tight-packing 아님 → "중밀도 분산 견고"지 #112-onset 근접 밀도는 미정복. stop-not-pass 교착 리스크도 분산이라 미검증.
+- **검증역전 0**: 실 빌드 96%(build 8.65M + OR 재빌드 10.04M=정직-실패 비용).
 
 ### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
 **길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).
