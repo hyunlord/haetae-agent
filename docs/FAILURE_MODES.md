@@ -44,10 +44,10 @@
 | **검증 역전 잔여(codex 고-input)** | 하니스 단일 build 13.16M *input*(agentic 전체맥락 재전송) | #78이 계약으로 좁혔으나 codex 측 컨텍스트 재전송은 director 밖 — 하니스 분해 더 잘게 / right-size 후속 |
 | **바 비례성** | ac8 `sample≥200`·ac7 거의-전원-spawn이 데모치곤 공격적(비구속) | right-size: 임계를 stakes에 맞게 trim(부차, 캡스톤 #77) |
 | ✅ **continue-from reuse-거부 → rebuild-all** *(#91 해소·#92 검증)* | 재합성이 criteria/분해를 매번 바꿔 #71 reuse 거부 → done 유닛 재빌드로 resume 절약 0 + plan 비대(반복 #81·kanban-r2/r3·snake-r2/r3) | **#91 순수 재개**가 부모 plan/criteria 보존(spec.yaml 로드·재합성 skip)→reuse 매칭으로 해소(#92 실루프: done 재빌드 0·통합 11.5M). 잔여는 신규 행 'OR 통합-대안 ↔ #91 비일관' |
-| **하니스 키워드 과매칭** | 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐 → 트레이스 미생산인데 계약 부착 → 못 채워 fail(캡스톤 #89 snake u0) | 하니스 탐지에서 준비/스캐폴드 유닛 제외 정교화(트레이스를 *생산*하는 유닛만) |
+| ✅ **하니스 키워드 과매칭** *(#99 해소·#100 검증)* | 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐 → 트레이스 미생산인데 계약 부착 → 못 채워 fail(캡스톤 #89 snake u0) | **#99**: 하니스 탐지를 "키워드 언급"→"증거-생산(run/sim:trace 체크·evidence_fields/scenario_steps 보유)" 게이트로(준비/스캐폴드 제외). gate is_harness가 계약-구동이라 intake 분류만 수정. #100서 u5(DnD 구현) 오탐 0 입증 |
 | **큰 plan budget 초과** | 다유닛+하니스 검증(per-unit self-check+재시도)이 통합 run-judge 前 전역 캡 소진(캡스톤 #87·#89 kanban 7유닛 >20M) | 캡 상향 또는 plan-trim·재시도 효율·하니스-특화 비용 ceiling |
-| **OR 통합-대안 ↔ #91 비일관** | 통합 gate 실패 시 #41/#52 OR-대안이 seeded-done 포함 *전체* 유닛 리셋 → #91 reuse 상실·병렬 머지충돌 재발 → escalate(캡스톤 #92 kanban-r4, u1 머지 미수렴) | 통합 실패에 *연루된 유닛만* 리셋(seeded-done 보존) → #91 reuse와 정합 |
-| **하니스 시나리오 결함** | 필드(#78)·종류(#84)·stdout(#86) 다 통과해도 *시나리오 로직*(무엇을 어떻게 구동하나)이 틀리면 run-judge가 정확히 fail(false-negative 아닌 정당 fail; #92 kanban ac3 DnD 같은-카드 미이동·ac5 생성카드 삭제후reload) | 시나리오 계약(#78 필드 계약의 *시나리오*판 — 무엇을 구동할지 명시) |
+| ✅ **OR 통합-대안 ↔ #91 비일관** *(#97 해소·#100 검증)* | 통합 gate 실패 시 #41/#52 OR-대안이 seeded-done 포함 *전체* 유닛 리셋 → #91 reuse 상실·병렬 머지충돌 재발 → escalate(캡스톤 #92 kanban-r4, u1 머지 미수렴) | **#97**: 통합 실패에 *연루된 유닛만* 리셋(실패 기준→소유 유닛 #26/#72 매핑·seeded-done 보존·폴백 전체 리셋) → #91 reuse와 정합. #100 kanban fresh 완주서 OR 미발동(전 유닛 first-try) |
+| ✅ **하니스 시나리오 결함** *(#98 해소·#100 검증)* | 필드(#78)·종류(#84)·stdout(#86) 다 통과해도 *시나리오 로직*(무엇을 어떻게 구동하나)이 틀리면 run-judge가 정확히 fail(false-negative 아닌 정당 fail; #92 kanban ac3 DnD 같은-카드 미이동·ac5 생성카드 삭제후reload) | **#98**: 합성기가 evidence_fields와 함께 scenario_steps(기준 입증 흐름) 유도 + verification-harness 스킬 흔한-실수 회피(완전 흐름·같은 엔티티 전 상태·검사 前 보존). #100서 ac6 DnD·ac5 persistence 통합 pass로 입증 |
 | **충돌회피 부하 한계 미검증** | 속도-절단 회피가 *중간 부하*(spawn 4·28체, 캡스톤 #95)서 0겹침·0교착으로 통과했으나, 고부하/좁은 통로서 절단-정지 stall 여지(완전 RVO/ORCA 상호 사이드스텝 아님) | stress run으로 한계 probe(부하·spawn·통로폭 ↑) → 필요 시 #94 스킬에 reciprocal 사이드스텝 강화 |
 
 ## 4. 안티패턴 (하지 말 것)

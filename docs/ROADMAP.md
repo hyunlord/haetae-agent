@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–95 · 893 tests · main @1235759 · 핵심 A–E 완료 · autopilot(제로-config) · 비용 거버넌스 · 하니스 검증 사슬(§6) · #91 순수 재개 + #92 실루프 검증 · crowd-sim 북극성 첫 완주(§6) · 길 B 복수 완주**
+> **최종 갱신: 2026-06-14 · WO#1–100 · 932 tests · main @36ebf2b · 길 B 3/3 완주 · crowd-sim 북극성 첫 완주**
 
 ---
 
@@ -125,7 +125,7 @@
 
 ---
 
-## 6. 하니스 검증 사슬 + 길 B 완주 검증 (WO#77–89)
+## 6. 하니스 검증 사슬 + 길 B 완주 검증 (WO#77–100)
 
 ### 배경: 검증 역전 (verification inversion)
 crowd-sim 캡스톤이 반복적으로 통합 run-judge에 *닿지 못함* — 매번 **검증 하니스 유닛**이 비용을 독식(crowd-sim u7 13M, kanban u6 14.9M, snake u4 21.6M = 전체의 66~89%). 게이트는 건전했으나(가짜 done 거부), 하니스 자체가 (a) 틀린 증거를 내거나 (b) 게이트 환경서 못 돌거나 (c) 노이즈로 미파싱이라, *검증기가 검증 안 됨* = hollow verification.
@@ -160,10 +160,18 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - **명제 확인**: gate가 거친 동선을 거르는 정확성 보존하면서, *빌더가 그 바를 처음으로 정직하게 넘김*(0겹침·0교착·렌더 트레이스 증거 위 적대 판정 pass).
 - **한계(과대해석 금지)**: 빌더 회피는 *속도-절단*이지 완전 RVO/ORCA 상호 사이드스텝 아님. spawn_rate=4·28 에이전트 *중간 부하*서 통과 — 더 무거운 부하/좁은 통로 stress는 미검증("첫 완주 + 한계 미검증"). stress run으로 한계 probe가 후속.
 
+### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
+**길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).
+- **#97 OR 통합-대안 연루-유닛 한정 리셋**: #41/#52 OR가 seeded-done 포함 전체 리셋하던 #92 비일관 수정 — 연루 유닛만 리셋, #91 seeded-done 보존(reuse 유지·머지충돌 재발 방지). 실패 기준→소유 유닛 매핑(#26/#72), 폴백 전체 리셋.
+- **#98 하니스 시나리오 계약**(#78 필드계약의 시나리오판): 합성기가 evidence_fields와 함께 scenario_steps(기준 입증 흐름) 유도 + 스킬이 올바른 시나리오 구성(완전 흐름·같은 엔티티 전 상태·검사 前 보존). #100서 입증 — ac6 DnD·ac5 persistence 시나리오 결함(#92) 해소, 통합 pass.
+- **#99 하니스 탐지 정교화**: "키워드 언급" → "증거-생산(run/sim:trace 체크·evidence_fields/scenario_steps 보유)" 게이트. 준비/스캐폴드 유닛(#89 snake u0) 과매칭 제거. #100서 u5(DnD 구현) 오탐 0 입증. gate is_harness가 계약-구동이라 intake 분류만 수정.
+- **클러스터 효과**: 거짓 음성·헛재시도 제거 → kanban이 #89(21.2M·미완) 대비 *더 싸게(17.66M) 완주*. 셋 다 빌더-측/탐지-분류만(적대 run-judge·gate 판정 무접촉 일관).
+- **결산**: 검증 기계 완결 — 하니스 사슬(필드#78·종류#84·stdout#86·시나리오#98·탐지#99) + 효율 재개(#91·#97) + 적대 분리 보존. 길 B 3/3 + crowd-sim 북극성 첫 완주.
+
 ### 남은 갭 (운영/후속 — 검증 인프라 결함 아님)
-1. ✅ **continue-from 재사용 거부 → rebuild-all — #91 해소(#92 실루프 검증)**: 순수 재개가 부모 plan/criteria를 보존(spec.yaml 로드·재합성 skip) → #71 reuse 매칭·done 재빌드 0. (구 증상: 재합성이 criteria/분해를 매번 바꿔 reuse 거부 → rebuild-all + plan 비대, 반복 #81·r2·r3.) **잔여**: 통합 실패 시 #41/#52 OR-대안이 seeded-done까지 리셋(FAILURE_MODES §3 신규 행 'OR 통합-대안 ↔ #91 비일관').
+1. ✅ **continue-from 재사용 거부 → rebuild-all — #91 해소(#92 실루프 검증)**: 순수 재개가 부모 plan/criteria를 보존(spec.yaml 로드·재합성 skip) → #71 reuse 매칭·done 재빌드 0. (구 증상: 재합성이 criteria/분해를 매번 바꿔 reuse 거부 → rebuild-all + plan 비대, 반복 #81·r2·r3.) **잔여도 해소(#97/#100)**: 통합 실패 시 #41/#52 OR-대안이 *연루 유닛만* 리셋·seeded-done 보존 → #100 kanban fresh 완주서 OR 미발동(전 유닛 first-try).
 2. **큰 plan budget**: 7유닛+하니스 검증이 20M 초과(kanban). 캡 상향 또는 plan-trim/재시도 효율.
-3. **하니스 키워드 과매칭**: 스캐폴드/준비 유닛(desc에 "trace" 등)이 하니스로 오탐→계약 부착됐으나 트레이스 미생산→fail. 탐지서 준비 유닛 제외 정교화.
+3. ✅ **하니스 키워드 과매칭 — #99 해소(#100 검증)**: 탐지를 증거-생산 게이트로 정교화(준비/스캐폴드 제외) → #100서 u5(DnD 구현) 오탐 0. (구 증상: desc "trace" 언급 준비 유닛이 오탐→계약 부착→미생산 fail, 캡스톤 #89 snake u0.)
 4. **병렬 fresh 빌드 회피**: 동시 npm install이 cache 경합 → fresh 캡스톤 순차.
 
 ---
