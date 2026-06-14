@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–111 · 1009 tests · main @6d06bca · 길 B 3/3 · crowd-sim 북극성 첫 완주 · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
+> **최종 갱신: 2026-06-14 · WO#1–113 · 1009 tests · main @b72a400 · 길 B 3/3 · crowd-sim *저밀도* 첫 완주(#112 재캘리브레이션) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
 
 ---
 
@@ -13,6 +13,7 @@
 - 차별점 3축: **governed GATE**(다조건 종료 + 적대적 판정으로 자기합리화 차단) · **spec governance**(mutability gradient, anti-erosion) · **provider-agnostic**.
 - 검증 사건: 캡스톤 빌드가 *자기 채점 스크립트*로 `pass:true` 도장 → **독립 run-judge가 "행동 증거 없음"으로 거부**(ac8). 적대적 게이트의 존재 이유 그대로 증명.
 - **수렴 검증**: Claude Code *Dynamic Workflows* · Google *LEAP* · **Loop Engineering**(2026-06 frontier 용어화 — prompt→context→harness→loop 사다리)이 같은 자리에 도달. Loop Engineering 상세·차용 후보는 **§5**.
+- **시나리오 커버리지 = gate 엄밀성의 상한** *(WO#112 교훈)*: 적대 gate는 *시나리오가 어려운 조건을 구동할 때만* 그 실패를 잡는다. #95 crowd-sim이 통과한 건 gate가 틀려서가 아니라 *run 시나리오가 저밀도*였기 때문(overlap onset ~15체 아래의 active=12). → sim 하니스 시나리오는 현실 밀도/스트레스를 구동해야 한다(#98 시나리오 계약의 자연 확장). 북극성(복잡 태스크)엔 결정적 — **검증 시나리오가 약하면 적대 gate도 가짜 done을 못 거른다**(gate는 결백, 커버리지가 병목).
 
 ---
 
@@ -159,6 +160,13 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - **disjoint 분해(#72)**: 8유닛(layout·agent·navigation·checkout/queue·collision-avoidance·canvas-render·헤드리스트레이스·렌더트레이스), 로직-렌더 분리가 분해에 반영. 머지충돌 2건 #48로 해소, 통합 OR 불필요(첫 시도 통과). #82-B·#78 작동.
 - **명제 확인**: gate가 거친 동선을 거르는 정확성 보존하면서, *빌더가 그 바를 처음으로 정직하게 넘김*(0겹침·0교착·렌더 트레이스 증거 위 적대 판정 pass).
 - **한계(과대해석 금지)**: 빌더 회피는 *속도-절단*이지 완전 RVO/ORCA 상호 사이드스텝 아님. spawn_rate=4·28 에이전트 *중간 부하*서 통과 — 더 무거운 부하/좁은 통로 stress는 미검증("첫 완주 + 한계 미검증"). stress run으로 한계 probe가 후속.
+
+### crowd-sim stress 발견 — 속도-절단의 한계 (WO#112 진단)
+#112 부하 sweep(엔진 무수정·트레이스, spawn/active/radius — 통로폭은 layout 고정이라 미노출, spawn_rate는 클램프라 active·radius가 실제 혼잡 레버)으로 #95를 캘리브레이션:
+- **#94 교착 제거는 견고**: deadlock 0·stuck 0·완주율 98~100%가 240체·active 96·radius 0.30까지 유지. #81/#87의 34만 교착(=#94 타깃 실패모드) 재발 0.
+- **그러나 속도-절단은 collision-free 아님**: 동시 ~15체 초과 시 overlap 발생·급증(active 96서 에이전트당 매틱 ~2겹침, radius↑ 7.5× 증폭). 비상호적 속도장애물의 약점 — *교착 실패모드를 overlap 실패모드로 맞바꾼 liveness hack*(멈추는 대신 서로 통과).
+- **#95 재캘리브레이션**: #95는 active=12 = overlap onset(~15) 바로 아래 → **overlap=0은 저밀도 아티팩트, "저밀도 첫 완주"**(견고한 완주 아님). #95 caveat 데이터 확증.
+- **다음 후보**: 완전 RVO/ORCA(상호) 스킬(#94 v2) / flow-field 의무화 / 더 강한 분해.
 
 ### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
 **길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).

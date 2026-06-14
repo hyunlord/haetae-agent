@@ -48,7 +48,8 @@
 | **큰 plan budget 초과** | 다유닛+하니스 검증(per-unit self-check+재시도)이 통합 run-judge 前 전역 캡 소진(캡스톤 #87·#89 kanban 7유닛 >20M) | 캡 상향 또는 plan-trim·재시도 효율·하니스-특화 비용 ceiling |
 | ✅ **OR 통합-대안 ↔ #91 비일관** *(#97 해소·#100 검증)* | 통합 gate 실패 시 #41/#52 OR-대안이 seeded-done 포함 *전체* 유닛 리셋 → #91 reuse 상실·병렬 머지충돌 재발 → escalate(캡스톤 #92 kanban-r4, u1 머지 미수렴) | **#97**: 통합 실패에 *연루된 유닛만* 리셋(실패 기준→소유 유닛 #26/#72 매핑·seeded-done 보존·폴백 전체 리셋) → #91 reuse와 정합. #100 kanban fresh 완주서 OR 미발동(전 유닛 first-try) |
 | ✅ **하니스 시나리오 결함** *(#98 해소·#100 검증)* | 필드(#78)·종류(#84)·stdout(#86) 다 통과해도 *시나리오 로직*(무엇을 어떻게 구동하나)이 틀리면 run-judge가 정확히 fail(false-negative 아닌 정당 fail; #92 kanban ac3 DnD 같은-카드 미이동·ac5 생성카드 삭제후reload) | **#98**: 합성기가 evidence_fields와 함께 scenario_steps(기준 입증 흐름) 유도 + verification-harness 스킬 흔한-실수 회피(완전 흐름·같은 엔티티 전 상태·검사 前 보존). #100서 ac6 DnD·ac5 persistence 통합 pass로 입증 |
-| **충돌회피 부하 한계 미검증** | 속도-절단 회피가 *중간 부하*(spawn 4·28체, 캡스톤 #95)서 0겹침·0교착으로 통과했으나, 고부하/좁은 통로서 절단-정지 stall 여지(완전 RVO/ORCA 상호 사이드스텝 아님) | stress run으로 한계 probe(부하·spawn·통로폭 ↑) → 필요 시 #94 스킬에 reciprocal 사이드스텝 강화 |
+| ⚠️ **속도-절단 회피 = liveness hack(collision-free 아님)** *(#112 probe로 확증)* | #112 stress sweep: 고밀도서 stall이 *아니라* overlap — 동시 ~15체 초과 시 겹침 발생·급증(active 96서 에이전트당 매틱 ~2겹침). deadlock·stuck은 0 유지(교착 실패모드를 overlap 실패모드로 맞바꾼 liveness hack, 멈추는 대신 통과). #95(active=12)는 onset 바로 아래라 0겹침=저밀도 아티팩트 | **완전 RVO/ORCA(상호 사이드스텝)·flow-field 필요**(#94 v2 방향) / 더 강한 분해. #94의 *교착 제거*는 견고(240체까지 재발 0) — 보강 대상은 *분리 무결성* |
+| **시나리오 밀도 커버리지 부족** | 저밀도 검증 시나리오는 *밀도-의존* 실패(overlap)를 구동 못 해 적대 gate가 못 잡음 — gate는 결백, 시나리오 커버리지가 병목(#95가 저밀도라 #112 한계가 안 드러남) | sim 하니스 시나리오가 현실 밀도/스트레스를 구동(#98 시나리오 계약의 자연 확장). **시나리오 커버리지 = gate 엄밀성의 상한**(ROADMAP §0) |
 
 ## 4. 안티패턴 (하지 말 것)
 
