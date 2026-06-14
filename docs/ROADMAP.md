@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-14 · WO#1–100 · 932 tests · main @36ebf2b · 길 B 3/3 완주 · crowd-sim 북극성 첫 완주**
+> **최종 갱신: 2026-06-14 · WO#1–103 · 962 tests · main @a78a65f · 길 B 3/3 · crowd-sim 북극성 첫 완주 · OMC #3·#4**
 
 ---
 
@@ -179,9 +179,9 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 ## 7. OMC 차용 후보 (수렴 분석 — LEAP·Dynamic-Workflows에 이어 3번째 외부 수렴)
 
 OMC(CC-플러그인 오케스트레이터)와 haetae가 또 같은 자리 수렴(병렬+검증루프+영속상태+티어라우팅+스킬주입). haetae에 없거나 약한 4종:
-1. **Disjoint 병렬 burst** — scope disjoint 입증 시 #72 위에 더 공격적 병렬(유닛 내/독립 수정). 단 병렬 npm 경합 등 격리 비용 주의(#89서 실측).
-2. **스킬 3층 멘탈모델** — 실행층/강화층/보장층 분리. haetae의 gate=보장층을 명시 레이어로 개념화 → 조합·재사용 사고 또렷.
-3. **control/data-plane 분리 + artifact descriptor** — 오케스트레이션 메타는 작게, 큰 산출물(trace·transcript·cost-ledger)은 descriptor(path·contentHash·sizeBytes·retention) 참조(작으면 인라인·크면 descriptor+요약). **#55 "sidecar over state pollution"의 일반화.** state.yaml 비대·파싱비용 방지. [가장 실용적]
-4. **스킬 자동 학습(learner)** — 완주 캡스톤(md/snake) 해법을 스킬로 *자동 추출*+주입. #32(seeded·수동)의 자동화. 진짜 새 능력.
+1. **Disjoint 병렬 burst** [후보] — scope disjoint 입증 시 #72 위에 더 공격적 병렬(유닛 내/독립 수정). 단 병렬 npm 경합 등 격리 비용 주의(#89서 실측).
+2. **스킬 3층 멘탈모델** [후보] — 실행층/강화층/보장층 분리. haetae의 gate=보장층을 명시 레이어로 개념화 → 조합·재사용 사고 또렷.
+3. ✅ **control/data-plane + artifact descriptor (WO#102, phase 1)** — ArtifactDescriptor 인프라(path·content_hash·size·kind·retention·summary) + bounded-handoff(8KB). 큰 trace를 data-plane(`<run-dir>/artifacts/`)로, state.yaml은 descriptor 참조. **판정 불변**(오프로드는 직렬화에서만·in-memory full trace 보존·gate.py 무접촉) · state 96%↓(41KB→1.5KB) · back-compat. #55 sidecar 일반화. cost/event/prompt = phase 2(인프라 재사용형).
+4. ✅ **스킬 자동 학습 learner (WO#103)** — 완주 캡스톤서 재사용 *패턴* 후보를 staging(`skills/_candidates/`) 추출 + provenance. **F.1 거버넌스: 자동채택 0**(load_skills가 `_`접두 구조적 제외·사람 `--approve` 전 미편입·미주입) · 빌더-측만(judge 무수신)·**독립 적대 gate가 backstop**(나쁜 학습 스킬도 나쁜 산출 통과 불가 = 자기학습 표류 안전망) · lint(자가채점/바완화/구현덤프 차단)·IP 원본. #32(seeded)의 거버넌스형 자동화.
 
 **차별점 유지**: OMC verifier=같은 시스템 opus 에이전트 체크리스트 / haetae gate=적대·독립 + 검증기 자체 검증(#78~#86 사슬). "정직한 실패" 축 우위는 보존하며 차용.
