@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from haetae.skills import boundary_match
+
 # 대안 생성 지시(IP). replan feedback으로 태운다. **criteria 약화 금지**를 못박는다.
 _ALTERNATIVE_DIRECTIVE = (
     "직전 접근이 독립 gate 판정을 정상 재시도까지 소진하고도 통과하지 못했다.\n"
@@ -187,8 +189,10 @@ def implicated_units(spec: Any, failed_ac_ids: Any) -> set[str] | None:
                 + " "
                 + (str(getattr(chk, "pass_", "") or "") if chk is not None else "")
             ).lower()
-            for u, dtoks in distinctive.items():  # #72 고유 토큰 *부분문자열* 매칭(교착 대응·보수적)
-                if any(t in ctext for t in dtoks):
+            for u, dtoks in distinctive.items():  # #72 고유 토큰 매칭(WO#107 word-boundary — 교착 보존)
+                # WO#107: naive substring → word-boundary(왼쪽 경계·오른쪽 열림). ascii 중간-단어
+                # 과매칭 차단하되 한글 조사 부착("드래그앤드롭"⊂"...으로")·stem은 보존 → 좁은 리셋 정밀↑.
+                if any(boundary_match(t, ctext) for t in dtoks):
                     owners.add(u)
         if not owners:
             return None

@@ -17,6 +17,7 @@ durable하게 인코딩해, 매칭되는 유닛의 work order에 *빌더(executo
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,6 +116,23 @@ def load_skills(skills_dir: str | Path) -> list[Skill]:
     return skills
 
 
+def boundary_match(needle: str, haystack: str) -> bool:
+    """needle이 haystack에서 **왼쪽 word-boundary**(앞이 ascii 영숫자 아님 또는 문자열 시작)에
+    나타나는가 — 오른쪽은 *열림*(stem/prefix·suffix 허용). WO#107.
+
+    naive substring의 ascii 중간-단어 과매칭("ui"가 build/guid/fluid에)을 차단하되:
+      - **stem/prefix 보존**: "sim" → "simulation"·"sim:trace"(오른쪽 열림).
+      - **멀티워드 구**: "behavior trace"·"crowd simulator"는 구 그대로 매칭(공백 포함).
+      - **한글 교착 보존**: 왼쪽 경계는 *ascii 영숫자만* 차단하므로 한글-인접/조사 부착
+        ("드래그앤드롭" ⊂ "드래그앤드롭으로", "X드래그앤드롭")은 그대로 매칭(#97 #72 보존).
+    needle/haystack 모두 소문자 가정. 결정적(정규식)·LLM 아님(의미 매칭은 v2 보류).
+    """
+    if not needle:
+        return False
+    # (?<![a-z0-9]) = 직전 문자가 ascii 영숫자가 아님(=왼쪽 word-boundary; 한글/기호/공백/시작 허용).
+    return re.search(r"(?<![a-z0-9])" + re.escape(needle), haystack) is not None
+
+
 def match_skills(
     skills: list[Skill],
     work_order_text: str,
@@ -126,7 +144,10 @@ def match_skills(
     무매칭 → 빈 리스트. 순서는 입력 skills 순서(=로드 정렬)라 결정적.
     """
     text = (work_order_text or "").lower()
-    matched = [sk for sk in skills if any(trig in text for trig in sk.triggers)]
+    matched = [
+        sk for sk in skills
+        if any(boundary_match(trig, text) for trig in sk.triggers)
+    ]
     return matched[:max_skills] if max_skills >= 0 else matched
 
 
