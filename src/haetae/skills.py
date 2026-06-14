@@ -96,6 +96,11 @@ def load_skills(skills_dir: str | Path) -> list[Skill]:
         if not base.is_dir():
             return []
         for sub in sorted(base.iterdir()):
+            # WO#103 거버넌스(자동채택 0): `_`/`.` 접두 디렉토리는 *비활성 staging*(예: _candidates)
+            # 이거나 숨김 — 활성 레지스트리에서 제외한다. 학습 후보(skills/_candidates/<name>/)는
+            # 사람이 명시 승인(approve)해 *활성 skills/<name>/로 옮겨질 때만* 로드/주입된다.
+            if sub.name.startswith("_") or sub.name.startswith("."):
+                continue
             md = sub / SKILL_FILENAME
             if not md.is_file():
                 continue
