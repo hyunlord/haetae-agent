@@ -133,6 +133,46 @@ def test_skill_does_not_lower_bar():
     assert "자가채점" in body and ("금지" in body or "채점은 게이트 몫" in body)
 
 
+# ════════════════════ WO#114: 밀도 시나리오 커버리지 유도 (#98 확장·#112 교훈) ════════════════════
+# #112 핀포인트: crowd-sim이 *저밀도*(동시 ~12체, overlap onset ~15 바로 아래)서만 돌아 overlap=0이
+# 저밀도 아티팩트였다 → 적대 run-judge가 분리 붕괴를 못 잡음. 시나리오 커버리지 = gate 엄밀성의 상한.
+# 수정: sim/crowd 류 scenario_steps가 현실/스트레스 밀도를 구동하도록 (1) 합성기 프롬프트 + (2) 스킬.
+# **빌더-측 유도만**, *강화*(더 어려운 조건 요구)이지 바 완화 아님 — 비-sim 기준 무영향.
+
+
+def test_synthesizer_steers_sim_density_coverage():
+    """합성기가 sim/crowd 류 scenario_steps에 *현실/혼잡 밀도* 구동을 유도(저밀도 happy-path 금지)."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "밀도 커버리지" in src
+    assert "저밀도 happy-path 금지" in src
+    assert "혼잡" in src and "큐" in src                  # 큐/경합이 실제 형성될 밀도
+    assert "overlap" in src and ("min_separation" in src or "최소 분리" in src or "최소분리" in src)
+    assert "#112" in src                                  # 근거 명시
+    # 스코프: sim/crowd/agent 류로 한정(전체 기준 강제 아님 — 비-sim 무영향)
+    assert "sim" in src and ("crowd" in src or "navigation" in src or "에이전트" in src)
+
+
+def test_density_steering_is_strict_not_lenient():
+    """밀도 유도는 *강화*(더 어려운 조건)이지 완화 아님 — 판정은 여전히 run-judge(바 불변)."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "완화가 아니라 강화" in src or ("완화" in src and "강화" in src)
+    assert "run-judge가 한다" in src                      # 행동 판정은 여전히 독립 게이트
+    # 비-sim 무영향 명시
+    assert "비-sim" in src or "비-sim 기준엔 무관" in src
+
+
+def test_skill_teaches_density_coverage():
+    """verification-harness 스킬에 '밀도 커버리지' 섹션(혼잡 밀도 구동·밀도-하 overlap/separation 측정)."""
+    skills = {s.name: s for s in load_skills(SKILLS_DIR)}
+    body = skills["verification-harness"].body
+    assert "밀도 커버리지" in body
+    assert "저밀도 happy-path" in body
+    assert "overlap" in body and ("min_separation" in body or "분리" in body)
+    assert "#112" in body
+    # 강화이지 완화 아님 — 판정은 run-judge(자가채점 금지)
+    assert "강화" in body and "run-judge" in body
+
+
 # ════════════════════ WO#88: test·빌드 cmd 위생 유도 ════════════════════
 # #87 핀포인트: vitest 스캐폴드에 Jest 전용 플래그(--runInBand)를 붙여 러너 크래시 → 미수렴.
 

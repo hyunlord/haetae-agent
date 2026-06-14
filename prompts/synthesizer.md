@@ -157,6 +157,17 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
     +위치확인", "doing→done 이동+위치확인", "각 전이 후 컬럼 멤버십 기록"]`.
   - 예 "persistence(reload 후 잔존)": `scenario_steps: ["항목 생성", "reload", "생성한 *그* 항목 존재
     확인 — reload 前 변형/삭제 금지"]`.
+  - **밀도 커버리지(sim/crowd/agent-navigation 류 — #112 교훈)**: 에이전트 군집·충돌회피·navigation·
+    혼잡 흐름을 검증하는 `run` 기준의 `scenario_steps`는 *현실/스트레스 밀도*를 구동하라 — 동시 활성
+    에이전트를 *혼잡 수준*(좁은 통로·체크아웃에 **큐/경합이 실제 형성**되고 에이전트가 서로 근접해
+    overlap이 *날 수 있는* 밀도)으로 올려라. **저밀도 happy-path 금지**(동시 소수만 띄우면 분리 실패가
+    안 드러난다). evidence_fields엔 *그 밀도 하에서의* `overlap_violations`·`min_separation`(또는
+    최소 분리거리)·`stuck`/`deadlock`·완주율을 둬라. 근거(#112): crowd-sim이 *저밀도*(동시 ~12체,
+    overlap onset ~15 바로 아래)서만 돌면 overlap=0이 *저밀도 아티팩트*라 분리 붕괴를 적대 run-judge가
+    못 잡는다 — 시나리오 커버리지가 곧 gate 엄밀성의 상한. 예: `scenario_steps: ["동시 활성 에이전트를
+    혼잡 수준까지 스폰(좁은 통로/체크아웃에 큐 형성)", "그 밀도를 충분한 ticks 유지", "매 tick overlap·
+    최소분리·stuck 측정", "전원 enter→...→exit 완주율 기록"]`. (이는 *완화가 아니라 강화* — 더 어려운
+    조건을 요구할 뿐. 비-sim 기준엔 무관.)
   (`scenario_steps`도 acceptance_criterion 최상위 키 — `check` 안이 아님. *무엇을 구동할지* 유도일
   뿐 통과/실패 판정 완화가 아니다 — 값/행동 판정은 여전히 run-judge가 한다. 바 불변, criteria 파생.)
 
