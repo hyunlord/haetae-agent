@@ -282,6 +282,30 @@ class PlanItem(BaseModel):
     deps: list[str] | None = None
 
 
+class ArtifactDescriptor(BaseModel):
+    """control/data-plane 분리(WO#102, OMC #3): 큰 산출물을 state.yaml에 인라인하지 않고
+    data-plane 파일로 빼고 *참조*만 든다. 내용이 아니라 메타다.
+
+    path:         run-dir 상대 경로(예: artifacts/trace/<id>.json).
+    kind:         산출물 종류(trace/transcript/... — 2차서 cost/event/prompt 동형).
+    content_hash: 무결성 검증용 해시("sha256:..."). reader가 파일-descriptor 드리프트 탐지.
+    size_bytes:   원본 바이트 크기(표시·retention 판단).
+    created:      생성 시각(ISO, 선택 — 결정성 위해 미주입 가능).
+    retention:    보관 정책(keep/expire 등 — 후속 cleanup이 만료 prune, 이번엔 메타만).
+    summary:      인라인 표시용 짧은 다이제스트(파일 미해소 환경서도 *무엇*인지 보이게).
+    재사용 인프라 — reader는 resolve_artifact로 해소(해시 검증)해 *동일 내용*을 받으므로
+    판정/표시 로직 불변. 추가형·비파괴(없으면 인라인 그대로 = back-compat).
+    """
+
+    path: str
+    kind: str
+    content_hash: str
+    size_bytes: int
+    created: str | None = None
+    retention: str = "keep"
+    summary: str = ""
+
+
 class RunEvidence(BaseModel):
     """산출물을 *실행*해 캡처한 동적 행동 증거 (WO#22 — judge-runs-it).
 
@@ -304,6 +328,11 @@ class RunEvidence(BaseModel):
     timed_out: bool = False
     duration_s: float = 0.0
     reason: str | None = None
+    # WO#102: trace가 임계 초과면 *지속 시* data-plane 파일로 빼고 여기에 descriptor만(인라인 trace는 비움).
+    # **판정 불변**: 행동 판정은 캡처 직후 *in-memory full trace*로 수행되고, 오프로드는 _save_state
+    # 직렬화에서만 일어난다(판정 경로 무접촉). reader(대시보드·재개)는 evidence_trace로 해소 —
+    # 인라인 우선, 없으면 descriptor 해소(해시 검증). 추가형·비파괴(없으면 인라인 그대로 = back-compat).
+    trace_artifact: ArtifactDescriptor | None = None
 
 
 class CheckReport(BaseModel):

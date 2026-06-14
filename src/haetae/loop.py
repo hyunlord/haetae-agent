@@ -15,6 +15,7 @@ from typing import Callable, Protocol, runtime_checkable
 import yaml
 
 from haetae import intake, replan as replan_mod, scaffold as scaffold_mod, spec_critic as critic_mod
+from haetae.artifacts import offload_state_artifacts
 from haetae.capability import PocRunner, governed_capability_preflight
 from haetae.deps import Runner as DepsRunner, ensure_deps
 from haetae.executors import Tier, tier_label
@@ -431,12 +432,16 @@ def _exec_and_gate(
 
 
 def _save_state(state: State, state_path: str | Path) -> None:
+    # WO#102: control/data-plane 분리 — 큰 trace는 *직렬화 시* data-plane 파일로 빼고 state.yaml엔
+    # descriptor만 둔다. dump된 dict에만 작동(in-memory state 무변경) → 판정/replan/재개 무영향.
+    # best-effort: 오프로드 실패해도 인라인으로 저장(무회귀 — 부분 오프로드도 valid YAML).
+    dumped = state.model_dump(by_alias=True, mode="json")
+    try:
+        dumped = offload_state_artifacts(dumped, Path(state_path).parent)
+    except Exception:
+        pass  # 데이터-플레인 분리는 best-effort(저장 표현 최적화) — 실패 시 인라인 폴백
     Path(state_path).write_text(
-        yaml.safe_dump(
-            state.model_dump(by_alias=True, mode="json"),
-            allow_unicode=True,
-            sort_keys=False,
-        ),
+        yaml.safe_dump(dumped, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
 

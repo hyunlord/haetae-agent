@@ -62,13 +62,19 @@ def _truncate(text: str | None, cap: int) -> str | None:
 def _run_evidence_view(ev: Any) -> dict[str, Any] | None:
     if ev is None:
         return None
+    # WO#102: trace가 data-plane로 오프로드됐으면(인라인 비고 descriptor 보유) descriptor.summary를
+    # 표시한다(파일 해소 없이 *무엇*인지 보이게 — 크래시 0). 인라인이 있으면 그대로(back-compat).
+    trace = ev.trace or ""
+    desc = getattr(ev, "trace_artifact", None)
+    if not trace and desc is not None:
+        trace = getattr(desc, "summary", "") or ""
     return {
         "booted": ev.booted,
         "exit_code": ev.exit_code,
         "timed_out": ev.timed_out,
         "duration_s": ev.duration_s,
         "reason": ev.reason,
-        "trace": _truncate(ev.trace, _TRACE_CAP),
+        "trace": _truncate(trace, _TRACE_CAP),
         "stderr_tail": _truncate(ev.stderr_tail, _TRACE_CAP),
     }
 
