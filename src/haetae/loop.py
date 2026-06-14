@@ -93,6 +93,7 @@ from haetae.or_node import (
     build_anti_fixation_feedback,
     build_integration_feedback,
     fixation_fail_digest,
+    implicated_units,
     is_fixated,
     summarize_gate_evidence,
 )
@@ -2013,12 +2014,35 @@ def _parallel_loop(
                         outcome="abandoned", evidence=evidence, index=integration_alt))
                     integration_alt += 1
                     fb = build_alternative_feedback(None, evidence, scope="integration")
-                    for item in state.plan:  # 백트래킹: 유닛 pending 리셋 + 다른 접근 seed
+                    # WO#97: OR 통합-대안 리셋 범위를 *연루 유닛(+의존)*으로 좁혀 #91 seeded-done 보존.
+                    #   통합 실패 criteria → 연루 유닛(implicated_units). None(매핑 불가)이면 전체 리셋
+                    #   폴백(기존 동작). 연루 안 된 유닛(특히 seeded-done)은 보존 → #91 reuse 유지 +
+                    #   병렬 머지충돌 재발 방지. bar 불변(리셋 *범위*만 — 리셋된 유닛도 같은 criteria로 재빌드).
+                    failed_ac_ids = {c.ac_id for c in (igr.checks or []) if c.status == "fail"}
+                    imp = implicated_units(spec, failed_ac_ids)
+                    seeded_done = {ev.unit for ev in (reuse_events or [])}
+                    all_ids = {item.unit for item in state.plan}
+                    reset_ids = all_ids if imp is None else {u for u in all_ids if u in imp}
+                    for item in state.plan:  # 백트래킹: *연루* 유닛만 pending 리셋 + 다른 접근 seed
+                        if item.unit not in reset_ids:
+                            continue  # 연루 안 됨(seeded-done 포함) → 보존(부모 criteria 그대로, #91)
                         alt_feedback[item.unit] = fb
                         attempts_of[item.unit] = 0
                         _set_plan_state(state, item.unit, PlanState.pending)
                     record_transition(STAGE_OR_ALTERNATIVE, None)
-                    emit(f"OR 통합 대안 재계획 (대안 {integration_alt}/{or_alternatives}) — bar 불변")
+                    if imp is None:
+                        emit(
+                            f"OR 통합 대안 재계획 (대안 {integration_alt}/{or_alternatives}) — "
+                            "연루 판정 불가 → 전체 리셋 폴백 · bar 불변"
+                        )
+                    else:
+                        kept_seed = sorted(seeded_done - reset_ids)
+                        emit(
+                            f"OR 통합 대안 재계획 (대안 {integration_alt}/{or_alternatives}) — "
+                            f"연루 {len(reset_ids)}유닛 리셋, 보존 {len(all_ids) - len(reset_ids)}유닛"
+                            + (f" (seeded-done 보존: {', '.join(kept_seed)})" if kept_seed else "")
+                            + " · #91 reuse 유지 · bar 불변"
+                        )
                     persist()
                     continue  # 다른 접근으로 재라운드
                 # 통합 대안 소진(또는 OR OFF) → escalate. OR>0이면 접근 첨부, 0이면 기존 동작.

@@ -14,6 +14,7 @@ replan/judge/gate의 프롬프트·판정 로직은 건드리지 않는다(독�
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # 대안 생성 지시(IP). replan feedback으로 태운다. **criteria 약화 금지**를 못박는다.
@@ -107,6 +108,114 @@ def build_alternative_feedback(
         lines.append(f"- 실패 증거(독립 gate): {evidence}")
     lines.append(_ALTERNATIVE_DIRECTIVE)
     return "\n".join(lines)
+
+
+# ──────────────── WO#97: 통합-대안 연루 유닛 판정 (리셋 범위 한정 → #91 seeded-done 보존) ────────────────
+#
+# #92서 드러난 #41/#52 ↔ #91 비일관: 통합 gate 실패 시 OR 통합-대안이 *모든 유닛*을 리셋해
+# #91 seeded-done(부모서 검증·보존)까지 날려 reuse를 무위로 + 병렬 머지충돌 재발 → escalate.
+# 해법: 통합 실패가 *연루한* 유닛(+의존)만 리셋하고 나머지(특히 seeded-done)는 보존.
+# **bar 불변**: 이 함수는 리셋 *범위*만 정한다 — criteria/done_when/gate/run-judge와 무관.
+# 순수 함수(LLM/IO 0)·예외 흡수(불확실하면 None=호출부가 전체 리셋 폴백) — 절대 raise 안 함.
+
+# feature 토큰: ascii 낱말(≥3) 또는 한글 런(≥2). df==1(한 feature 유닛에만)인 토큰만 distinctive.
+_FEATURE_TOKEN_RE = re.compile(r"[a-z][a-z0-9]{2,}|[가-힣]{2,}")
+# 하니스(트레이스) 유닛 키워드 — owner 후보서 제외(모든 feature 토큰을 머금어 매칭이 광범위해짐).
+# 하니스는 feature 유닛의 *dependent*이므로 연루 시 전이 dependents로 자연히 리셋된다.
+_HARNESS_KEYWORDS = ("sim:trace", "sim-trace", "simtrace", "trace", "headless", "트레이스", "헤드리스")
+
+
+def _feature_tokens(text: str | None) -> set[str]:
+    return set(_FEATURE_TOKEN_RE.findall((text or "").lower()))
+
+
+def _is_harness_unit(desc: str | None) -> bool:
+    low = (desc or "").lower()
+    return any(k in low for k in _HARNESS_KEYWORDS)
+
+
+def implicated_units(spec: Any, failed_ac_ids: Any) -> set[str] | None:
+    """통합 실패 criteria가 *연루한* 유닛(+ 전이 dependents) 집합. None=매핑 불가(전체 리셋 폴백).
+
+    연루 판정(WO#97):
+      - **#26**: 실패 criterion의 `unit`이 실제 decomposition 유닛이면 그 유닛(직접 소유).
+      - **#72**: `unit`이 integration/None이면, criterion 텍스트(desc/pass)가 *비-하니스 feature
+        유닛*의 **distinctive 토큰**(그 유닛 desc/scope에만 있는 토큰)을 포함하면 그 유닛(보수적
+        — 고유 토큰 매칭만, 광범위/모호하면 미매핑).
+      - owners ∪ **전이 dependents**(연루 유닛에 의존하는 유닛 — 재통합 필요).
+    owners가 비면 None → 호출부가 *전체 리셋*으로 graceful 폴백(기존 동작). 보존된 done은
+    부모 criteria byte-그대로(#91·#71) — 이 함수는 리셋 범위만 좁힌다(anti-erosion 무관).
+    """
+    try:
+        units = list(getattr(spec, "decomposition", None) or [])
+        unit_ids = {u.unit for u in units}
+        failed = {str(a) for a in (failed_ac_ids or ())}
+        if not units or not failed:
+            return None
+        crit = {ac.id: ac for ac in (getattr(spec, "acceptance_criteria", None) or [])}
+        # 비-하니스 feature 유닛의 토큰(desc + scope) → df로 distinctive 토큰 추출.
+        feat_tokens = {
+            u.unit: _feature_tokens(getattr(u, "desc", ""))
+            | _feature_tokens(" ".join(getattr(u, "scope", None) or []))
+            for u in units
+            if not _is_harness_unit(getattr(u, "desc", ""))
+        }
+        df: dict[str, int] = {}
+        for toks in feat_tokens.values():
+            for t in toks:
+                df[t] = df.get(t, 0) + 1
+        # distinctive: 그 feature 유닛에만 있는(df==1) 토큰 중 *길이≥4*(의미있는 feature 이름만 —
+        # 짧은 공통어·접미사 오탐 배제). 매칭은 criterion *원문*에 대한 **부분문자열**(한글 교착 —
+        # 조사/어미 부착 "드래그앤드롭으로" ⊃ "드래그앤드롭" — 과 ascii 'localStorage' 모두 대응).
+        distinctive = {
+            u: {t for t in toks if df.get(t) == 1 and len(t) >= 4}
+            for u, toks in feat_tokens.items()
+        }
+
+        owners: set[str] = set()
+        for ac_id in failed:
+            ac = crit.get(ac_id)
+            if ac is None:
+                continue
+            tagged = (getattr(ac, "unit", "") or "").strip()
+            if tagged in unit_ids:  # #26 직접 소유
+                owners.add(tagged)
+                continue
+            chk = getattr(ac, "check", None)
+            ctext = (
+                str(getattr(ac, "desc", "") or "")
+                + " "
+                + (str(getattr(chk, "pass_", "") or "") if chk is not None else "")
+            ).lower()
+            for u, dtoks in distinctive.items():  # #72 고유 토큰 *부분문자열* 매칭(교착 대응·보수적)
+                if any(t in ctext for t in dtoks):
+                    owners.add(u)
+        if not owners:
+            return None
+
+        # 전이 dependents: 연루 유닛에 (전이적으로) 의존하는 유닛도 리셋한다(재통합 필요).
+        deps = {u.unit: set(getattr(u, "deps", None) or []) for u in units}
+        implicated = set(owners)
+        changed = True
+        while changed:
+            changed = False
+            for y in unit_ids:
+                if y in implicated:
+                    continue
+                seen: set[str] = set()
+                stack = list(deps.get(y, ()))
+                while stack:
+                    d = stack.pop()
+                    if d in seen:
+                        continue
+                    seen.add(d)
+                    stack.extend(deps.get(d, ()))
+                if seen & implicated:
+                    implicated.add(y)
+                    changed = True
+        return implicated
+    except Exception:  # noqa: BLE001 — 불확실하면 None(전체 리셋 폴백) — 절대 raise 안 함
+        return None
 
 
 # ──────────────── WO#79: proactive anti-fixation (CRDAL co-regulation) ────────────────
