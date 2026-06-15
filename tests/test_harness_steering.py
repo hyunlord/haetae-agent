@@ -229,6 +229,71 @@ def test_proximity_steering_is_builder_side_only():
     assert "근접(proximity) 강제" not in judge and "min_pair_distance" not in judge
 
 
+# ════════════════════ WO#120: 분리 메트릭 의미 고정 + sustained 밀도 (#118 fix·#119 교훈) ════════════════════
+# #119 핀포인트: OR 재빌드 제약기반 엔진이 행동상 collision-free(overlap/tunnel/teleport/deadlock 0·완주 100%)
+# 였으나 gate fail — 둘 다 빌더 한계가 아니라 계약 결함: (1) 분리 기준 `min_pair >= diameter`인데 min_pair가
+# edge-gap이라 단위 불일치 → 안 겹치는 엔진도 거짓 fail; (2) 엔진이 peak 밀도를 44→5로 metering down해 근접 회피.
+# 수정: (A) 분리 기준을 center-dist >= Σradii ≡ edge-gap >= 0으로 단위 일관 고정(약화 0), (B) sustained_peak_density
+# 요구. **빌더-측 유도만**, *강화/정정*(거짓 음성만 제거, 겹침 엔진 여전히 fail) — 비-sim 무영향.
+
+
+def test_synthesizer_pins_separation_metric_semantics():
+    """(A) 합성기가 분리 기준을 단위 일관(center-dist ≥ Σradii ≡ edge-gap ≥ 0)으로 고정, min_pair≥diameter 혼동 금지."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "분리 기준 의미 고정" in src or "단위 일관" in src
+    # 일관 정의: center-distance ≥ Σradii ≡ edge-gap ≥ 0
+    assert "center-distance" in src and ("r_i + r_j" in src or "Σradii" in src or "반지름 합" in src)
+    assert "edge-gap" in src
+    # 단위 혼동(min_pair ≥ diameter) 금지 명시
+    assert "diameter" in src and ("단위 혼동" in src or "단위 불일치" in src or "단위 섞" in src)
+    # overlap_violations와 같은 정의로 일관
+    assert "overlap_violations" in src
+    assert "#119" in src                                    # 근거 명시
+
+
+def test_separation_metric_fix_is_not_a_weakening():
+    """(A) 약화 아님(검증역전 0): 진짜 겹치는 엔진(edge-gap<0)은 여전히 fail, 거짓 음성만 제거."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "약화 아님" in src or "약화 아니" in src
+    assert "검증역전 0" in src or "거짓 음성만" in src
+    # 겹치는 엔진은 여전히 fail (바 의미 불변)
+    assert "여전히" in src and "fail" in src
+    assert "겹침 금지" in src or "바 의미" in src
+
+
+def test_synthesizer_requires_sustained_density():
+    """(B) 합성기가 sustained_peak_density(지속 측정)를 요구해 밀도 metering down 회피를 차단."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "sustained_peak_density" in src
+    assert "sustained 밀도" in src or "지속" in src
+    # bounded 공간이 packing 강제 (흩뜨릴 수 없게)
+    assert "bounded 공간" in src and ("packing" in src or "포화" in src)
+    # metering down 차단 근거
+    assert "metering" in src and "44" in src                # #119 44→5 metering 사례
+    assert "순간" in src and "지속" in src                   # 순간 peak ≠ 지속
+
+
+def test_skill_teaches_metric_semantics_and_sustained():
+    """스킬에 '분리 메트릭 단위 일관 + sustained 밀도' 섹션(#119)."""
+    skills = {s.name: s for s in load_skills(SKILLS_DIR)}
+    body = skills["verification-harness"].body
+    assert "단위 일관" in body
+    assert "center-distance" in body and "edge-gap" in body
+    assert "sustained_peak_density" in body
+    assert "metering" in body
+    assert "#119" in body
+    # 약화 아님 — 겹치는 엔진 여전히 fail
+    assert "여전히 fail" in body or "거짓 음성만" in body
+
+
+def test_metric_and_density_fix_is_builder_side_only():
+    """(A)(B) 모두 빌더-측(synthesizer+skill)만 — 적대 run-judge/judge 프롬프트엔 미주입(분리)."""
+    run_judge = (REPO_ROOT / "prompts" / "run_judge.md").read_text(encoding="utf-8")
+    judge = (REPO_ROOT / "prompts" / "judge.md").read_text(encoding="utf-8")
+    assert "sustained_peak_density" not in run_judge and "분리 기준 의미 고정" not in run_judge
+    assert "sustained_peak_density" not in judge and "분리 기준 의미 고정" not in judge
+
+
 # ════════════════════ WO#88: test·빌드 cmd 위생 유도 ════════════════════
 # #87 핀포인트: vitest 스캐폴드에 Jest 전용 플래그(--runInBand)를 붙여 러너 크래시 → 미수렴.
 

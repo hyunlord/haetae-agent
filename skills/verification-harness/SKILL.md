@@ -91,6 +91,21 @@ min_pair_distance=209 = 충돌 임계의 수십 배 → 에이전트가 *흩어�
   (분산서 overlap 0은 저밀도 아티팩트지 회피가 견고하단 증거가 아니다).
 - 이 역시 **완화가 아니라 강화**(더 어려운 근접 조건). 행동 판정은 여전히 독립 run-judge(자가채점 금지).
 
+### 분리 메트릭 단위 일관 + sustained 밀도 (#119 교훈)
+근접을 제대로 재려면 둘이 더 필요하다 — 둘 다 *강화/정정*이지 약화가 아니다(겹치는 엔진은 여전히 fail).
+
+- **분리 메트릭은 단위 일관되게(거짓 음성 차단).** "겹침 없음"은 **center-distance ≥ (r_i+r_j) = edge-gap ≥ 0**
+  하나의 정의다. `min_pair ≥ diameter`처럼 *edge-gap*을 재면서 임계는 *diameter*(center 단위)로 두는 **단위
+  혼동 금지** — 안 겹치는 엔진도 거짓 fail한다(#119: 제약기반 엔진이 overlap=0·teleport=0·완주 100%로
+  행동상 collision-free였으나 min_pair=0.64 < diameter 17.92로 거짓 fail). 트레이스가 내는 분리 필드는
+  **무엇으로 재는지 이름으로 명시**하라(`min_edge_gap` 또는 `min_center_distance`), `overlap_violations`와
+  *같은 정의*로. 진짜 겹치면(edge-gap<0) 여전히 fail — 거짓 음성만 없앤다.
+- **sustained(지속) 밀도 — 순간 peak ≠ 지속, 밀도 metering으로 회피 금지.** 엔진이 에이전트를 시간적으로
+  흩뿌려 peak 밀도를 낮추면(#119: peak_local_density 44→5로 metering down) 근접 경합을 피해버린다. **bounded
+  공간으로 packing을 강제**(작은 월드/좁은 통로가 흩뜨릴 여지를 안 줌)하고, `sustained_peak_density`(N틱 이상
+  *유지된* 밀도, 순간이 아니라 지속)를 emit해 "밀도가 onset 위로 *지속*"을 보여라. 순간만 높고 평소 흩어지면
+  근접 검증이 아니다.
+
 ## stdout 위생 (가장 흔한 실패 — 하니스가 *돌지만* 미파싱)
 게이트는 트레이스 **stdout을 그대로 `JSON.parse`** 한다. stdout에 JSON 외 *한 글자라도* 섞이면
 (npm 배너·`console.log`·진행 메시지·경고·스택) 파싱 실패 → 하니스가 **exit 0으로 깨끗이 실행돼도**

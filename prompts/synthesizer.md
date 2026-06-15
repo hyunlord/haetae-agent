@@ -178,6 +178,23 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
     밀도가 overlap onset 위가 되게", "병목에서 근접 경합을 충분한 ticks 유지", "매 tick min_pair_distance·
     peak_local_density·근접 하 overlap_violations·stuck 측정", "전원 통과 완주율 기록"]`,
     `evidence_fields: [min_pair_distance, peak_local_density, overlap_violations, stuck, completed_agents]`.
+  - **분리 기준 의미 고정 — 단위 일관(#119 교훈, 거짓 음성 차단).** 분리 기준은 *interpenetration(겹침)
+    없음*을 **단위 일관**되게 써라: **두 에이전트의 center-distance ≥ (r_i + r_j)** = **edge-gap ≥ 0**.
+    이는 `overlap_violations`(겹친 쌍)와 *정확히 같은 정의*다. **`min_pair ≥ diameter` 같은 단위 혼동
+    금지** — min_pair를 *edge-gap*(에지간 틈)으로 재면서 임계를 *diameter*(=2r, center 단위)로 두면
+    안 겹치는 엔진도 fail한다(#119: OR 재빌드 제약기반 엔진이 overlap=0·tunnel=0·teleport=0·완주
+    100%로 *행동상 collision-free*였으나 min_pair=0.64<diameter17.92로 거짓 fail). 그러니 evidence_fields의
+    분리 필드는 **무엇으로 재는지 정의를 명시**하라(`min_center_distance` 또는 `min_edge_gap`), 그리고 바도
+    같은 단위로: edge-gap이면 `min_edge_gap ≥ 0`(clearance 마진 원하면 `≥ ε` 명시), center면
+    `min_center_distance ≥ Σradii`. **약화 아님(검증역전 0)**: 진짜 겹치는 엔진(edge-gap < 0)은 *여전히
+    fail*, 안 겹치는 엔진만 통과 — 거짓 음성만 제거할 뿐 바 의미(겹침 금지)는 불변.
+  - **sustained 밀도 요구 — 밀도 metering으로 회피 차단(#119 교훈).** 빌더가 peak 밀도를 *시간적으로
+    낮춰*(에이전트를 띄엄띄엄 흘려보내 순간 peak만 높고 평소엔 흩어짐) 근접을 회피할 수 있다(#119: 제약기반
+    엔진이 peak_local_density 44→5로 metering down). 그러니 **bounded 공간이 packing을 강제**하게 하라 —
+    월드/통로가 에이전트 수 대비 작아 *흩뜨릴 수 없게*(스폰이 dissipation보다 빠르거나 공간이 포화). 그리고
+    evidence_fields에 **`sustained_peak_density`**(N틱 이상 *유지된* 국소 밀도, 순간 peak가 아니라 *지속*)를
+    둬서 계약을 "국소 밀도가 onset 위로 *충분한 ticks 지속*"으로 걸어라(순간만 높고 지속 낮으면 미충족). 이
+    역시 강화 — 더 어려운(지속 근접) 조건일 뿐 바 의미 불변.
   - 예(저밀도): `scenario_steps: ["동시 활성 에이전트를 혼잡 수준까지 스폰(좁은 통로/체크아웃에 큐 형성)",
     "그 밀도를 충분한 ticks 유지", "매 tick overlap·최소분리·stuck 측정", "전원 enter→...→exit 완주율
     기록"]`. (이는 *완화가 아니라 강화* — 더 어려운(근접) 조건을 요구할 뿐. 비-sim 기준엔 무관.)
