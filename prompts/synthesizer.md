@@ -164,10 +164,23 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
     안 드러난다). evidence_fields엔 *그 밀도 하에서의* `overlap_violations`·`min_separation`(또는
     최소 분리거리)·`stuck`/`deadlock`·완주율을 둬라. 근거(#112): crowd-sim이 *저밀도*(동시 ~12체,
     overlap onset ~15 바로 아래)서만 돌면 overlap=0이 *저밀도 아티팩트*라 분리 붕괴를 적대 run-judge가
-    못 잡는다 — 시나리오 커버리지가 곧 gate 엄밀성의 상한. 예: `scenario_steps: ["동시 활성 에이전트를
-    혼잡 수준까지 스폰(좁은 통로/체크아웃에 큐 형성)", "그 밀도를 충분한 ticks 유지", "매 tick overlap·
-    최소분리·stuck 측정", "전원 enter→...→exit 완주율 기록"]`. (이는 *완화가 아니라 강화* — 더 어려운
-    조건을 요구할 뿐. 비-sim 기준엔 무관.)
+    못 잡는다 — 시나리오 커버리지가 곧 gate 엄밀성의 상한.
+  - **근접(proximity) 강제 — 밀도는 *count가 아니라 proximity*다(#116 교훈).** "동시 *수*"만 요구하면
+    빌더가 *대형 월드에 24체를 흩뿌려* min_pair_distance가 크게(분산) 통과시킬 수 있다 — 동시 수는
+    많아도 *국소 밀도가 낮은* 저밀도 아티팩트다(#116: spawned=24·overlap=0이었으나 min_pair_distance=209,
+    충돌 임계의 수십 배 → tight-packing·근접 경합 미검증). 그러니 *수*를 넘어 **근접을 강제**하라:
+    월드/통로를 에이전트 수 대비 **좁게**(작은 월드 / 좁은 통로 / 명시적 chokepoint·병목)로 둬서
+    **peak 국소 밀도가 overlap onset 위**가 되고 **min_pair_distance가 충돌 임계(에이전트 반지름 합)
+    근처**까지 내려가 에이전트들이 *실제로 근접 경합*하게 하라. evidence_fields엔 그 근접을 못 피하게
+    `min_pair_distance`·`peak_local_density`와 **그 근접 하에서의** `overlap_violations`를 둬라
+    (분산으로 회피 못 하도록). 근접 하 overlap 0인지가 stop-not-pass(회피)가 견고하단 *진짜* 시험이다.
+    예: `scenario_steps: ["에이전트 수 대비 *좁은* 월드/통로(또는 chokepoint)에 동시 스폰 — peak 국소
+    밀도가 overlap onset 위가 되게", "병목에서 근접 경합을 충분한 ticks 유지", "매 tick min_pair_distance·
+    peak_local_density·근접 하 overlap_violations·stuck 측정", "전원 통과 완주율 기록"]`,
+    `evidence_fields: [min_pair_distance, peak_local_density, overlap_violations, stuck, completed_agents]`.
+  - 예(저밀도): `scenario_steps: ["동시 활성 에이전트를 혼잡 수준까지 스폰(좁은 통로/체크아웃에 큐 형성)",
+    "그 밀도를 충분한 ticks 유지", "매 tick overlap·최소분리·stuck 측정", "전원 enter→...→exit 완주율
+    기록"]`. (이는 *완화가 아니라 강화* — 더 어려운(근접) 조건을 요구할 뿐. 비-sim 기준엔 무관.)
   (`scenario_steps`도 acceptance_criterion 최상위 키 — `check` 안이 아님. *무엇을 구동할지* 유도일
   뿐 통과/실패 판정 완화가 아니다 — 값/행동 판정은 여전히 run-judge가 한다. 바 불변, criteria 파생.)
 

@@ -173,6 +173,62 @@ def test_skill_teaches_density_coverage():
     assert "강화" in body and "run-judge" in body
 
 
+# ════════════════════ WO#118: 밀도 계약을 근접(proximity)까지 강화 (#114 follow-up·#116 caveat) ════════════════════
+# #116 핀포인트: crowd-sim "견고 완주"가 *분산*이었다 — spawned=24·overlap=0이었으나 min_pair_distance=209
+# (충돌 임계의 수십 배) → 에이전트가 흩어졌을 뿐 tight-packing·근접 경합 미검증. #114가 동시 *수*는 요구했으나
+# *근접(proximity)*은 안 강제 → 빌더가 dispersed large-world로 통과. 밀도는 count가 아니라 proximity.
+# 수정: sim/crowd 류 scenario_steps가 작은 월드/좁은 통로/chokepoint로 tight-packing(peak 국소 밀도 onset 위·
+# min_pair_distance 충돌 임계 근처)을 강제하도록 (1) 합성기 프롬프트 + (2) 스킬. **빌더-측 유도만**, *강화*.
+
+
+def test_synthesizer_steers_proximity_not_just_count():
+    """합성기가 sim/crowd 류 scenario_steps에 *근접(tight-packing)* 강제를 유도(동시 수만으로 회피 못 하게)."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "근접(proximity) 강제" in src or "근접" in src
+    assert "count가 아니라 proximity" in src                # 밀도=proximity 명제
+    # tight-packing 수단: 작은 월드 / 좁은 통로 / chokepoint
+    assert "chokepoint" in src or "좁은 통로" in src or "작은 월드" in src
+    # 근접 메트릭(분산 회피 차단)
+    assert "min_pair_distance" in src and "peak_local_density" in src
+    assert "overlap onset 위" in src or "onset 위" in src   # peak 국소 밀도가 onset 위
+    assert "충돌 임계" in src                                # min_pair가 충돌 임계 근처
+    assert "#116" in src                                    # 근거 명시
+    # 스코프: 여전히 sim/crowd/agent 류 한정(비-sim 무영향)
+    assert "sim" in src and ("crowd" in src or "navigation" in src or "에이전트" in src)
+
+
+def test_proximity_steering_is_strict_not_lenient():
+    """근접 유도도 *강화*(더 어려운 조건)이지 완화 아님 — 판정은 여전히 run-judge(바 불변)·비-sim 무영향."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    # 더 어려운(근접) 조건을 요구할 뿐 — 완화 아님
+    assert "완화가 아니라 강화" in src
+    assert "더 어려운(근접)" in src or ("더 어려운" in src and "근접" in src)
+    assert "run-judge가 한다" in src                        # 행동 판정은 여전히 독립 게이트
+    assert "비-sim 기준엔 무관" in src or "비-sim" in src    # 비-sim 무영향
+
+
+def test_skill_teaches_proximity_not_count():
+    """verification-harness 스킬에 '근접 ≠ count' 섹션(작은 월드/chokepoint로 tight-packing 강제)."""
+    skills = {s.name: s for s in load_skills(SKILLS_DIR)}
+    body = skills["verification-harness"].body
+    assert "근접 ≠ count" in body or "count가 아니라" in body
+    assert "tight-packing" in body
+    assert "chokepoint" in body or "좁은 통로" in body or "작은 월드" in body
+    assert "min_pair_distance" in body and "peak_local_density" in body
+    assert "#116" in body                                   # 근거 명시
+    # 강화이지 완화 아님 — 판정은 run-judge(자가채점 금지)
+    assert "강화" in body and "run-judge" in body
+
+
+def test_proximity_steering_is_builder_side_only():
+    """근접 유도는 빌더-측(synthesizer+skill)만 — 적대 run-judge/judge 프롬프트엔 주입 0(분리)."""
+    run_judge = (REPO_ROOT / "prompts" / "run_judge.md").read_text(encoding="utf-8")
+    judge = (REPO_ROOT / "prompts" / "judge.md").read_text(encoding="utf-8")
+    # 근접 강제 어휘는 빌더-측 유도 전용 — 적대 게이트 프롬프트엔 새 근접 계약이 주입되지 않는다.
+    assert "근접(proximity) 강제" not in run_judge and "min_pair_distance" not in run_judge
+    assert "근접(proximity) 강제" not in judge and "min_pair_distance" not in judge
+
+
 # ════════════════════ WO#88: test·빌드 cmd 위생 유도 ════════════════════
 # #87 핀포인트: vitest 스캐폴드에 Jest 전용 플래그(--runInBand)를 붙여 러너 크래시 → 미수렴.
 

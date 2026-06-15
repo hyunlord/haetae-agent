@@ -75,6 +75,22 @@ overlap=0으로 통과했으나 ~15체 넘으면 겹침 폭증). 그 0은 *저�
 - **이건 바 완화가 아니라 강화** — 더 어려운(현실적) 조건을 구동할 뿐. 행동 판정은 여전히 독립
   run-judge가 한다(자가채점 금지). 시나리오가 어려운 조건을 구동해야 적대 게이트가 그 실패를 잡는다.
 
+### 근접 ≠ count (#116 교훈 — 밀도는 동시 *수*가 아니라 *proximity*다)
+밀도는 **count가 아니라 proximity**다. *대형 월드에 에이전트를 흩뿌리면* 동시 24체여도
+min_pair_distance가 커(분산) 국소 밀도가 낮은 **저밀도 아티팩트**가 된다 — 동시 수만 채우고 근접
+경합은 없는 가짜 밀도다. (#116: crowd-sim이 spawned=24·overlap=0으로 "견고 완주"했으나
+min_pair_distance=209 = 충돌 임계의 수십 배 → 에이전트가 *흩어져* 있었을 뿐 tight-packing·근접
+경합은 미검증. stop-not-pass 회피가 *근접서도* collision-free인지 안 드러남.)
+
+- **작은 월드 / 좁은 통로 / chokepoint로 tight-packing을 강제하라.** 월드·통로를 에이전트 수 대비
+  *좁게* 둬서 **peak 국소 밀도(`peak_local_density`)가 overlap onset 위**가 되고
+  **`min_pair_distance`가 충돌 임계(에이전트 반지름 합) 근처**까지 내려가게 — 그래야 에이전트가
+  *실제로 근접 경합*한다. 큰 월드에 적게 흩뿌려 min_pair가 크면 시나리오 결함이다.
+- evidence_fields에 `min_pair_distance`·`peak_local_density`와 **그 근접 하에서의**
+  `overlap_violations`를 둬라 — 분산으로 회피 못 하게. **근접 경합서 overlap 0인지가 진짜 시험**이다
+  (분산서 overlap 0은 저밀도 아티팩트지 회피가 견고하단 증거가 아니다).
+- 이 역시 **완화가 아니라 강화**(더 어려운 근접 조건). 행동 판정은 여전히 독립 run-judge(자가채점 금지).
+
 ## stdout 위생 (가장 흔한 실패 — 하니스가 *돌지만* 미파싱)
 게이트는 트레이스 **stdout을 그대로 `JSON.parse`** 한다. stdout에 JSON 외 *한 글자라도* 섞이면
 (npm 배너·`console.log`·진행 메시지·경고·스택) 파싱 실패 → 하니스가 **exit 0으로 깨끗이 실행돼도**
