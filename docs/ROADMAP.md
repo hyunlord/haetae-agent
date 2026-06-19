@@ -176,6 +176,13 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - **정직 caveat**: 통과 트레이스 min_pair_distance=209(대형 월드·24체 *분산*) = tight-packing 아님 → "중밀도 분산 견고"지 #112-onset 근접 밀도는 미정복. stop-not-pass 교착 리스크도 분산이라 미검증.
 - **검증역전 0**: 실 빌드 96%(build 8.65M + OR 재빌드 10.04M=정직-실패 비용).
 
+### tight-density v2 — #120 계약 검증 + OR-재빌드 의미충돌 (WO#121 RUN)
+#120(정정 메트릭 + sustained 밀도)으로 tight-density 재실행 → **#120 결정적 검증** + crowd-sim verdict는 *새 머지 실패모드*로 미도달(충돌회피 실패 아님; escalated, 34.6M/40M·codex gpt-5.5).
+- **#120(B) 게임불가 입증**: attempt-0서 sustained_peak_density 1433·active_avg 168.6·proximity_ticks 1465 → #119의 밀도 metering-down(44→5) 회피 불가. bounded 공간이 sustained packing 강제.
+- **#120(A) 메트릭 일관 + 검증역전 0**: min_edge_gap=-0.48(<0)=진짜 겹침이 overlap_violations 18.4M·min_center 0과 일관 → 실제 겹치는 엔진 *정확히 fail*(#119의 0.64 거짓음성≠진짜 음수). 검증 기계 밀도-엄밀성 증명.
+- **근접 verdict 미도달**: OR 재빌드가 u1을 예약/슬롯 흐름모델(구조적 collision-free, 유망)로 전환했으나 u1↔머지된 u2(layout) *의미/빌드 충돌*(conflict_files=[] 빈 목록 3회·tier medium→high→xhigh)로 escalate → u3(충돌 코어) 재빌드 안 됨 → 예약 엔진의 sustained 근접 행동 미검증.
+- crowd-sim 캘리브레이션: 저밀도→중밀도까지 종결, **근접은 머지 모드 수정 후 재실행 필요**(충돌회피 자체는 아직 미판정).
+
 ### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
 **길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).
 - **#97 OR 통합-대안 연루-유닛 한정 리셋**: #41/#52 OR가 seeded-done 포함 전체 리셋하던 #92 비일관 수정 — 연루 유닛만 리셋, #91 seeded-done 보존(reuse 유지·머지충돌 재발 방지). 실패 기준→소유 유닛 매핑(#26/#72), 폴백 전체 리셋.
