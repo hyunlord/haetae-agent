@@ -235,3 +235,69 @@ def test_harness_units_pure_no_mutation():
     before = spec.model_dump()
     harness_units(spec)
     assert spec.model_dump() == before
+
+
+# ════════════════════ 5. WO#128 — dep-인식 계약 배치(토대 스캐폴드 오부착 방지) ════════════════════
+
+
+def test_foundation_scaffold_excluded_when_producer_exists():
+    """WO#128: deps=[] 스캐폴드가 (합성기 오태깅으로) 증거를 소유해도, *비-토대 생산자*가 따로
+    있으면 제외 — 무거운 trace 계약은 생산자에 배치(#126 토대유닛 5-dispatch 낭비 제거)."""
+    spec = _spec(
+        [{"id": "ac1", "desc": "엔진 trace", "unit": "u0",  # 합성기가 토대 스캐폴드 u0에 (오)태깅
+          "check": {"type": "run", "cmd": "npm run --silent trace:engine"},
+          "evidence_fields": ["clear_reached", "coin_count"]}],
+        [
+            {"unit": "u0", "desc": "브라우저 Canvas 게임 스캐폴드", "deps": []},   # deps=[] 토대 스캐폴드
+            {"unit": "u1", "desc": "플레이어 물리 엔진 구현", "deps": ["u0"]},      # 엔진(생산자)
+            {"unit": "u5", "desc": "헤드리스 엔진 trace 하니스", "deps": ["u1"]},   # 트레이스 생산자
+        ],
+    )
+    h = harness_units(spec)
+    assert "u0" not in h           # 토대 스캐폴드 제외(계약 미부착 → 토대유닛 dispatch 낭비 0)
+    assert "u5" in h               # 트레이스 생산자엔 부착
+    out = extract_evidence_contracts(spec)
+    by = {u.unit: u.evidence_contract for u in out.decomposition}
+    assert by["u0"] == []          # 토대 스캐폴드 무계약(#126 낭비 제거)
+    assert by["u5"] == ["clear_reached", "coin_count"]  # 계약이 생산자에 배치
+
+
+def test_sole_foundation_scaffold_owner_preserved():
+    """WO#128: 토대 스캐폴드가 *유일* 후보면 유지(깊이 손실 방지 — #99 단독 소유 보존)."""
+    spec = _spec(
+        [{"id": "ac1", "desc": "trace", "unit": "u0",
+          "check": {"type": "run", "cmd": "node t.js"},
+          "evidence_fields": ["wall_crossings"]}],
+        [{"unit": "u0", "desc": "trace 스크립트 스캐폴드", "deps": []}],  # 유일 후보(생산자 없음)
+    )
+    assert harness_units(spec) == {"u0"}  # 생산자 없음 → 유지(계약 손실 방지)
+
+
+def test_producer_with_deps_not_treated_as_foundation():
+    """WO#128: deps가 있으면(다운스트림 import) desc에 'scaffold'가 있어도 토대 아님 → 후보 유지."""
+    spec = _spec(
+        [{"id": "ac1", "desc": "trace", "unit": "u2",
+          "check": {"type": "run", "cmd": "node t.js"},
+          "evidence_fields": ["x_count"]}],
+        [
+            {"unit": "u0", "desc": "엔진 로직", "deps": []},
+            {"unit": "u2", "desc": "엔진 위에 trace 하니스 scaffold 구축", "deps": ["u0"]},  # deps 있음
+        ],
+    )
+    assert "u2" in harness_units(spec)  # deps>0 → 토대 아님 → 유지(진짜 생산자)
+
+
+def test_dep_aware_placement_pure_no_mutation():
+    """WO#128: 토대 제외 로직도 순수 — harness_units는 spec을 안 바꾼다."""
+    spec = _spec(
+        [{"id": "ac1", "desc": "엔진 trace", "unit": "u0",
+          "check": {"type": "run", "cmd": "node t.js"},
+          "evidence_fields": ["clear_reached"]}],
+        [
+            {"unit": "u0", "desc": "게임 스캐폴드", "deps": []},
+            {"unit": "u1", "desc": "헤드리스 trace 하니스", "deps": ["u0"]},
+        ],
+    )
+    before = spec.model_dump()
+    harness_units(spec)
+    assert spec.model_dump() == before  # 순수(무변경)

@@ -602,7 +602,7 @@ def _is_trace_harness_unit(desc: str | None) -> bool:
 # 시사하는 마커만(바 "준비/구현"처럼 진짜 하니스를 만드는 표현은 제외 — bare "준비"는 마커 아님).
 _PREP_SCAFFOLD_MARKERS = (
     "이름 준비", "이름/구조", "이름·구조", "이름 및 구조", "스크립트 이름", "이름만", "구조만",
-    "네이밍", "준비만", "뼈대", "스텁", "골격",
+    "네이밍", "준비만", "뼈대", "스텁", "골격", "스캐폴드", "스캐폴딩",  # WO#128: 한국어 scaffold 보강(영어 scaffold와 짝)
     "scaffold", "scaffolding", "naming", "stub", "placeholder", "skeleton", "boilerplate",
 )
 
@@ -630,25 +630,52 @@ def _unit_owns_structured_evidence(spec: ProjectSpec, unit: str | None) -> bool:
     return False
 
 
+def _is_foundation_scaffold(unit) -> bool:
+    """WO#128: deps=[] 토대 스캐폴드 유닛인가 — 무거운 trace 증거계약의 *대상이 아님*.
+
+    #126서 엔진-trace 계약이 deps=[] 스캐폴드 u0에 (오)부착돼 엔진(다운스트림)이 아직 없어 충족 불가
+    → 토대유닛 5-dispatch(medium→high→xhigh) 낭비 후 OR 흡수. 좁은 판정: deps 비어있음(토대 —
+    다운스트림 산물 미생산) **그리고** desc가 스캐폴드 마커. 의존이 있으면(다운스트림을 엮음) 토대가
+    아니다 → 제외 대상 아님(deps>0 하니스는 트레이스 대상을 import하는 진짜 생산자일 수 있음).
+    """
+    if unit.deps:  # 의존 있음 → 토대 아님(다운스트림 산물을 엮는 진짜 하니스일 수 있음)
+        return False
+    return _is_prep_scaffold_unit(unit.desc)
+
+
 def harness_units(spec: ProjectSpec) -> set[str]:
-    """검증 하니스(=evidence-contract 부착 + #82-B self-check 대상) 유닛 집합. 순수 함수. WO#99.
+    """검증 하니스(=evidence-contract 부착 + #82-B self-check 대상) 유닛 집합. 순수 함수. WO#99·#128.
 
     **주 게이트 = 트레이스를 *실제로 생산*하는가**(키워드는 보조). 분류 규칙(유닛이 하니스이려면):
       (PRIMARY) 그 유닛에 태그된 기준이 evidence_fields/scenario_steps를 들고 있다(증거-생산 확정), 또는
       (SECONDARY) 트레이스 키워드 매칭 *그리고* 준비/스캐폴드/네이밍 유닛이 *아님*.
     #87/#89 과매칭(준비 유닛이 "trace" 언급만으로 하니스 오탐 → 계약 못 채워 거짓 fail) 제거.
     진짜 하니스(run/sim:trace + evidence_fields)는 PRIMARY 또는 SECONDARY로 *여전히* 잡힌다(깊이 유지).
+
+    **WO#128 (dep-인식 배치)**: 무거운 trace 계약은 *traced 대상을 생산하는* 유닛에 둔다. deps=[] 토대
+    스캐폴드가 (합성기 오태깅 등으로) 후보에 들어도 — *비-토대 생산자 후보가 따로 있으면* — 토대
+    스캐폴드는 제외한다(계약을 생산자에 배치 → #126 토대유닛 dispatch 낭비 제거). 생산자가 없으면
+    (토대가 *유일* 후보) 기존대로 유지한다(깊이 손실 방지 — #99 단독 소유 보존). 식별: 토대 =
+    deps 비어있음 + 스캐폴드 마커; 생산자 = 그 외 후보(트레이스 키워드/증거를 든 비-토대 유닛).
     """
-    out: set[str] = set()
+    candidates: set[str] = set()
     for u in spec.decomposition:
         # PRIMARY: 구조화 증거를 부착한 기준을 소유 → 증거-생산 확정(준비어 표현이어도 하니스).
         if _unit_owns_structured_evidence(spec, u.unit):
-            out.add(u.unit)
+            candidates.add(u.unit)
             continue
         # SECONDARY: 키워드 매칭하되 준비/스캐폴드/네이밍 유닛은 제외(비-생산 → 오탐 차단).
         if _is_trace_harness_unit(u.desc) and not _is_prep_scaffold_unit(u.desc):
-            out.add(u.unit)
-    return out
+            candidates.add(u.unit)
+    # WO#128: deps=[] 토대 스캐폴드를 *비-토대 생산자가 따로 있을 때만* 제외(계약을 생산자에 배치).
+    foundations = {
+        u.unit for u in spec.decomposition
+        if u.unit in candidates and _is_foundation_scaffold(u)
+    }
+    producers = candidates - foundations
+    if foundations and producers:
+        return producers  # 생산자 존재 → 토대 스캐폴드 제외(무거운 trace 계약은 생산자에)
+    return candidates      # 생산자 없음(토대 유일) → 유지(깊이 손실 방지)
 
 
 def extract_required_evidence_fields(spec: ProjectSpec) -> list[str]:

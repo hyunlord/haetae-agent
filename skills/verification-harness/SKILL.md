@@ -24,6 +24,21 @@ triggers: [trace, 트레이스, headless, 헤드리스, e2e, harness, 하니스,
 - 브라우저 API가 *정말* 필요하면(DOM 이벤트·layout rect 등) **JSDOM**으로 가볍게 흉내 내라 —
   실브라우저를 띄우지 마라. canvas 렌더는 검증 대상이 아니라 *로직*이 대상이다(아래).
 
+## server-less 게임플레이 검증 (#126 "플랫포머 onset" — loopback listen 금지)
+게임/플랫포머 등 인터랙티브 앱의 *게임플레이 행동*도 **서버 없이** 검증한다 — 행동 권위는
+**in-sandbox engine-trace**(node 헤드리스로 엔진/규칙 import, 전체 행동 증거 emit). 샌드박스는
+**loopback listen(`127.0.0.1`)을 `EPERM`으로 차단**하므로 *서버를 띄우는 순간 게이트서 실패*한다.
+- **`127.0.0.1`/localhost 서버 호스팅 금지** — `vite --host`·dev/preview 서버·headless-Chrome-on-localhost·
+  CDP-to-local-server 전부 금지(loopback listen = 샌드박스 EPERM). 캡스톤 #126: 플랫포머 `trace:browser-render`가
+  127.0.0.1 vite 서버를 띄우려다 EPERM으로 통합 실패 — engine-trace는 동일 행동 증거를 서버 없이 이미 냈다.
+- **engine-trace가 행동 권위**: 이동·점프·중력·충돌·코인 수집·적 처치/피격·라이프·게임오버·클리어를
+  순수 엔진 import로 결정적 trace(서버·브라우저 불요). evidence_fields는 *이 server-less trace*가 낸다.
+- **시각/렌더 확인은 server-less로만**: 정말 DOM/canvas 픽셀이 필요하면 **`file://`·data-URI 로드**(서버 불요)나
+  JSDOM으로. browser-render는 *best-effort 표면*일 뿐 — `run` 행동 기준(통합 게이트가 강제)을 거기 걸지 마라
+  (browser-render가 통합 실패를 유발하면 안 됨).
+- **검증 깊이는 유지**: server-less라고 얕아지는 게 아니다 — engine-trace가 *전체 행동*을 권위로 검증한다
+  (hollow 아님). 서버 기반 브라우저 관측을 *빼는* 게 아니라, 행동 권위를 서버 불요 경로로 *옮기는* 것.
+
 ## 로직-렌더 분리 (UI 앱도 엔진을 node서 trace)
 - 엔진/상태/규칙 로직을 **DOM·canvas·렌더링에서 분리**해 별도 모듈로 둬라 — 그래야 node에서
   렌더 없이 import해 구동할 수 있다.

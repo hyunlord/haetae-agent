@@ -122,6 +122,15 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
     (캡스톤 #83: 브라우저 하니스가 전체 비용 66~89% 태우고 미수렴; node 트레이스는 완주).
   - UI 앱이면 **로직을 렌더링에서 분리**하라 — 엔진/상태/규칙을 DOM·canvas 없이 import해 node서
     trace한다(canvas 픽셀이 아니라 *로직*이 검증 대상). DOM 이벤트/rect가 필요하면 JSDOM으로 가볍게.
+  - **게임/플랫포머 등 — 게임플레이 검증은 *server-less*다(#126 "플랫포머 onset", 안전 강화).** 행동 권위는
+    **in-sandbox engine-trace**(서버 불요·node 헤드리스로 엔진/규칙 import·전체 행동 증거: 이동·점프·중력·
+    충돌·코인 수집·적 처치/피격·라이프·게임오버·클리어). **`127.0.0.1` 등 loopback 서버를 띄우지 마라** —
+    샌드박스가 loopback listen을 `EPERM`으로 차단한다(`vite --host`·dev/preview 서버·headless-Chrome-on-localhost·
+    CDP-to-local-server 회피). 시각/렌더 확인이 필요하면 **`file://`·data-URI 로드**(서버 불요)나 JSDOM으로만,
+    그것도 *best-effort*로 두고 — `run` 행동 기준(=통합 게이트가 강제)은 **engine-trace에 둬라**(browser-render가
+    통합 실패를 유발하면 안 됨). 검증 *깊이*는 유지된다(engine-trace가 전체 행동을 권위로 검증 — hollow 아님).
+    근거(#126): 플랫포머 빌더가 `trace:browser-render`로 127.0.0.1 서버를 띄우려다 EPERM으로 통합 실패 —
+    engine-trace는 동일 행동 증거(점프 아크·코인·스톰프·낙하 데미지·클리어·게임오버)를 *서버 없이* 이미 냈다.
 - **하니스는 stdout에 *오직 단일 유효 JSON 객체(evidence)* 만 출력하라 — stdout 위생이 핵심이다.**
   게이트는 트레이스 stdout을 **그대로 `JSON.parse`** 해 `evidence_fields` 존재를 검사한다. stdout에
   JSON 외 *한 글자라도* 섞이면(npm 배너·`console.log`·진행 메시지·경고) 파싱 실패 → 하니스가
