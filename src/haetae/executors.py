@@ -212,3 +212,12 @@ class CodexExecutor:
             raise CodexExecutorError(str(e)) from e
         self.last_usage = usage  # 읽기만 — sandbox 권한 불변
         return text
+
+
+# WO#137: 로컬-모델 빌더 provider 재노출. local_agent는 executors를 import하지 않으므로
+# (metering/models만 의존) 순환 없음. **빌더 전용** — judge/run-judge/gate/critic 경로에는
+# 절대 끼우지 않는다(LocalAgentExecutor엔 judge용 complete()가 없어 구조적으로도 분리).
+from haetae.providers.local_agent import (  # noqa: E402
+    LocalAgentError,
+    LocalAgentExecutor,
+)

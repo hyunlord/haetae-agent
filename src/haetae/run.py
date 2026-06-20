@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from haetae.executors import CodexExecutor, HumanRelayExecutor, Tier, tier_label
+from haetae.executors import (
+    CodexExecutor,
+    HumanRelayExecutor,
+    LocalAgentExecutor,
+    Tier,
+    tier_label,
+)
 from haetae.providers.launch_options import read_codex_config
 from haetae.gate import CompositeGate
 from haetae.heartbeat import HeartbeatWriter
@@ -639,9 +645,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--executor",
-        choices=["human", "codex"],
+        choices=["human", "codex", "local"],
         default="human",
-        help="실행자 (기본: human=사람 릴레이). codex=자율 쓰기 실행(opt-in)",
+        help=(
+            "실행자 (기본: human=사람 릴레이). codex=자율 쓰기 실행(opt-in). "
+            "local=약한 로컬 모델 빌더(OpenAI 호환 엔드포인트, #136/#137; **빌더 전용**·판정 무접촉)"
+        ),
+    )
+    parser.add_argument(
+        "--local-endpoint",
+        default="http://100.70.109.50:8089/v1",
+        help="--executor local의 OpenAI 호환 베이스 URL (기본: GB10 llama.cpp #136)",
+    )
+    parser.add_argument(
+        "--local-model",
+        default="qwen2.5-coder:7b",
+        help="--executor local의 서빙 모델명 (기본: qwen2.5-coder:7b)",
+    )
+    parser.add_argument(
+        "--local-max-turns",
+        type=int,
+        default=3,
+        help="--executor local 에이전틱 루프 턴 상한 (기본 3; 28 t/s 경제성·#134 단발 선호)",
     )
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
     parser.add_argument(
@@ -943,6 +968,15 @@ def main(argv: list[str] | None = None) -> int:
             idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
             heartbeat=heartbeat, transcript=transcript,
         )
+    elif args.executor == "local":
+        # WO#137: 약한 로컬 모델 빌더(OpenAI 호환 엔드포인트, #136 GB10 llama.cpp).
+        # **빌더 전용** — judge는 위 make_judge_client()(강한 codex), critic은 critic_client
+        # (강한 codex) 경로 그대로다(적대 분리 불변). 로컬 모델은 *판정*에 절대 안 닿는다.
+        executor = LocalAgentExecutor(
+            endpoint=args.local_endpoint, model=args.local_model,
+            workdir=args.workdir, max_turns=args.local_max_turns,
+            heartbeat=heartbeat, transcript=transcript,
+        )
     else:
         executor = HumanRelayExecutor()
 
@@ -964,6 +998,14 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt, tier: CodexExecutor(
                 model=tier.model, workdir=wt, reasoning_effort=tier.reasoning_effort,
                 idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
+                heartbeat=heartbeat, transcript=transcript,
+            )
+        elif args.executor == "local":
+            # WO#137 빌더 전용(1-arg=후방호환). 로컬 엔드포인트는 단일 모델을 서빙하므로
+            # tier model override는 적용 안 한다(설정된 endpoint/model 재사용). 판정 무접촉.
+            executor_factory = lambda wt: LocalAgentExecutor(
+                endpoint=args.local_endpoint, model=args.local_model,
+                workdir=wt, max_turns=args.local_max_turns,
                 heartbeat=heartbeat, transcript=transcript,
             )
         else:
