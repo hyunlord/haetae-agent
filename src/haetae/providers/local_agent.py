@@ -21,11 +21,13 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import py_compile
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -375,15 +377,121 @@ def _py_files(workdir: Path, cap: int = 300) -> list[Path]:
     return files
 
 
-def builder_smoke(workdir: Path, *, timeout: float = 60.0) -> str | None:
-    """빌더-측 구조적 스모크: (1) py_compile 문법 + (2) pytest --collect-only 임포트 검사.
+def _parse_unittest_discovery(cmds: list[str]) -> tuple[str, str] | None:
+    """gate 체크 명령들에 `unittest discover`가 있으면 그 -s(start)·-p(pattern)을 뽑는다(WO#141).
 
-    통과(구조적 자기-정합)면 None, 실패면 *정확한 에러 문자열*(다음 빌더 턴에 그대로 주입).
-    **판정 아님**(정답성/완결성 무평가) — collect-only는 import 가능 여부만 본다. best-effort:
-    pytest 미설치 등 *툴 부재*면 그 단계는 skip(빌드 막지 않음 — 진짜 검증은 gate).
+    예: "python -m unittest discover -s tests -p test_*.py" → ("tests", "test_*.py").
+    -s/-p 없으면 unittest 기본(".", "test*.py"). unittest discover가 없으면 None.
+    """
+    for cmd in cmds:
+        low = cmd.lower()
+        if "unittest" in low and "discover" in low:
+            toks = cmd.split()
+            start, pattern = ".", "test*.py"
+            for i, t in enumerate(toks):
+                nxt = toks[i + 1].strip("'\"") if i + 1 < len(toks) else None
+                if t in ("-s", "--start-directory") and nxt is not None:
+                    start = nxt
+                elif t.startswith("-s") and len(t) > 2:
+                    start = t[2:].strip("'\"")
+                elif t in ("-p", "--pattern") and nxt is not None:
+                    pattern = nxt
+                elif t.startswith("-p") and len(t) > 2:
+                    pattern = t[2:].strip("'\"")
+            return (start, pattern)
+    return None
+
+
+def _smoke_conventions(
+    workdir: Path, check_cmds: list[str] | None
+) -> tuple[bool, tuple[str, str] | None]:
+    """검사할 디스커버리 컨벤션 결정: (pytest collect 할까, unittest discover (start,pattern)|None).
+
+    gate 체크 명령(check_cmds)을 알면 *그 러너를 미러*한다(WO#141 — over-constraint 회피):
+      - unittest discover 명령 → unittest 디스커버리(그 -s/-p). pytest는 항상(브로드 import 안전망).
+      - pytest만 → unittest 강제 안 함(None) — bare-function pytest 테스트 false-fail 방지.
+      - 모름(빈 cmds) → 양쪽(pytest collect + 기본 unittest discover) — gate가 어느 러너든 찾게.
+    pytest collect는 *항상* 켠다: TestCase도 수집해 정상 테스트엔 false-fail 없고, import 에러를
+    브로드하게 잡는다.
+    """
+    cmds = [c for c in (check_cmds or []) if c]
+    blob = " ".join(cmds).lower()
+    has_unittest = "unittest" in blob and "discover" in blob
+    has_pytest = "pytest" in blob
+    if has_unittest:
+        return (True, _parse_unittest_discovery(cmds) or (".", "test*.py"))
+    if has_pytest:
+        return (True, None)  # gate가 pytest만 → unittest findability 강제 안 함
+    start = "tests" if (workdir / "tests").is_dir() else "."  # 모름 → 양쪽
+    return (True, (start, "test*.py"))
+
+
+def _smoke_pytest_collect(workdir: Path, timeout: float) -> str | None:
+    """pytest --collect-only(import/collection 검사). 미설치/타임아웃이면 None(skip). 채점 아님."""
+    rc, out = _smoke_run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"], workdir, timeout
+    )
+    low = out.lower()
+    if rc in (127, 124) or "no module named pytest" in low or "no module named \"pytest\"" in low:
+        return None
+    if rc not in (0, 5):  # 0=수집됨, 5=테스트 없음 → 구조적 OK. 그 외(2=collection error)=실패.
+        return f"[smoke pytest collect 실패] pytest --collect-only (exit {rc}):\n{out.strip()[-2000:]}"
+    return None
+
+
+# unittest 디스커버리를 *발견만* 하는 스니펫: TestLoader.discover().countTestCases()는 테스트를
+# *실행/채점하지 않고* 수집만 한다(#139 단언 유지). 발견 0개(=#140 exit-5형)·로드 에러를 잡는다.
+_UT_DISCOVER_SNIPPET = (
+    "import unittest,sys\n"
+    "ld=unittest.TestLoader()\n"
+    "try:\n"
+    "    s=ld.discover(START, pattern=PAT)\n"
+    "except Exception as e:\n"
+    "    print('DISCOVER_ERROR', repr(e)); sys.exit(3)\n"
+    "errs=getattr(ld,'errors',None) or []\n"
+    "cnt=s.countTestCases()\n"
+    "if errs:\n"
+    "    [print(str(x)[:600]) for x in errs]; sys.exit(2)\n"
+    "print('COUNT', cnt); sys.exit(0 if cnt>0 else 5)\n"
+)
+
+
+def _smoke_unittest_discover(
+    workdir: Path, start_dir: str, pattern: str, timeout: float
+) -> str | None:
+    """gate의 `unittest discover -s START -p PAT` 컨벤션을 *미러*해 테스트 *발견 가능성*만 검사한다.
+
+    `TestLoader.discover().countTestCases()` = *수집만*(실행/채점 아님 — gate 소관·불변). 발견 0개
+    (=#140 exit-5형, gate 러너가 못 찾음)·디스커버리 import 에러를 빌더-측서 미리 잡아 피드백.
+    """
+    snippet = _UT_DISCOVER_SNIPPET.replace("START", repr(start_dir)).replace("PAT", repr(pattern))
+    rc, out = _smoke_run([sys.executable, "-c", snippet], workdir, timeout)
+    if rc in (127, 124):
+        return None  # 인터프리터 부재/타임아웃 → skip
+    if rc == 5:
+        return (
+            f"[smoke unittest 발견 실패] unittest discover -s {start_dir} -p {pattern} → 테스트 0개 "
+            f"발견. gate 러너가 못 찾는다 — 테스트를 {start_dir}/ 아래 {pattern} 파일에 "
+            "unittest.TestCase 하위클래스로 둬라(자유 함수 def test_*()는 unittest가 못 찾음)."
+        )
+    if rc in (2, 3):
+        return f"[smoke unittest 발견 에러] discover(-s {start_dir} -p {pattern}):\n{out.strip()[-1500:]}"
+    return None  # rc 0 = 발견 OK
+
+
+def builder_smoke(
+    workdir: Path, *, check_cmds: list[str] | None = None, timeout: float = 60.0
+) -> str | None:
+    """빌더-측 구조적 스모크 v2(WO#141): (1) py_compile 문법 + (2) *gate 디스커버리 컨벤션 미러*.
+
+    통과(구조적 자기-정합·gate-findable)면 None, 실패면 *정확한 에러*(다음 빌더 턴에 주입).
+    **판정 아님** — 컴파일·import·*디스커버리(findability)* 만(테스트 실행/채점 아님, gate 소관·불변).
+    check_cmds(유닛 gate 체크 명령)를 알면 그 러너(pytest/unittest discover)를 미러해 #140의 exit-5
+    (스모크 통과인데 gate가 테스트를 못 찾던 불일치)를 빌더-측서 잡는다. 모르면 양쪽 디스커버리.
+    best-effort: 툴 부재면 그 단계 skip(빌드 막지 않음 — 진짜 검증은 gate).
     """
     workdir = Path(workdir)
-    # 1) 컴파일/문법 — py_compile은 *실행하지 않고* 파싱/바이트컴파일만 한다(안전).
+    # 1) 컴파일/문법 — py_compile은 *실행하지 않고* 파싱/바이트컴파일만(안전).
     for f in _py_files(workdir):
         try:
             py_compile.compile(str(f), doraise=True)
@@ -391,20 +499,33 @@ def builder_smoke(workdir: Path, *, timeout: float = 60.0) -> str | None:
             rel = os.path.relpath(str(f), str(workdir))
             return f"[smoke 컴파일 실패] {rel}:\n{e}"[:2000]
         except (OSError, ValueError):
-            continue  # 읽기 실패 등은 스모크가 막지 않는다(gate가 본다)
-    # 2) test collect-only — import/collection 에러만(테스트 실행/채점 아님).
-    rc, out = _smoke_run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"], workdir, timeout
-    )
-    low = out.lower()
-    if rc in (127, 124) or "no module named pytest" in low or "no module named \"pytest\"" in low:
-        return None  # pytest 부재/타임아웃 → collect 스모크 skip(best-effort)
-    # pytest exit: 0=수집됨, 5=테스트 없음 → 둘 다 구조적 OK. 그 외(2=collection error 등)=실패.
-    if rc not in (0, 5):
-        tail = out.strip()
-        tail = tail if len(tail) <= 2000 else "…" + tail[-2000:]
-        return f"[smoke test collect 실패] pytest --collect-only (exit {rc}):\n{tail}"
+            continue
+    # 테스트 파일이 없으면 디스커버리 검사 불필요(컴파일만으로 구조적 OK).
+    if not any("test" in f.name for f in _py_files(workdir)):
+        return None
+    # 2) gate 디스커버리 컨벤션 미러(collect/discover — *발견만*, 실행/채점 아님).
+    do_pytest, ut_spec = _smoke_conventions(workdir, check_cmds)
+    if do_pytest:
+        err = _smoke_pytest_collect(workdir, timeout)
+        if err:
+            return err
+    if ut_spec is not None:
+        err = _smoke_unittest_discover(workdir, ut_spec[0], ut_spec[1], timeout)
+        if err:
+            return err
     return None
+
+
+def _call_verify(verify, workdir: Path, check_cmds: list[str]):
+    """verify 콜백 호출(back-compat): check_cmds kwarg를 받으면 넘기고(builder_smoke), 아니면
+    workdir만(테스트 모킹 `lambda wd: ...`). 시그니처로 분기 — 1-arg 콜백 무회귀.
+    """
+    try:
+        if "check_cmds" in inspect.signature(verify).parameters:
+            return verify(workdir, check_cmds=check_cmds)
+    except (ValueError, TypeError):
+        pass
+    return verify(workdir)
 
 
 # ──────────────────────────── LocalAgentExecutor ────────────────────────────
@@ -423,11 +544,12 @@ class LocalAgentExecutor:
                  더 낼 편집이 없으면 조기 종료.
     timeout:     한 번의 모델 호출 타임아웃(초).
     temperature/max_tokens: 생성 파라미터(코드라 낮은 temp 기본).
-    verify:      빌더-측 *구조적 스모크* 콜백 `(workdir: Path) -> str | None`(예: `builder_smoke`
-                 = 컴파일 + pytest --collect-only, WO#139). 편집 적용 후 호출해 에러 문자열을 받으면
-                 *그 정확한 에러를 다음 턴에 주입*해 self-fix시킨다(턴 상한 내 *반복*). 통과(None)면
-                 구조적 자기-정합 달성. None이면 미사용. **판정 아님** — 정답/완결은 독립 적대 gate가
-                 한다(불변). 주입형이라 테스트서 모킹 가능.
+    verify:      빌더-측 *구조적 스모크* 콜백(예: `builder_smoke` = 컴파일 + *gate 디스커버리 컨벤션
+                 미러*(pytest collect / unittest discover findability), WO#139/#141). 편집 적용 후
+                 호출해 에러를 받으면 *그 정확한 에러를 다음 턴에 주입*해 self-fix(턴 상한 내 반복).
+                 통과(None)면 구조적 자기-정합·gate-findable 달성 → *즉시 반환*(속도). None이면 미사용.
+                 **판정 아님** — 정답/완결은 독립 적대 gate가 한다(불변). 주입형이라 테스트서 모킹 가능.
+                 콜백이 `check_cmds` kwarg를 받으면 유닛 gate 체크 명령이 주입된다(1-arg 콜백 back-compat).
     heartbeat/transcript: 라이브 텔레메트리 sink(duck-typed). None이면 off(무회귀).
     """
 
@@ -466,6 +588,8 @@ class LocalAgentExecutor:
         self.last_smoke_error: str | None = None
         self.last_smoke_passed: bool = False
         self.smoke_feedback_count: int = 0
+        # WO#141: 직전 run의 벽시계(초) — 빌드 요약에 표면화(속도 튜닝 가시성).
+        self.last_elapsed_s: float = 0.0
 
     # ── Executor 인터페이스 ────────────────────────────────────────────
     def run(self, order: NextOrder) -> str:
@@ -476,6 +600,8 @@ class LocalAgentExecutor:
         self.last_smoke_error = None
         self.last_smoke_passed = False
         self.smoke_feedback_count = 0
+        self.last_elapsed_s = 0.0
+        _t0 = time.monotonic()
 
         user_msg = _format_order(order)
         ctx = workdir_context(self.workdir, order)
@@ -506,11 +632,12 @@ class LocalAgentExecutor:
             self.last_applied = list(applied_all)
             done = is_done(text)
 
-            # 빌더-측 스모크(WO#139): 편집 적용 후 *구조적 자기검사*(컴파일+test collect). 실패하면
-            # 정확한 에러를 다음 턴에 주입해 self-fix(*턴 상한 내 반복* — #137의 1회 한정이 아님).
-            # 통과면 구조적 자기-정합 달성. 정답/완결 판정은 이후 독립 적대 gate가 한다(불변).
+            # 빌더-측 스모크(WO#139/#141): 편집 적용 후 *구조적 자기검사*(컴파일 + gate 디스커버리
+            # 컨벤션 미러). 실패하면 정확한 에러를 다음 턴에 주입해 self-fix(턴 상한 내 반복).
+            # 통과(구조적 자기-정합·gate-findable)면 *즉시 반환*(WO#141 속도: 불필요 턴 0).
+            # 정답/완결 판정은 이후 독립 적대 gate가 한다(불변).
             if self.verify is not None and applied:
-                err = self._safe_verify()
+                err = self._safe_verify(order)
                 if err:
                     self.last_smoke_error = err
                     self.smoke_feedback_count += 1
@@ -519,7 +646,7 @@ class LocalAgentExecutor:
                         messages.append({
                             "role": "user",
                             "content": (
-                                "빌더 스모크(컴파일/test collect) 실패. 아래 *정확한 에러*를 보고 같은 "
+                                "빌더 스모크(컴파일/디스커버리) 실패. 아래 *정확한 에러*를 보고 같은 "
                                 f"편집 프로토콜(path= 펜스 블록)로 고쳐라(파일 전체 재출력):\n{err}\n"
                                 f"고친 뒤 {DONE_MARKER}."
                             ),
@@ -527,7 +654,9 @@ class LocalAgentExecutor:
                         continue
                     # 턴 소진 — 스모크 미통과인 채 반환(이후 독립 gate가 판정).
                     break
+                # 구조적 통과 → *즉시 반환*(불필요 턴 0; gate가 정답성 판정).
                 self.last_smoke_passed = True
+                break
 
             if done or not edits:
                 break
@@ -540,6 +669,7 @@ class LocalAgentExecutor:
                     "content": f"계속. 남은 파일이 있으면 같은 프로토콜로 내고, 끝났으면 {DONE_MARKER}만 출력하라.",
                 })
 
+        self.last_elapsed_s = time.monotonic() - _t0
         if not applied_all:
             raise LocalAgentError(
                 "로컬 빌더가 적용 가능한 편집을 내지 못함(경로-태깅 펜스 블록 0건)", last_text
@@ -572,12 +702,17 @@ class LocalAgentExecutor:
         else:
             self.last_usage = Usage(input_tokens=agg_in, output_tokens=agg_out, model=self.model)
 
-    def _safe_verify(self) -> str | None:
-        """verify 콜백을 best-effort로 부른다(예외는 흡수 — 검증 실패가 빌드를 죽이지 않는다)."""
+    def _safe_verify(self, order: NextOrder | None = None) -> str | None:
+        """verify(빌더 스모크) 콜백을 best-effort로 부른다(예외는 흡수 — 검증 실패가 빌드를 안 죽임).
+
+        유닛 gate 체크 명령(order.local_checks)을 check_cmds로 넘겨 스모크가 *gate 디스커버리
+        컨벤션*을 미러하게 한다(WO#141). _call_verify가 1-arg 콜백(테스트 모킹)엔 back-compat.
+        """
         if self.verify is None:
             return None
+        cmds = [c.cmd for c in order.local_checks if c.cmd] if order is not None else []
         try:
-            return self.verify(self.workdir)
+            return _call_verify(self.verify, self.workdir, cmds)
         except Exception:  # noqa: BLE001 — 주입 체크의 크래시가 빌더를 죽이지 않는다
             return None
 
@@ -594,7 +729,7 @@ class LocalAgentExecutor:
             smoke = "스모크 off"
         return (
             f"로컬 빌더({self.model}) 완료 — 적용 파일 {len(applied)}개: {files}\n"
-            f"턴 {self.last_turns}/{self.max_turns} · {smoke}\n"
+            f"턴 {self.last_turns}/{self.max_turns} · {smoke} · {self.last_elapsed_s:.0f}s\n"
             f"--- 모델 최종 메시지(tail) ---\n{tail}"
         )
 

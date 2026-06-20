@@ -404,11 +404,11 @@ def test_builder_smoke_collect_catches_import_error(tmp_path):
 
 
 def test_builder_smoke_collect_only_does_not_run_or_score(tmp_path):
-    """적대 분리: collect-only는 *import 가능 여부*만 본다 — 실패하는 테스트도 *실행/채점 안 함*."""
+    """적대 분리: collect/discover는 *findability*만 — 실행하면 FAIL할 테스트도 *실행/채점 안 함*."""
     (tmp_path / "tests").mkdir()
-    # import은 되지만 실행하면 FAIL할 테스트 → collect는 성공(None), 채점 안 함
     (tmp_path / "tests" / "test_x.py").write_text("def test_would_fail():\n    assert False\n")
-    assert la.builder_smoke(tmp_path) is None
+    # gate가 pytest면 bare-fn도 findable → collect 통과(채점 아님; would-fail이어도 None)
+    assert la.builder_smoke(tmp_path, check_cmds=["python -m pytest tests/test_x.py"]) is None
 
 
 def test_builder_smoke_skips_when_pytest_absent(tmp_path, monkeypatch):
@@ -419,12 +419,15 @@ def test_builder_smoke_skips_when_pytest_absent(tmp_path, monkeypatch):
 
 
 def test_builder_smoke_collect_error_via_seam(tmp_path, monkeypatch):
-    (tmp_path / "m.py").write_text("y = 2\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_m.py").write_text(
+        "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n"
+    )
     monkeypatch.setattr(
         la, "_smoke_run",
         lambda cmd, cwd, timeout: (2, "ImportError: cannot import name 'winner' from 'rules'"),
     )
-    err = la.builder_smoke(tmp_path)
+    err = la.builder_smoke(tmp_path, check_cmds=["python -m pytest tests/"])
     assert err is not None and "exit 2" in err and "winner" in err
 
 
@@ -493,6 +496,108 @@ def test_smoke_is_builder_side_not_judge():
     assert "py_compile" in src and "--collect-only" in src
     for forbidden in ("haetae.judge", "haetae.gate", "GateResult", "run_judge"):
         assert forbidden not in src, f"local_agent이 {forbidden} 참조(분리 위반)"
+
+
+# ──────────────────── 스모크 v2: gate-discovery 정렬 + 속도 (WO#141) ────────────────────
+
+
+def test_parse_unittest_discovery():
+    assert la._parse_unittest_discovery(["python -m unittest discover -s tests -p test_*.py"]) == ("tests", "test_*.py")
+    assert la._parse_unittest_discovery(["python -m unittest discover"]) == (".", "test*.py")
+    assert la._parse_unittest_discovery(["python -m pytest tests/"]) is None
+
+
+def test_smoke_conventions_mirror_gate_runner(tmp_path):
+    (tmp_path / "tests").mkdir()
+    # pytest-only gate → unittest 강제 안 함(over-constraint 회피)
+    assert la._smoke_conventions(tmp_path, ["python -m pytest tests/test_x.py"]) == (True, None)
+    # unittest gate → unittest 디스커버리 미러
+    assert la._smoke_conventions(tmp_path, ["python -m unittest discover -s tests -p test_*.py"]) == (True, ("tests", "test_*.py"))
+    # 모름 → 양쪽(tests/ 있으면 거기)
+    assert la._smoke_conventions(tmp_path, []) == (True, ("tests", "test*.py"))
+
+
+def _write_pkg_with_test(tmp_path, test_body):
+    (tmp_path / "rules.py").write_text("def winner(b):\n    return None\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_rules.py").write_text(test_body)
+
+
+def test_smoke_unittest_gate_catches_unfindable_test(tmp_path):
+    """#140 exit-5 fix: gate가 unittest면, pytest는 수집해도 unittest가 못 찾는 bare-fn 테스트를 잡는다."""
+    _write_pkg_with_test(tmp_path, "from rules import winner\n\ndef test_w():\n    assert winner([]) is None\n")
+    err = la.builder_smoke(tmp_path, check_cmds=["python -m unittest discover -s tests -p test_*.py"])
+    assert err is not None and "unittest 발견 실패" in err
+
+
+def test_smoke_pytest_gate_no_unittest_overconstraint(tmp_path):
+    """gate가 pytest면 bare-fn 테스트도 통과(unittest findability 강제 안 함)."""
+    _write_pkg_with_test(tmp_path, "from rules import winner\n\ndef test_w():\n    assert winner([]) is None\n")
+    assert la.builder_smoke(tmp_path, check_cmds=["python -m pytest tests/test_rules.py"]) is None
+
+
+def test_smoke_unittest_testcase_passes_and_not_scored(tmp_path):
+    """적대 분리 유지: 디스커버리는 *발견만* — 실행하면 FAIL할 TestCase도 통과(채점 아님)."""
+    _write_pkg_with_test(
+        tmp_path,
+        "import unittest\nclass T(unittest.TestCase):\n    def test_fails(self):\n        self.assertTrue(False)\n",
+    )
+    assert la.builder_smoke(tmp_path, check_cmds=["python -m unittest discover -s tests"]) is None
+
+
+def test_smoke_unknown_cmds_checks_both(tmp_path):
+    """check_cmds 모르면 양쪽 디스커버리 — bare-fn 테스트는 unittest 기본 디스커버리가 잡는다."""
+    _write_pkg_with_test(tmp_path, "from rules import winner\n\ndef test_w():\n    assert winner([]) is None\n")
+    err = la.builder_smoke(tmp_path)  # check_cmds 없음 → 양쪽
+    assert err is not None and "unittest 발견 실패" in err
+
+
+def test_call_verify_passes_check_cmds_or_falls_back():
+    rec = {}
+    def smoke_like(workdir, check_cmds=None):
+        rec["cmds"] = check_cmds
+        return None
+    la._call_verify(smoke_like, "/tmp/x", ["unit cmd"])
+    assert rec["cmds"] == ["unit cmd"]
+    # 1-arg 콜백(테스트 모킹)엔 workdir만 — back-compat
+    assert la._call_verify(lambda wd: "ERR", "/tmp/x", ["ignored"]) == "ERR"
+
+
+def test_executor_passes_unit_check_cmds_to_smoke(tmp_path, monkeypatch):
+    """executor가 order.local_checks 명령을 스모크에 check_cmds로 넘긴다(디스커버리 정렬 배선)."""
+    rec = {}
+    def recording_verify(workdir, check_cmds=None):
+        rec["cmds"] = check_cmds
+        return None
+    monkeypatch.setattr(la, "post_chat", FakePost([_block("a.py", "x") + f"\n{DONE_MARKER}"]))
+    ex = LocalAgentExecutor(endpoint="http://x/v1", model="m", workdir=tmp_path, verify=recording_verify)
+    order = NextOrder(
+        unit="u1", goal="g",
+        local_checks=[Check(type=CheckType.test, cmd="python -m unittest discover -s tests")],
+    )
+    ex.run(order)
+    assert rec["cmds"] == ["python -m unittest discover -s tests"]
+
+
+def test_smoke_pass_returns_immediately_speed(tmp_path, monkeypatch):
+    """#141 속도: 구조 통과면 *즉시 반환*(불필요 continue 턴 0) — DONE 없어도 1턴서 끝."""
+    fake = FakePost([_block("a.py", "x")])  # DONE 없음, 매번 같은 편집
+    monkeypatch.setattr(la, "post_chat", fake)
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=5, verify=lambda wd: None
+    )
+    ex.run(_order())
+    assert len(fake.calls) == 1            # 스모크 통과 → 즉시 반환(불필요 턴 0)
+    assert ex.last_smoke_passed is True
+    assert ex.last_turns == 1
+
+
+def test_last_elapsed_surfaced_in_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(la, "post_chat", FakePost([_block("a.py", "x") + f"\n{DONE_MARKER}"]))
+    ex = LocalAgentExecutor(endpoint="http://x/v1", model="m", workdir=tmp_path)
+    result = ex.run(_order())
+    assert ex.last_elapsed_s >= 0.0
+    assert "s\n" in result or "s " in result  # 벽시계 표면화
 
 
 # ──────────────────────────── (선택) 라이브 통합 — opt-in ────────────────────────────
