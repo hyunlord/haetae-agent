@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-15 · WO#1–116 · 1016 tests · main @a7791ca · 길 B 3/3 · crowd-sim *중밀도 견고 완주*(#116, 적대 gate가 저밀도 아티팩트 차단→재빌드→DONE) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
+> **최종 갱신: 2026-06-20 · WO#1–124 · 1033 tests · main @2f8a1c6 · 길 B 3/3 · 🎯 crowd-sim 캘리브레이션 종결 — *tight 근접 collision-free 완주*(#124, sustained tight-packing서 overlap 0·min_center≥임계·100% 완주·교착 0; gate 정직성 end-to-end inversion 0) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
 
 ---
 
@@ -13,7 +13,7 @@
 - 차별점 3축: **governed GATE**(다조건 종료 + 적대적 판정으로 자기합리화 차단) · **spec governance**(mutability gradient, anti-erosion) · **provider-agnostic**.
 - 검증 사건: 캡스톤 빌드가 *자기 채점 스크립트*로 `pass:true` 도장 → **독립 run-judge가 "행동 증거 없음"으로 거부**(ac8). 적대적 게이트의 존재 이유 그대로 증명.
 - **수렴 검증**: Claude Code *Dynamic Workflows* · Google *LEAP* · **Loop Engineering**(2026-06 frontier 용어화 — prompt→context→harness→loop 사다리)이 같은 자리에 도달. Loop Engineering 상세·차용 후보는 **§5**.
-- **시나리오 커버리지 = gate 엄밀성의 상한** *(WO#112 교훈)*: 적대 gate는 *시나리오가 어려운 조건을 구동할 때만* 그 실패를 잡는다. #95 crowd-sim이 통과한 건 gate가 틀려서가 아니라 *run 시나리오가 저밀도*였기 때문(overlap onset ~15체 아래의 active=12). → sim 하니스 시나리오는 현실 밀도/스트레스를 구동해야 한다(#98 시나리오 계약의 자연 확장). 북극성(복잡 태스크)엔 결정적 — **검증 시나리오가 약하면 적대 gate도 가짜 done을 못 거른다**(gate는 결백, 커버리지가 병목).
+- **시나리오 커버리지 = gate 엄밀성의 상한** *(WO#112 교훈)*: 적대 gate는 *시나리오가 어려운 조건을 구동할 때만* 그 실패를 잡는다. #95 crowd-sim이 통과한 건 gate가 틀려서가 아니라 *run 시나리오가 저밀도*였기 때문(overlap onset ~15체 아래의 active=12). → sim 하니스 시나리오는 현실 밀도/스트레스를 구동해야 한다(#98 시나리오 계약의 자연 확장). 북극성(복잡 태스크)엔 결정적 — **검증 시나리오가 약하면 적대 gate도 가짜 done을 못 거른다**(gate는 결백, 커버리지가 병목). **보강(#124 end-to-end 입증)**: 게다가 *메트릭 일관성*(#120 단위)·*계약 게임불가*(#120 sustained)·*의미충돌 머지 정합*(#123)이 함께여야 적대 gate가 하드 태스크서 신뢰할 verdict를 낸다 — #124가 tight 근접 collision-free done으로 전부 한 런에서 입증(inversion 0).
 
 ---
 
@@ -182,6 +182,15 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - **#120(A) 메트릭 일관 + 검증역전 0**: min_edge_gap=-0.48(<0)=진짜 겹침이 overlap_violations 18.4M·min_center 0과 일관 → 실제 겹치는 엔진 *정확히 fail*(#119의 0.64 거짓음성≠진짜 음수). 검증 기계 밀도-엄밀성 증명.
 - **근접 verdict 미도달**: OR 재빌드가 u1을 예약/슬롯 흐름모델(구조적 collision-free, 유망)로 전환했으나 u1↔머지된 u2(layout) *의미/빌드 충돌*(conflict_files=[] 빈 목록 3회·tier medium→high→xhigh)로 escalate → u3(충돌 코어) 재빌드 안 됨 → 예약 엔진의 sustained 근접 행동 미검증.
 - crowd-sim 캘리브레이션: 저밀도→중밀도까지 종결, **근접은 머지 모드 수정 후 재실행 필요**(충돌회피 자체는 아직 미판정).
+
+### crowd-sim 캘리브레이션 종결 — tight 근접 collision-free (WO#123 머지수정 + #124 RUN) 🎯
+#123(OR-재빌드 의미충돌 수정) 후 tight-density 재실행 → **근접 verdict 도달 + collision-free + done**. crowd-sim 아크 완전 종결.
+- **#123 실효**: 의미충돌 1회 → 계약-소비 형제 리셋 1회(u3 충돌코어 + 소비자 u1/u2 공동) → 공동 재빌드 → 전원 머지. #121 머지 루프 재발 0(3회 escalate → 1회 리셋 done). escalate 0.
+- **근접 collision-free done**: 2차 통합 run-judge가 sustained tight-packing(1800틱) 하 PASS — overlap 693→**0**, min_center 13.82→**14.25(≥14 임계)**, 완주 26→**100/100**, 밀도 1390(고밀도 유지)·교착 0·벽관통 0·흐름순서 위반 240→0. 빌더 **overlap-projection 엔진**(OR 대안)이 근접 유지하며 collision-free 달성. 통합 6/6.
+- **★gate 정직성 end-to-end★**: 전 아크서 verification inversion 0 — 1차 (overlap 693 ∧ min_center 13.82<14) 일관 fail → 2차 (overlap 0 ∧ min_center 14.25≥14) 일관 pass. 거짓음성·거짓양성 0. 1-고객 아티팩트(#116)·메트릭버그(#119)·머지루프(#121) 매번 잡거나 고침 → 최종 통과는 진짜 벌어들인 것.
+- **빌더 레벨업**: 속도-절단(liveness hack #94/#116) → stop-not-pass(근접 붕괴 #119) → 예약/슬롯(머지 막힘 #121) → overlap-projection(근접 collision-free #124). 바 상향 + 스킬이 빌더를 진짜 collision-free까지 끌어올림.
+- **사다리 종결**: 저밀도(#95) → 중밀도-분산(#116, min_pair 209) → tight 근접 collision-free done(#124). #112 overlap-onset 정복.
+- 비용: 자연 done(40M output cap 내). 총 ~124M(입력 = codex 컨텍스트 재전송 지배, #78 알려진 패턴 — 효율 백로그).
 
 ### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
 **길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).
