@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from haetae.or_node import implicated_units
+from haetae.or_node import contract_consuming_siblings, implicated_units
 from haetae.loop import run_loop
 from haetae.models import (
     CheckReport,
@@ -100,6 +100,88 @@ def test_implicated_no_raise_on_weird_input():
     """예외 흡수: 이상한 spec이어도 raise 없이 None."""
     assert implicated_units(object(), {"x"}) is None
     assert implicated_units(None, {"x"}) is None
+
+
+# ──────────────────────── 순수: contract_consuming_siblings (WO#123, #97 확장) ────────────────────────
+
+# scope-겹침 케이스용 spec(_SPEC_YAML은 scope 전부 disjoint라 별도).
+_OVERLAP_YAML = """\
+spec_id: ccs-001
+version: 1
+order_raw: x
+goal: g
+task_type: feature_impl
+verifiability: objective
+mode: normal
+constraints: []
+acceptance_criteria:
+  - { id: ac1, desc: d, check: { type: test, cmd: "true" } }
+assumptions: []
+non_goals: [n]
+done_when: d
+decomposition:
+  - { unit: u_a, desc: a, deps: [], scope: ["src/shared.ts", "src/a.ts"] }
+  - { unit: u_b, desc: b, deps: [], scope: ["src/shared.ts", "src/b.ts"] }
+  - { unit: u_c, desc: c, deps: [], scope: ["src/c.ts"] }
+open_questions: []
+"""
+
+
+def _overlap_spec() -> ProjectSpec:
+    return ProjectSpec.model_validate(yaml.safe_load(_OVERLAP_YAML))
+
+
+def test_consumer_by_scope_overlap_72():
+    """#72: 형제 scope가 unit scope와 파일 공유(src/shared.ts) → 소비 형제. 무관(u_c) 보존."""
+    spec = _overlap_spec()
+    assert contract_consuming_siblings(spec, "u_a", ["u_b", "u_c"]) == {"u_b"}
+    assert contract_consuming_siblings(spec, "u_b", ["u_a", "u_c"]) == {"u_a"}
+
+
+def test_consumer_by_direct_dep_either_direction_no_transitive():
+    """직접 선언 의존(양방향) → 소비 형제. *전이*는 제외(기반 유닛 과다-리셋 방지)."""
+    spec = _spec()
+    # u_dnd·u_persist는 u_seed에 *직접* 의존 → u_seed 재작성의 소비자. u_trace는 u_seed에
+    # 직접 의존 아님(u_dnd/u_persist 경유=전이) → 헬퍼는 미식별(전이 여파는 호출부 cut이 처리).
+    assert contract_consuming_siblings(spec, "u_seed", ["u_dnd", "u_persist", "u_trace"]) == {
+        "u_dnd",
+        "u_persist",
+    }
+
+
+def test_consumer_build_error_file_attribution():
+    """(c) conflict_files를 scope로 *소유*한 형제 → 소비자(의존·scope-겹침 없어도)."""
+    spec = _spec()
+    # u_persist(src/persist.ts)·u_dnd 사이엔 직접 의존·scope 겹침 없음 → conflict_files로만 귀속.
+    assert contract_consuming_siblings(
+        spec, "u_dnd", ["u_persist"], conflict_files=["src/persist.ts"]
+    ) == {"u_persist"}
+    # 귀속 파일이 아무 형제 scope도 아니면 미식별.
+    assert contract_consuming_siblings(
+        spec, "u_dnd", ["u_persist"], conflict_files=["src/nobody.ts"]
+    ) == set()
+
+
+def test_consumer_excludes_self_and_unmerged():
+    """`unit` 자신 제외 · 머지 형제 없으면 빈 집합(미머지는 어차피 재빌드 예정)."""
+    spec = _spec()
+    assert contract_consuming_siblings(spec, "u_dnd", ["u_dnd"]) == set()  # self 제외
+    assert contract_consuming_siblings(spec, "u_dnd", []) == set()
+    assert contract_consuming_siblings(spec, "u_dnd", None) == set()
+
+
+def test_consumer_unrelated_preserved():
+    """의존·scope·귀속 무관 형제는 소비자 아님 → 보존(좁은 식별)."""
+    spec = _spec()
+    # u_persist vs u_dnd: 둘 다 u_seed 의존(서로 직접 의존 아님)·scope disjoint → 미식별.
+    assert contract_consuming_siblings(spec, "u_dnd", ["u_persist"]) == set()
+
+
+def test_consumer_no_raise_on_weird_input():
+    """예외 흡수: 이상한 입력이어도 raise 없이 빈 집합(graceful 폴백)."""
+    assert contract_consuming_siblings(None, "u1", ["u2"]) == set()
+    assert contract_consuming_siblings(object(), "u1", ["u2"]) == set()
+    assert contract_consuming_siblings(_spec(), "does-not-exist", ["u_dnd"]) == set()
 
 
 # ──────────────────────────── 실루프: #91 재개 + 통합 OR (연루만 리셋·seeded 보존) ────────────────────────────

@@ -149,6 +149,15 @@ class WorktreeManager:
         self._remove(unit_id)
 
     # ── 통합 백트래킹: 체크포인트 + 가드된 main reset (WO#52) ────────────────
+    def _record_head(self) -> str | None:
+        """현재 main HEAD 커밋 해시를 reset 허용 목록(_checkpoints)에 기록·반환. best-effort(None)."""
+        proc = self._git("rev-parse", "HEAD", check=False)
+        ref = proc.stdout.strip()
+        if proc.returncode != 0 or not ref:
+            return None
+        self._checkpoints.add(ref)
+        return ref
+
     def checkpoint(self) -> str | None:
         """현재 main(통합 브랜치) HEAD 커밋 해시를 기록·반환(읽기 전용).
 
@@ -156,12 +165,13 @@ class WorktreeManager:
         reset_main_to(ref)로 *그 상태로만* 되감을 수 있게 한다(기록된 ref만 reset 허용).
         실패 → None(best-effort, 호출부가 #41 동작으로 폴백).
         """
-        proc = self._git("rev-parse", "HEAD", check=False)
-        ref = proc.stdout.strip()
-        if proc.returncode != 0 or not ref:
-            return None
-        self._checkpoints.add(ref)
-        return ref
+        return self._record_head()
+
+    def head_ref(self) -> str | None:
+        """현재 main HEAD 기록·반환 — checkpoint()와 동작 동일하나 *별도 진입점*(WO#123 머지-직전
+        기록용). 통합 백트래킹 checkpoint()를 스파이/오버라이드하는 코드와 카운트가 섞이지 않게
+        분리한다(같은 _record_head·_checkpoints 공유 → reset_main_to 가드는 동일하게 적용). best-effort(None)."""
+        return self._record_head()
 
     def reset_main_to(self, ref: str | None) -> bool:
         """run workdir 빌드 repo의 main을 *기록된 체크포인트* ref로 `git reset --hard`.

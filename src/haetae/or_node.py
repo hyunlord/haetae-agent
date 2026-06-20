@@ -222,6 +222,62 @@ def implicated_units(spec: Any, failed_ac_ids: Any) -> set[str] | None:
         return None
 
 
+# ──────────────── WO#123: 계약-소비 형제 식별 (#97 implicated를 의미-계약 의존까지 확장) ────────────────
+#
+# #121 새 실패모드: OR 재빌드가 유닛 *핵심 모델*(예: 예약/슬롯 흐름)을 재작성하며 *공유 인터페이스/
+# 계약*을 바꾸면, 이미 머지된 형제가 *빌드-수준*으로 깨진다 — 머지는 텍스트상 깨끗(conflict_files=[])
+# 인데 통합 빌드가 안 된다. #48 적응 재빌드가 "형제 보존"을 요구해도 재작성이 공유 계약을 계속 바꿔
+# 루프 → escalate. 해법: 그 *계약-소비 형제*를 리셋 집합에 넣어 둘이 새 계약에 맞춰 함께 재통합.
+#
+# implicated_units(#97)는 실패 *criterion → 소유 유닛*(+dependents)을 매핑했다. 여기선 *재빌드 유닛이
+# 바꾼 계약을 소비하는* 머지된 형제를 식별한다(의미-계약 의존 — #97의 의미 차원 확장).
+# **bar 불변**: 리셋 *범위*만 정한다 — criteria/done_when/gate/run-judge 무관. 순수·예외 흡수(불확실
+# 하면 빈 집합 → 호출부 graceful 폴백) — 절대 raise 안 함.
+
+
+def contract_consuming_siblings(
+    spec: Any,
+    unit: str,
+    merged_siblings: Any,
+    *,
+    conflict_files: Any = None,
+) -> set[str]:
+    """`unit`이 (재작성으로) 바꾼 공유 계약을 *소비*하는 머지된 형제 집합 (WO#123).
+
+    소비 신호(보수적 — 셋 중 하나라도; 모두 *이미 머지된* 형제로 한정):
+      (a) **#72 scope 겹침**: 형제 scope가 `unit` scope와 파일을 공유 → 공유 계약 면.
+      (b) **선언 의존(직접·양방향)**: 형제가 `unit`에 의존하거나 `unit`이 형제에 의존 — 둘이
+          인터페이스를 공유(한쪽 재작성이 다른 쪽을 깬다). 전이 미사용(기반 유닛 과다-리셋 방지).
+      (c) **빌드-에러 파일 귀속**: conflict_files(있으면)를 scope로 소유한 형제(깨진 파일의 주인).
+    빈 집합 = 식별 불가 → 호출부가 graceful 폴백(기존 #48/escalate). `unit` 자신·미머지 형제는 제외.
+    """
+    try:
+        sib = {str(s) for s in (merged_siblings or []) if str(s) != str(unit)}
+        if not sib:
+            return set()
+        units = list(getattr(spec, "decomposition", None) or [])
+        if not units:
+            return set()
+        scope = {u.unit: set(getattr(u, "scope", None) or []) for u in units}
+        deps = {u.unit: set(getattr(u, "deps", None) or []) for u in units}
+        if unit not in scope:  # 알 수 없는 유닛 → 식별 불가
+            return set()
+        ufiles = scope.get(unit, set())
+        cfiles = {str(f) for f in (conflict_files or [])}
+        consumers: set[str] = set()
+        for s in sib:
+            sfiles = scope.get(s, set())
+            if ufiles and (sfiles & ufiles):  # (a) scope 겹침
+                consumers.add(s)
+            elif unit in deps.get(s, set()) or s in deps.get(unit, set()):  # (b) 직접 의존(양방향)
+                consumers.add(s)
+            elif cfiles and (sfiles & cfiles):  # (c) 빌드-에러 파일 귀속
+                consumers.add(s)
+        return consumers
+    except Exception:  # noqa: BLE001 — 불확실하면 빈 집합(graceful 폴백) — 절대 raise 안 함
+        return set()
+
+
 # ──────────────── WO#79: proactive anti-fixation (CRDAL co-regulation) ────────────────
 #
 # 현 메커니즘은 다 *사후*다: #41 OR은 재시도 소진 *後* 대안 분해, #68C는 누적 ceiling *後* escalate.

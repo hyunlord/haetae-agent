@@ -940,3 +940,131 @@ def test_integration_backtracking_allowed_sandboxes_unchanged(tmp_path):
     import haetae.providers.codex as codex_mod
     assert codex_mod.ALLOWED_SANDBOXES == ("read-only", "workspace-write")
     assert "danger-full-access" not in codex_mod.ALLOWED_SANDBOXES
+
+
+# ──────────── 통합 벽 ③: 의미/빌드-수준 충돌 → 계약-소비 형제 리셋 (WO#123) ────────────
+#
+# #121 새 실패모드: OR 재빌드가 유닛 핵심 모델을 재작성하며 *공유 계약*을 바꾸면, 머지는
+# 텍스트상 깨끗(conflict_files=[])인데 머지된 *소비 형제*가 빌드-수준으로 깨진다. #48이 u1만
+# 재빌드하면 같은 의미 충돌 루프 → escalate. #123: 그 소비 형제도 함께 리셋·재빌드(새 계약 정합).
+
+# scope·deps가 있는 3유닛 선형: u_keep(무관) ← u_consumer(소비) ← u_rebuilt(재작성/충돌).
+SPEC_SEMANTIC = _spec(
+    "  - { unit: u_keep, desc: keep, deps: [], scope: [src/keep.ts] }\n"
+    "  - { unit: u_consumer, desc: consumer, deps: [u_keep], scope: [src/shared.ts, src/consumer.ts] }\n"
+    "  - { unit: u_rebuilt, desc: rebuilt, deps: [u_consumer], scope: [src/shared.ts, src/rebuilt.ts] }"
+)
+
+
+class _SemConflictWM(WorktreeManager):
+    """`conflict_unit` 머지를 *의미 충돌*(return "conflict", conflict_files=[])로 시뮬 —
+    텍스트 충돌 파일 없음(#123 신호, #48 텍스트-충돌과 구분). checkpoint/reset_main_to는
+    가상 머지목록으로 페이크(실 git 미사용). conflict_times회 충돌 후 ok."""
+
+    def __init__(self, workdir, conflict_unit: str, conflict_times: int = 1):
+        super().__init__(workdir)
+        self.conflict_unit = conflict_unit
+        self.conflict_times = conflict_times
+        self._merged: list[str] = []
+        self._snap: dict[str, list[str]] = {}
+        self._n = 0
+        self._hits = 0
+
+    def ensure_repo(self):  # 실 git 미사용(페이크)
+        pass
+
+    def create(self, unit_id):
+        p = self.root / unit_id
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def merge(self, unit_id):
+        if unit_id == self.conflict_unit and self._hits < self.conflict_times:
+            self._hits += 1
+            self.last_conflict_files = []  # 텍스트 충돌 없음 = 의미/빌드-수준 신호(#123)
+            return "conflict"
+        self._merged.append(unit_id)
+        self.last_conflict_files = []
+        return "ok"
+
+    def head_ref(self):  # WO#123 머지-직전 기록(loop이 호출) — 가상 main 스냅샷
+        self._n += 1
+        ref = f"ck{self._n}"
+        self._snap[ref] = list(self._merged)  # 이 시점(머지 직전) 가상 main 스냅샷
+        self._checkpoints.add(ref)
+        return ref
+
+    def reset_main_to(self, ref):
+        if ref not in self._snap:
+            return False
+        self._merged = list(self._snap[ref])  # 그 스냅샷으로 un-merge
+        return True
+
+    def discard(self, unit_id):
+        pass
+
+    def cleanup(self, unit_id):
+        pass
+
+    def cleanup_all(self):
+        pass
+
+
+def _build_recorder():
+    built: list[str] = []
+    lock = threading.Lock()
+
+    def make_ex(wt):
+        class E:
+            def run(self, order):
+                with lock:
+                    built.append(order.unit)
+                return f"{order.unit} built"
+
+        return E()
+
+    return built, make_ex
+
+
+def test_semantic_conflict_resets_contract_consuming_sibling_then_resolves(tmp_path):
+    """텍스트 충돌 없는(conflict_files=[]) 의미 머지 충돌 → 계약-소비 형제(u_consumer)를 함께
+    리셋·재빌드 → 해소(done). 무관 형제(u_keep)는 보존(리셋 집합 제외 = #91 일관)."""
+    wm = _SemConflictWM(tmp_path, conflict_unit="u_rebuilt", conflict_times=1)
+    built, make_ex = _build_recorder()
+    seen: list[str] = []
+    state = run_loop(
+        "x", BrainClient(SPEC_SEMANTIC), executor=None, gate=PassGate(),
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=1, worktree_manager=wm, progress=seen.append,
+    )
+    assert state.status is Status.done, [str(e) for e in state.pending_escalations]
+    # 무관 u_keep(머지-직전 prefix): 보존 → 재빌드 0(최초 1회만).
+    assert built.count("u_keep") == 1, f"무관 u_keep은 보존돼야: {built}"
+    # 계약-소비 u_consumer: 최초 + 소비-형제 리셋 재빌드 = 2회.
+    assert built.count("u_consumer") == 2, f"소비 u_consumer는 함께 재빌드돼야: {built}"
+    # u_rebuilt: 최초(충돌) + 리셋 후 재빌드 = 2회.
+    assert built.count("u_rebuilt") == 2, f"u_rebuilt 초기 충돌 + 재빌드: {built}"
+    assert any("계약-소비 형제 리셋" in s for s in seen), seen
+
+
+def test_semantic_conflict_consumer_reset_once_then_falls_back_to_escalate(tmp_path):
+    """루프 가드: 소비-형제 리셋은 유닛당 1회 — 리셋 후에도 계속 의미 충돌하면 기존 #48 적응
+    재빌드/escalate로 폴백(무한 소비-형제 리셋 방지). 정직한 머지-충돌 escalation 유지."""
+    wm = _SemConflictWM(tmp_path, conflict_unit="u_rebuilt", conflict_times=999)
+    built, make_ex = _build_recorder()
+    seen: list[str] = []
+    state = run_loop(
+        "x", BrainClient(SPEC_SEMANTIC), executor=None, gate=PassGate(),
+        executor_factory=make_ex, gate_factory=lambda wt: PassGate(),
+        max_parallel=2, workdir=tmp_path, prompt_dir=PROMPT_DIR,
+        unit_retries=1, worktree_manager=wm, progress=seen.append,
+    )
+    assert state.status is Status.escalated
+    # 소비-형제 리셋 정확히 1회(가드) → u_consumer는 최초 + 1회 = 2회까지만(무한 리셋 아님).
+    assert built.count("u_consumer") == 2, f"소비-형제 리셋은 1회 가드여야: {built}"
+    # 1회 소비-형제 리셋은 일어났다(흔적).
+    assert any("계약-소비 형제 리셋" in s for s in seen), seen
+    # 그 후 기존 경로로 폴백 → 정직한 머지-충돌 escalation(#48 이력 첨부).
+    esc = [e for e in state.pending_escalations if e.get("unit") == "u_rebuilt"]
+    assert esc and "머지 충돌" in esc[0]["reason"], state.pending_escalations

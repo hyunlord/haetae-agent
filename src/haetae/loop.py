@@ -94,6 +94,7 @@ from haetae.or_node import (
     build_alternative_feedback,
     build_anti_fixation_feedback,
     build_integration_feedback,
+    contract_consuming_siblings,
     fixation_fail_digest,
     implicated_units,
     is_fixated,
@@ -1532,6 +1533,13 @@ def _parallel_loop(
     # WO#48: 유닛별 머지 충돌 → *통합 적응 재빌드* 시도 이력(정직한 escalation 첨부용).
     # 각 항목 {attempt, conflict_files, merged_siblings} — 재빌드 경로가 무엇을 시도했는지.
     integ_adapt: dict[str, list[dict]] = {}
+    # WO#123: 의미/빌드-수준 머지 충돌(텍스트 충돌 없음=conflict_files 빈) → 계약-소비 형제 리셋.
+    #   merge_seq: 성공 머지 순서(소비 형제 un-merge 기준점 산출용). pre_merge_ckpt: 각 유닛이
+    #   머지되기 *직전* main HEAD(reset_main_to로 그 유닛+이후 un-merge). semantic_reset_done:
+    #   유닛별 *소비-형제 리셋 1회* 가드(리셋 후 또 충돌하면 기존 #48/escalate로 폴백 — 무한 루프 방지).
+    merge_seq: list[str] = []
+    pre_merge_ckpt: dict[str, str] = {}
+    semantic_reset_done: set[str] = set()
     # ── 반응형 tier 사다리(WO#64) 봉투 ─────────────────────────────────────
     # ladder: 사다리(미지정/빈 리스트면 단일 tier 1칸 = 후방호환). escalation_of: 유닛별
     # *지금까지 한 escalation 수*(gate 실패/머지 충돌/OR 대안 재dispatch마다 ++, 단조 비감소).
@@ -1753,6 +1761,53 @@ def _parallel_loop(
             {"reason": f"parallel v1 미지원 action: {action.value}", "unit": unit})
         return None
 
+    def _semantic_consumer_reset(
+        unit: str, merged_siblings: list[str], event_cost: Cost | None
+    ) -> bool:
+        """WO#123: 의미/빌드-수준 머지 충돌 → 계약-소비 형제를 *함께* 리셋·재빌드.
+
+        `unit`이 (재작성으로) 바꾼 공유 계약을 소비하는 머지 형제(contract_consuming_siblings)를
+        식별 → 그중 *가장 먼저 머지된* 형제 직전 체크포인트로 main을 reset(그 형제+이후 머지 전부
+        un-merge) → un-merge된 유닛 + `unit`을 pending으로 되돌려 *함께* 재빌드한다(둘이 새 계약에
+        정합). 머지-직전 prefix(특히 일찍 시드된 #91 seeded-done)는 보존. 식별 불가/체크포인트
+        없음/reset 실패면 False(호출부 graceful 폴백). **bar 불변 — 리셋 *범위*만**. 절대 raise 안 함.
+        """
+        try:
+            consumers = contract_consuming_siblings(spec, unit, merged_siblings)
+            order_idx = {u: i for i, u in enumerate(merge_seq)}
+            # 기준점 후보: 소비 형제 중 머지 순서·머지-직전 ref가 *기록된* 것만(best-effort).
+            present = [c for c in consumers if c in pre_merge_ckpt and c in order_idx]
+            if not present:
+                return False  # 소비 형제 식별 불가 또는 머지 기록 없음 → 폴백
+            earliest = min(present, key=lambda c: order_idx[c])
+            ref = pre_merge_ckpt.get(earliest)
+            if not ref or not wm.reset_main_to(ref):
+                return False  # 체크포인트 reset 불가(best-effort) → 폴백
+            cut = order_idx[earliest]
+            reset_units = set(merge_seq[cut:]) | {unit}  # earliest+이후 un-merge됨 + 충돌 유닛
+            del merge_seq[cut:]  # un-merge된 것 머지 기록서 제거(일관성)
+            for u in reset_units:
+                pre_merge_ckpt.pop(u, None)
+                _set_plan_state(state, u, PlanState.pending)
+                attempts_of[u] = 0
+                # 함께 재빌드되는 형제 명시(현재 main에 맞춰 재통합 — bar 불변 directive 포함).
+                alt_feedback[u] = build_integration_feedback(
+                    u, None, sorted(reset_units - {u}))
+            semantic_reset_done.add(unit)  # 유닛당 1회 가드(리셋 후 또 충돌 → 기존 #48/escalate)
+            account(event_cost)  # 폐기된 충돌 시도 비용도 정직하게 누적
+            escalation_of[unit] += 1  # 재dispatch = tier 상향(단조, 기존 충돌-재빌드와 동형)
+            record_transition(STAGE_OR_ALTERNATIVE, unit)
+            kept = list(merge_seq)  # 보존된 prefix(머지 유지 — seeded-done 포함)
+            emit(
+                f"의미/빌드-수준 머지 충돌(텍스트 충돌 없음) → 계약-소비 형제 리셋(#123): "
+                f"{unit} + {', '.join(sorted(reset_units - {unit}))} 함께 재빌드 · "
+                f"보존 {len(kept)}유닛" + (f" ({', '.join(kept)})" if kept else "") + " · bar 불변"
+            )
+            persist()
+            return True
+        except Exception:  # noqa: BLE001 — 어떤 실패도 폴백(기존 #48/escalate) — 절대 raise 안 함
+            return False
+
     def handle_outcome(unit: str, order: NextOrder, result: str, gr: GateResult,
                        exec_cost: Cost | None = None) -> None:
         """unit gate 결과를 처리: 성공→머지, 충돌/실패→바운드 재dispatch 또는 escalate."""
@@ -1772,12 +1827,20 @@ def _parallel_loop(
         emit(_summarize_gate(gr))
 
         if verdict in (Verdict.pass_, Verdict.done):
+            # WO#123: 머지 *직전* main HEAD를 기록(best-effort) — 의미/빌드-수준 충돌 시 소비
+            #   형제를 이 지점으로 un-merge(reset_main_to)하기 위함. head_ref는 통합 백트래킹
+            #   checkpoint()와 *별도 진입점*(카운트 분리). 실패면 None → 그 유닛은 기준점 후보서
+            #   빠짐(소비-형제 리셋이 graceful 폴백).
+            pre_ck = wm.head_ref()
             outcome = wm.merge(unit)
             if outcome == "ok":
                 account(event_cost)
                 record(unit, order.goal, result, verdict, gr.checks,
                        cost=event_cost, ts=now())
                 _set_plan_state(state, unit, PlanState.done)
+                if pre_ck:  # WO#123: 성공 머지 순서 + 머지-직전 ref 기록(소비-형제 리셋 기준점)
+                    pre_merge_ckpt[unit] = pre_ck
+                    merge_seq.append(unit)
                 wm.cleanup(unit)
                 last_result = f"unit={unit} verdict={verdict.value} merged"
                 persist()
@@ -1795,6 +1858,17 @@ def _parallel_loop(
             # WO#68 (C): 누적 수렴 ceiling 초과면 더 재빌드 안 던지고 사람에게 escalate(바 불변).
             if unit_ceiling_hit(unit):
                 escalate_unit_unconverged(unit, order, result, gr, event_cost)
+                return
+            # WO#123: 텍스트 충돌 파일이 *없는*(conflict_files 빈) 머지 충돌 = 의미/빌드-수준 신호
+            #   (#48 텍스트-충돌은 conflict_files 있음 → 아래 적응 재빌드로 처리, 불변). 계약-소비
+            #   머지 형제가 있고 이 유닛에 아직 소비-형제 리셋을 안 했으면 → 그 형제를 함께 리셋·재빌드
+            #   (둘이 새 계약 정합). 유닛당 1회(가드) — 리셋 후 또 충돌하면 아래 기존 경로로 폴백.
+            if (
+                not conflict_files
+                and merged_siblings
+                and unit not in semantic_reset_done
+                and _semantic_consumer_reset(unit, merged_siblings, event_cost)
+            ):
                 return
             if attempts_of[unit] < unit_retries:
                 attempts_of[unit] += 1
