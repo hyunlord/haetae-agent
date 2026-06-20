@@ -379,6 +379,122 @@ def test_local_provider_does_not_import_judge_or_gate():
         assert forbidden not in src, f"local_agent이 {forbidden}을 import함(분리 위반)"
 
 
+# ──────────────────────── 빌더-측 스모크 (WO#139) ────────────────────────
+
+
+def test_builder_smoke_compile_catches_syntax(tmp_path):
+    (tmp_path / "bad.py").write_text("def f(:\n    pass\n")
+    err = la.builder_smoke(tmp_path)
+    assert err is not None and "컴파일" in err and "bad.py" in err
+
+
+def test_builder_smoke_clean_passes(tmp_path):
+    (tmp_path / "ok.py").write_text("x = 1\n")
+    assert la.builder_smoke(tmp_path) is None  # 컴파일 OK + 테스트 없음(collect exit 5) → None
+
+
+def test_builder_smoke_collect_catches_import_error(tmp_path):
+    """실 pytest collect-only: test가 없는 모듈을 import하면 collection error를 잡는다(#138 케이스)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        "from nonexistent_pkg_xyz_138 import thing\n\ndef test_a():\n    assert True\n"
+    )
+    err = la.builder_smoke(tmp_path)
+    assert err is not None and "collect" in err.lower()
+
+
+def test_builder_smoke_collect_only_does_not_run_or_score(tmp_path):
+    """적대 분리: collect-only는 *import 가능 여부*만 본다 — 실패하는 테스트도 *실행/채점 안 함*."""
+    (tmp_path / "tests").mkdir()
+    # import은 되지만 실행하면 FAIL할 테스트 → collect는 성공(None), 채점 안 함
+    (tmp_path / "tests" / "test_x.py").write_text("def test_would_fail():\n    assert False\n")
+    assert la.builder_smoke(tmp_path) is None
+
+
+def test_builder_smoke_skips_when_pytest_absent(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("def test_a():\n    assert True\n")
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (1, "No module named pytest"))
+    assert la.builder_smoke(tmp_path) is None  # 툴 부재 → skip(빌드 막지 않음)
+
+
+def test_builder_smoke_collect_error_via_seam(tmp_path, monkeypatch):
+    (tmp_path / "m.py").write_text("y = 2\n")
+    monkeypatch.setattr(
+        la, "_smoke_run",
+        lambda cmd, cwd, timeout: (2, "ImportError: cannot import name 'winner' from 'rules'"),
+    )
+    err = la.builder_smoke(tmp_path)
+    assert err is not None and "exit 2" in err and "winner" in err
+
+
+class _ScriptedSmoke:
+    """N번 실패(에러 반환) 후 통과(None). 호출 인자 기록."""
+
+    def __init__(self, fail_times: int, err: str = "ImportError: cannot import name 'winner'"):
+        self.fail_times = fail_times
+        self.err = err
+        self.calls = 0
+
+    def __call__(self, workdir):
+        self.calls += 1
+        return self.err if self.calls <= self.fail_times else None
+
+
+def test_smoke_feedback_iterates_not_one_shot(tmp_path, monkeypatch):
+    """#139 핵심: 스모크가 2회 실패하면 *2번 다* 에러를 피드백해 self-fix(1회 한정 아님)."""
+    fake = FakePost([
+        _block("src/a.py", "v1"),
+        _block("src/a.py", "v2"),
+        _block("src/a.py", "v3") + f"\n{DONE_MARKER}",
+    ])
+    monkeypatch.setattr(la, "post_chat", fake)
+    smoke = _ScriptedSmoke(fail_times=2)
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=4, verify=smoke
+    )
+    ex.run(_order())
+    assert len(fake.calls) == 3            # build → fix → fix(pass)
+    assert ex.smoke_feedback_count == 2    # 두 실패 모두 피드백(반복)
+    assert ex.last_smoke_passed is True
+    # 2번째·3번째 호출 user 메시지에 정확한 에러가 주입됐다
+    for ci in (1, 2):
+        msgs = fake.calls[ci]["payload"]["messages"]
+        assert any("cannot import name 'winner'" in m.get("content", "")
+                   for m in msgs if m["role"] == "user")
+
+
+def test_smoke_pass_first_try_no_feedback(tmp_path, monkeypatch):
+    monkeypatch.setattr(la, "post_chat", FakePost([_block("a.py", "1") + f"\n{DONE_MARKER}"]))
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, verify=lambda wd: None
+    )
+    ex.run(_order())
+    assert ex.smoke_feedback_count == 0 and ex.last_smoke_passed is True
+
+
+def test_smoke_exhausts_turns_returns_not_raises(tmp_path, monkeypatch):
+    """스모크가 끝내 통과 못 해도 turn 상한서 멈추고 *반환*한다(gate가 이후 판정)."""
+    monkeypatch.setattr(la, "post_chat", FakePost([_block("a.py", "x")]))  # 매번 같은 편집
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=2,
+        verify=lambda wd: "ImportError: always",
+    )
+    result = ex.run(_order())  # raise 안 함(적용 파일 있음)
+    assert ex.last_smoke_passed is False
+    assert ex.smoke_feedback_count >= 1
+    assert "미통과" in result
+
+
+def test_smoke_is_builder_side_not_judge():
+    """적대 분리: 스모크(builder_smoke)는 judge/gate를 import·호출하지 않는다(컴파일+collect만)."""
+    src = Path(la.__file__).read_text(encoding="utf-8")
+    # builder_smoke 본문이 judge/gate/run_judge를 부르지 않음(소스 스캔은 모듈 전역 분리 테스트가 커버)
+    assert "py_compile" in src and "--collect-only" in src
+    for forbidden in ("haetae.judge", "haetae.gate", "GateResult", "run_judge"):
+        assert forbidden not in src, f"local_agent이 {forbidden} 참조(분리 위반)"
+
+
 # ──────────────────────────── (선택) 라이브 통합 — opt-in ────────────────────────────
 
 
@@ -397,3 +513,27 @@ def test_local_executor_integration_creates_file(tmp_path):
     )
     ex.run(order)
     assert (tmp_path / "src" / "hello.ts").exists()
+
+
+@pytest.mark.skipif(
+    os.environ.get("HAETAE_LOCAL_IT") != "1",
+    reason="실 로컬 엔드포인트 통합 테스트는 opt-in (HAETAE_LOCAL_IT=1; 예: GB10 llama.cpp :8089)",
+)
+def test_smoke_live_self_consistency(tmp_path):
+    """WO#139 라이브: 실 7B + builder_smoke로 *구조적 자기-정합* impl+test가 collect되게 만든다(#138 floor)."""
+    endpoint = os.environ.get("HAETAE_LOCAL_ENDPOINT", "http://100.70.109.50:8089/v1")
+    model = os.environ.get("HAETAE_LOCAL_MODEL", "qwen2.5-coder:7b")
+    ex = LocalAgentExecutor(
+        endpoint=endpoint, model=model, workdir=str(tmp_path), max_turns=4, verify=la.builder_smoke
+    )
+    order = NextOrder(
+        unit="it_smoke",
+        goal=(
+            "Python으로 src/calc.py에 add(a, b)와 sub(a, b)를 구현하고, tests/test_calc.py에 그 둘을 "
+            "import해 검증하는 pytest를 작성하라. test의 import 경로가 impl과 정확히 일치해야 한다."
+        ),
+        deliverable="calc 모듈 + 임포트 정합 테스트",
+    )
+    ex.run(order)
+    # 스모크가 self-fix까지 끌어 구조적 자기-정합 달성(컴파일+collect 통과)
+    assert la.builder_smoke(tmp_path) is None

@@ -18,6 +18,7 @@ from haetae.executors import (
     HumanRelayExecutor,
     LocalAgentExecutor,
     Tier,
+    builder_smoke,
     tier_label,
 )
 from haetae.providers.launch_options import read_codex_config
@@ -668,6 +669,16 @@ def main(argv: list[str] | None = None) -> int:
         default=3,
         help="--executor local 에이전틱 루프 턴 상한 (기본 3; 28 t/s 경제성·#134 단발 선호)",
     )
+    parser.add_argument(
+        "--local-smoke",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "--executor local 빌더-측 구조적 스모크(컴파일+pytest --collect-only) ON(기본). 실패 시 "
+            "정확 에러를 다음 빌더 턴에 피드백해 self-fix(#139). --no-local-smoke로 끔. "
+            "**판정 아님** — 정답/완결은 독립 적대 gate(불변)."
+        ),
+    )
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
     parser.add_argument(
         "--continue-from",
@@ -975,6 +986,7 @@ def main(argv: list[str] | None = None) -> int:
         executor = LocalAgentExecutor(
             endpoint=args.local_endpoint, model=args.local_model,
             workdir=args.workdir, max_turns=args.local_max_turns,
+            verify=(builder_smoke if args.local_smoke else None),
             heartbeat=heartbeat, transcript=transcript,
         )
     else:
@@ -1006,6 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt: LocalAgentExecutor(
                 endpoint=args.local_endpoint, model=args.local_model,
                 workdir=wt, max_turns=args.local_max_turns,
+                verify=(builder_smoke if args.local_smoke else None),
                 heartbeat=heartbeat, transcript=transcript,
             )
         else:

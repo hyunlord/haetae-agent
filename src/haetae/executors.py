@@ -220,4 +220,5 @@ class CodexExecutor:
 from haetae.providers.local_agent import (  # noqa: E402
     LocalAgentError,
     LocalAgentExecutor,
+    builder_smoke,
 )

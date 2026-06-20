@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import py_compile
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -330,6 +333,80 @@ def workdir_context(workdir: Path, order: NextOrder, *, max_files: int = 60, max
     return "\n".join(parts)
 
 
+# ──────────────────────────── 빌더-측 구조적 스모크 (WO#139) ────────────────────────────
+#
+# #138 진단: 7B가 minimax는 맞췄으나 impl↔test 불일치(test가 자기 impl엔 없는 API import →
+# collection error)를 4시도 내내 못 고침 — *에러를 못 봐서*. 해법: 편집 적용 후 빌더가 *스스로*
+# 구조적 스모크(컴파일 + pytest --collect-only)를 돌려 정확한 에러를 보고 bounded 턴 내 self-fix.
+#
+# 적대 분리(sacred): 스모크 = **빌더-측 자기검사**(구조적: 컴파일 가능·임포트(collect) 가능만).
+# *판정 아님* — 정답성/완결성/criteria 충족은 여전히 독립 적대 run-judge/gate가 판정한다(불변).
+# collect-only는 테스트를 *실행/채점하지 않는다*(import 가능 여부만) → #82 self-verification·
+# #108 harness-smoke와 동형. judge/run-judge/gate/critic 코드·경로엔 일절 닿지 않는다.
+
+
+def _smoke_run(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]:
+    """스모크용 subprocess 실행 seam(테스트 monkeypatch 지점). (returncode, output_tail) 반환.
+
+    빌트 코드 *오프라인 규율*은 gate와 동일(네트워크 미부여) — collect-only는 import-time만 돌린다.
+    툴 부재/타임아웃은 특별 코드로 반환해 호출부가 graceful 처리한다. ALLOWED_SANDBOXES 무관.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+        )
+    except FileNotFoundError:
+        return (127, "")  # 인터프리터/툴 없음 → 호출부 skip
+    except subprocess.TimeoutExpired:
+        return (124, "smoke timeout")
+    return (proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
+
+
+def _py_files(workdir: Path, cap: int = 300) -> list[Path]:
+    """workdir의 .py 파일들(노이즈 디렉토리 제외, cap). 컴파일/스모크 대상 수집."""
+    files: list[Path] = []
+    for root, dirs, names in os.walk(workdir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+        for n in names:
+            if n.endswith(".py"):
+                files.append(Path(root) / n)
+                if len(files) >= cap:
+                    return files
+    return files
+
+
+def builder_smoke(workdir: Path, *, timeout: float = 60.0) -> str | None:
+    """빌더-측 구조적 스모크: (1) py_compile 문법 + (2) pytest --collect-only 임포트 검사.
+
+    통과(구조적 자기-정합)면 None, 실패면 *정확한 에러 문자열*(다음 빌더 턴에 그대로 주입).
+    **판정 아님**(정답성/완결성 무평가) — collect-only는 import 가능 여부만 본다. best-effort:
+    pytest 미설치 등 *툴 부재*면 그 단계는 skip(빌드 막지 않음 — 진짜 검증은 gate).
+    """
+    workdir = Path(workdir)
+    # 1) 컴파일/문법 — py_compile은 *실행하지 않고* 파싱/바이트컴파일만 한다(안전).
+    for f in _py_files(workdir):
+        try:
+            py_compile.compile(str(f), doraise=True)
+        except py_compile.PyCompileError as e:
+            rel = os.path.relpath(str(f), str(workdir))
+            return f"[smoke 컴파일 실패] {rel}:\n{e}"[:2000]
+        except (OSError, ValueError):
+            continue  # 읽기 실패 등은 스모크가 막지 않는다(gate가 본다)
+    # 2) test collect-only — import/collection 에러만(테스트 실행/채점 아님).
+    rc, out = _smoke_run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"], workdir, timeout
+    )
+    low = out.lower()
+    if rc in (127, 124) or "no module named pytest" in low or "no module named \"pytest\"" in low:
+        return None  # pytest 부재/타임아웃 → collect 스모크 skip(best-effort)
+    # pytest exit: 0=수집됨, 5=테스트 없음 → 둘 다 구조적 OK. 그 외(2=collection error 등)=실패.
+    if rc not in (0, 5):
+        tail = out.strip()
+        tail = tail if len(tail) <= 2000 else "…" + tail[-2000:]
+        return f"[smoke test collect 실패] pytest --collect-only (exit {rc}):\n{tail}"
+    return None
+
+
 # ──────────────────────────── LocalAgentExecutor ────────────────────────────
 
 
@@ -346,9 +423,11 @@ class LocalAgentExecutor:
                  더 낼 편집이 없으면 조기 종료.
     timeout:     한 번의 모델 호출 타임아웃(초).
     temperature/max_tokens: 생성 파라미터(코드라 낮은 temp 기본).
-    verify:      선택적 경량 체크 `(workdir: Path) -> str | None`. 편집 적용 후 호출해 에러
-                 문자열을 받으면 *한 번* 모델에 피드백해 재시도시킨다(에러-피드백 1턴). None이면
-                 미사용(gate가 진짜 검증). **빌트 코드 실행 정책은 gate 소관** — 여기선 주입만.
+    verify:      빌더-측 *구조적 스모크* 콜백 `(workdir: Path) -> str | None`(예: `builder_smoke`
+                 = 컴파일 + pytest --collect-only, WO#139). 편집 적용 후 호출해 에러 문자열을 받으면
+                 *그 정확한 에러를 다음 턴에 주입*해 self-fix시킨다(턴 상한 내 *반복*). 통과(None)면
+                 구조적 자기-정합 달성. None이면 미사용. **판정 아님** — 정답/완결은 독립 적대 gate가
+                 한다(불변). 주입형이라 테스트서 모킹 가능.
     heartbeat/transcript: 라이브 텔레메트리 sink(duck-typed). None이면 off(무회귀).
     """
 
@@ -383,6 +462,10 @@ class LocalAgentExecutor:
         # 직전 run의 적용 파일/턴 수(보고/테스트용).
         self.last_applied: list[str] = []
         self.last_turns: int = 0
+        # WO#139 빌더-측 스모크 상태(보고/테스트용).
+        self.last_smoke_error: str | None = None
+        self.last_smoke_passed: bool = False
+        self.smoke_feedback_count: int = 0
 
     # ── Executor 인터페이스 ────────────────────────────────────────────
     def run(self, order: NextOrder) -> str:
@@ -390,6 +473,9 @@ class LocalAgentExecutor:
         self.last_usage = None
         self.last_applied = []
         self.last_turns = 0
+        self.last_smoke_error = None
+        self.last_smoke_passed = False
+        self.smoke_feedback_count = 0
 
         user_msg = _format_order(order)
         ctx = workdir_context(self.workdir, order)
@@ -403,7 +489,6 @@ class LocalAgentExecutor:
         applied_all: list[str] = []
         agg_in: int | None = None
         agg_out: int | None = None
-        feedback_used = False
         last_text = ""
 
         for turn in range(self.max_turns):
@@ -421,20 +506,28 @@ class LocalAgentExecutor:
             self.last_applied = list(applied_all)
             done = is_done(text)
 
-            # 선택적 경량 체크 → 실패 시 에러-피드백 1턴(딱 한 번).
-            if self.verify is not None and applied and not feedback_used:
+            # 빌더-측 스모크(WO#139): 편집 적용 후 *구조적 자기검사*(컴파일+test collect). 실패하면
+            # 정확한 에러를 다음 턴에 주입해 self-fix(*턴 상한 내 반복* — #137의 1회 한정이 아님).
+            # 통과면 구조적 자기-정합 달성. 정답/완결 판정은 이후 독립 적대 gate가 한다(불변).
+            if self.verify is not None and applied:
                 err = self._safe_verify()
                 if err:
-                    feedback_used = True
-                    messages.append({"role": "assistant", "content": text})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "적용 후 체크가 실패했다. 같은 편집 프로토콜(path= 펜스 블록)로 고쳐라:\n"
-                            f"{err}\n끝나면 {DONE_MARKER}."
-                        ),
-                    })
-                    continue
+                    self.last_smoke_error = err
+                    self.smoke_feedback_count += 1
+                    if turn < self.max_turns - 1:
+                        messages.append({"role": "assistant", "content": text})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "빌더 스모크(컴파일/test collect) 실패. 아래 *정확한 에러*를 보고 같은 "
+                                f"편집 프로토콜(path= 펜스 블록)로 고쳐라(파일 전체 재출력):\n{err}\n"
+                                f"고친 뒤 {DONE_MARKER}."
+                            ),
+                        })
+                        continue
+                    # 턴 소진 — 스모크 미통과인 채 반환(이후 독립 gate가 판정).
+                    break
+                self.last_smoke_passed = True
 
             if done or not edits:
                 break
@@ -493,9 +586,15 @@ class LocalAgentExecutor:
         if len(tail) > 600:
             tail = "…" + tail[-600:]
         files = ", ".join(applied) if applied else "(없음)"
+        if self.last_smoke_passed:
+            smoke = "스모크 pass(구조적 자기-정합)"
+        elif self.smoke_feedback_count:
+            smoke = f"스모크 미통과({self.smoke_feedback_count}회 피드백 후 턴 소진)"
+        else:
+            smoke = "스모크 off"
         return (
             f"로컬 빌더({self.model}) 완료 — 적용 파일 {len(applied)}개: {files}\n"
-            f"턴 {self.last_turns}/{self.max_turns}\n"
+            f"턴 {self.last_turns}/{self.max_turns} · {smoke}\n"
             f"--- 모델 최종 메시지(tail) ---\n{tail}"
         )
 
