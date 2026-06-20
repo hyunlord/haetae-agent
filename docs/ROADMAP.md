@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-20 · WO#1–126 · 1033 tests · main @2f8a1c6 · 🎮 Mario 챕터 시작 — 스케일 first-contact(#126): 분해·통합·게임플레이-하니스 *다 스케일 견딤*(머신이 스케일을 견딤, 벽 아님; codex 크레딧 외부 소진으로 2차 통합 게이트 직전 정지·haetae 50M cap 미도달·#91 재개 가능) · 🎯 crowd-sim 캘리브레이션 종결(#124, tight 근접 collision-free·gate 정직성 inversion 0) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
+> **최종 갱신: 2026-06-20 · WO#1–129 · 1043 tests · main @38b89d6 · 🎮 Mario 챕터 첫 완주(#129) — #128 fix(증거계약 dep-배치 + server-less 게임플레이 검증)로 *깨끗한 done*(통합 8/8·스캐폴드 낭비 0·EPERM 0·검증역전 0·~17M ≈ 7× 저렴; #126이 크레딧 소진으로 못 받은 verdict 획득) · 🎯 crowd-sim 캘리브레이션 종결(#124, tight 근접 collision-free·gate 정직성 inversion 0) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
 
 ---
 
@@ -200,6 +200,14 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - 산출물: `npm run build` exit 0(`tsc --noEmit && vite build`, 13.41kB JS 번들·14 모듈)·35 TS 파일(engine/rules/content/render/hud/input/app + 11 trace 스크립트·browser-cdp 포함) — **진짜 컴파일·플레이 가능 Vite 앱**(일반 머신선 dev 서버가 127.0.0.1로 서빙→브라우저 플레이; 샌드박스만 차단).
 - **2 갭**: **(1 소프트, 해소)** 증거계약이 `deps=[]` **스캐폴드 u0**에 부착 → 엔진(u1) 없이 충족 불가 → 토대유닛 5 dispatch 낭비(OR-대안이 흡수·자가교정). **(2 새, "플랫포머 onset")** 브라우저-하니스(headless Chrome/CDP)가 127.0.0.1 서버 띄우려다 샌드박스 loopback listen **EPERM** 차단 → `trace:browser-render` 통합 fail(게임 hollow 아님). **fix = server-less 검증**(in-sandbox engine-trace를 행동 권위로 + render는 file://·data-URI/best-effort), **ALLOWED_SANDBOXES 불변**(안전 불변 = loopback 허용 안 함, #84 강화).
 - **핵심**: 스케일은 벽이 아니다 — 분해·통합·하니스 다 견딤. 다음 캘리브레이션 타깃 = **갭#2(server-less 하니스)**, crowd-sim 아크식 *막힘→진단→수정→재실행*.
+
+### Mario 챕터 첫 깨끗한 완주 — #128 실효 (WO#128 fix + #129 RUN) 🎯
+#128(증거계약 dep-배치 + server-less 게임플레이 검증) 후 플랫포머 fresh 재실행 → **통합 8/8 done**. #126이 크레딧 소진으로 못 받은 verdict를 깨끗이 받음.
+- **#128(A) ✅ dep-배치**: 계약 u5(생산자)에만·스캐폴드 유닛 0·disp=5/pass=5(유닛당 1)·토대 낭비 0(vs #126 u0=5). #126 실패모드 구조적 소멸.
+- **#128(B) ✅ server-less**: EPERM/loopback/127.0.0.1 전부 0(런 전체·#126서 서버 띄운 u4 포함). 하니스 "서버 없는 node 헤드리스 트레이스"·dev no --host. 통합이 server-less engine-trace 증거로 8/8 통과. **ALLOWED_SANDBOXES 강화**(loopback 안 함).
+- **검증 깊이 유지·inversion 0**: 8/8 = 실제 플레이스루(이동·코인 2·스톰프·옆접촉 데미지·라이프 3→2→1→0·게임오버·게임오버 후 입력무시·canvas 124800px·HUD). server-less ≠ hollow.
+- **스케일·비용**: 5유닛·충돌 0·OR 0·escalate 0(머신 발동 불필요). ~17M(vs #126 ~124M·7× 저렴) — #128이 스캐폴드 낭비 + 브라우저-EPERM OR 처닝 제거 → 자연 done. 산출물 npm build exit 0(12.24kB·플레이 가능).
+- 아크: crowd-sim 종결(#124) → 스케일 first-contact(#126·2갭) → #128 fix → #129 깨끗한 done 🎯. **스케일은 벽 아님 + server-less 검증 실효 입증.**
 
 ### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
 **길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).
