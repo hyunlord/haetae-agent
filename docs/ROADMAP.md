@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-20 · WO#1–124 · 1033 tests · main @2f8a1c6 · 길 B 3/3 · 🎯 crowd-sim 캘리브레이션 종결 — *tight 근접 collision-free 완주*(#124, sustained tight-packing서 overlap 0·min_center≥임계·100% 완주·교착 0; gate 정직성 end-to-end inversion 0) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
+> **최종 갱신: 2026-06-20 · WO#1–126 · 1033 tests · main @2f8a1c6 · 🎮 Mario 챕터 시작 — 스케일 first-contact(#126): 분해·통합·게임플레이-하니스 *다 스케일 견딤*(머신이 스케일을 견딤, 벽 아님; codex 크레딧 외부 소진으로 2차 통합 게이트 직전 정지·haetae 50M cap 미도달·#91 재개 가능) · 🎯 crowd-sim 캘리브레이션 종결(#124, tight 근접 collision-free·gate 정직성 inversion 0) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
 
 ---
 
@@ -191,6 +191,15 @@ crowd-sim이 *지금껏 한 번도 못 닿던* 통합 run-judge에 **처음 도�
 - **빌더 레벨업**: 속도-절단(liveness hack #94/#116) → stop-not-pass(근접 붕괴 #119) → 예약/슬롯(머지 막힘 #121) → overlap-projection(근접 collision-free #124). 바 상향 + 스킬이 빌더를 진짜 collision-free까지 끌어올림.
 - **사다리 종결**: 저밀도(#95) → 중밀도-분산(#116, min_pair 209) → tight 근접 collision-free done(#124). #112 overlap-onset 정복.
 - 비용: 자연 done(40M output cap 내). 총 ~124M(입력 = codex 컨텍스트 재전송 지배, #78 알려진 패턴 — 효율 백로그).
+
+### Mario 챕터 — 스케일 first-contact (WO#126 RUN) 🎮
+중복잡도 오리지널 플랫포머(IP-클론 금지)로 스케일 첫 probe → **머신이 스케일을 견딤**(벽 아님). codex 크레딧 외부 소진으로 2차 통합 게이트 직전 정지(haetae 50M output cap 미도달·cap=0·#91 `--continue-from` 재개 가능) — 결정적 verdict 보류, 단 3대 스케일 질문은 다 답.
+- **Q1 분해@스케일 ✅**: 7유닛 disjoint(#72)·병렬 burst 작동·#40 분해 critic 정상(engine·rules·content·render+HUD·input·app + 헤드리스 engine-trace·브라우저 harness). burst가 u1+u2 동시→u3/u4/u6 동시로 스케일서 작동.
+- **Q2 통합@스케일 ✅**: 6 클린 머지·1 텍스트충돌(`package.json`→#48 통합-적응 재빌드 해소)·의미충돌(#123) 0·1 정직 통합-실패→#97 통합-OR(5 impl 리셋·**2 보존**[스캐폴드 u0 + 하니스 u6]·#91 reuse)·**escalate 0**. #97 스코핑이 교과서적 — 하니스 *계약*은 고정, *구현*만 재빌드.
+- **Q3 게임플레이 하니스 ✅ REAL(골드스탠더드, hollow 아님)**: 4 trace 표면(engine·browser-render·browser-playable·browser-failure-loop)·42필드/20스텝·anti-placeholder 조항(스캐폴드 값은 placeholder, 실증거는 u1~u6 강제). **독립 실증**(director 머신 `trace:engine` JSON): 점프아크(y384→peak306→복귀, 중력)·좌우이동·platforms_crossed 3·코인 0→1·스톰프 처치 1·옆접촉 데미지 3→2·낙하 데미지 3→2→1→0(틱 11/22/33)·깃발 클리어(clear_reached)·게임오버·HUD life [3,2,0]·canvas_non_empty_pixels 518400·keydown/up 4. crowd-sim 초기 hollow와 정반대 — 요구 행동 전부 실검증.
+- 산출물: `npm run build` exit 0(`tsc --noEmit && vite build`, 13.41kB JS 번들·14 모듈)·35 TS 파일(engine/rules/content/render/hud/input/app + 11 trace 스크립트·browser-cdp 포함) — **진짜 컴파일·플레이 가능 Vite 앱**(일반 머신선 dev 서버가 127.0.0.1로 서빙→브라우저 플레이; 샌드박스만 차단).
+- **2 갭**: **(1 소프트, 해소)** 증거계약이 `deps=[]` **스캐폴드 u0**에 부착 → 엔진(u1) 없이 충족 불가 → 토대유닛 5 dispatch 낭비(OR-대안이 흡수·자가교정). **(2 새, "플랫포머 onset")** 브라우저-하니스(headless Chrome/CDP)가 127.0.0.1 서버 띄우려다 샌드박스 loopback listen **EPERM** 차단 → `trace:browser-render` 통합 fail(게임 hollow 아님). **fix = server-less 검증**(in-sandbox engine-trace를 행동 권위로 + render는 file://·data-URI/best-effort), **ALLOWED_SANDBOXES 불변**(안전 불변 = loopback 허용 안 함, #84 강화).
+- **핵심**: 스케일은 벽이 아니다 — 분해·통합·하니스 다 견딤. 다음 캘리브레이션 타깃 = **갭#2(server-less 하니스)**, crowd-sim 아크식 *막힘→진단→수정→재실행*.
 
 ### 길 B 3/3 완주 + 검증/루프 정련 (WO#97–100)
 **길 B 완전 3/3**: md-editor + snake + **kanban** 전 사슬 완주. kanban은 #89 budget·#92 시나리오 결함으로 막혔다가, 2번 클러스터(#97/#98/#99) 적용 후 fresh 첫 완주(통합 8/8, 17.66M, 6유닛 전부 first-try, 헛재시도 0).
