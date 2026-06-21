@@ -832,3 +832,253 @@ def test_smoke_live_self_consistency(tmp_path):
     ex.run(order)
     # 스모크가 self-fix까지 끌어 구조적 자기-정합 달성(컴파일+collect 통과)
     assert la.builder_smoke(tmp_path) is None
+
+
+# ──────────────────── 스택 감지 + JS/vitest 자기-테스트 확장 (WO#146) ────────────────────
+#
+# #145: #144 자기-테스트가 u1 수렴 실증(메커니즘 작동)했으나 Python(pytest/unittest) 전용 —
+# 합성기가 게임에 흔히 고르는 JS/vitest 스택엔 inert. 북극성 태스크(snake/crowd-sim/platformer)가
+# 다 JS/Canvas이므로 증명된 lift 메커니즘을 JS로 확장. 적대 분리 sacred(빌더-측 자기-테스트, gate 불변).
+
+
+class _ScriptedSmokeRun:
+    """_smoke_run 모킹 — cmd argv를 합쳐 substr 매칭으로 (rc, out) 반환(미매칭=(0,'')). 호출 기록."""
+
+    def __init__(self, rules):  # rules: list[(substr, (rc, out))]
+        self.rules = rules
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd, cwd, timeout):
+        self.calls.append(cmd)
+        joined = " ".join(cmd)
+        for sub, ret in self.rules:
+            if sub in joined:
+                return ret
+        return (0, "")
+
+
+def _write_js_pkg(tmp_path, *, vitest=True, test_file="tests/rules.test.ts", test_body="import {x} from '../src/rules';\ntest('w', () => { expect(x()).toBe(1); });\n"):
+    (tmp_path / "package.json").write_text(
+        '{"name":"g","scripts":{"test":"vitest run"}' + (',"devDependencies":{"vitest":"^2"}' if vitest else "") + "}\n"
+    )
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "rules.ts").write_text("export const x = () => 1;\n")
+    if test_file:
+        p = tmp_path / test_file
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(test_body)
+
+
+# ── 스택 감지 ──────────────────────────────────────────────────────────────
+
+def test_detect_stack_js_by_check_cmds():
+    assert la._detect_stack(Path("/x"), ["npx vitest run"]) == "js"
+    assert la._detect_stack(Path("/x"), ["npm test"]) == "js"
+    assert la._detect_stack(Path("/x"), ["jest --ci"]) == "js"
+
+
+def test_detect_stack_python_by_check_cmds_wins(tmp_path):
+    """pytest/unittest 명령은 권위적 — package.json이 있어도 python 라우팅(혼합 회피)."""
+    (tmp_path / "package.json").write_text("{}\n")
+    assert la._detect_stack(tmp_path, ["python -m pytest -q"]) == "python"
+    assert la._detect_stack(tmp_path, ["python -m unittest discover"]) == "python"
+
+
+def test_detect_stack_js_by_package_json(tmp_path):
+    (tmp_path / "package.json").write_text("{}\n")
+    assert la._detect_stack(tmp_path, []) == "js"
+
+
+def test_detect_stack_python_default(tmp_path):
+    """신호 없음(빈 cmds·package.json 없음) → python 기본(기존 동작 무회귀)."""
+    (tmp_path / "mod.py").write_text("x=1\n")
+    assert la._detect_stack(tmp_path, []) == "python"
+    assert la._detect_stack(tmp_path, None) == "python"
+
+
+# ── JS 자기-테스트 명령 정규화 ────────────────────────────────────────────────
+
+def test_selftest_js_cmd_normalizes():
+    # npx vitest run … → 그대로(이미 one-shot)
+    assert la._selftest_js_cmd(["npx vitest run tests/rules.test.ts"]) == ["npx", "vitest", "run", "tests/rules.test.ts"]
+    # bare vitest → npx 접두 + one-shot 'run' 보장(watch-mode hang 회피)
+    assert la._selftest_js_cmd(["vitest"]) == ["npx", "--no-install", "vitest", "run"]
+    # npm test → 그대로(npm on PATH)
+    assert la._selftest_js_cmd(["npm test"]) == ["npm", "test"]
+    # jest → npx 접두(one-shot 기본)
+    assert la._selftest_js_cmd(["jest"]) == ["npx", "--no-install", "jest"]
+    # JS 러너 아님 → None
+    assert la._selftest_js_cmd(["python -m pytest"]) is None
+    assert la._selftest_js_cmd([]) is None
+
+
+# ── JS 스모크(findability) ─────────────────────────────────────────────────
+
+def test_builder_smoke_js_node_check_catches_syntax(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path, test_file=None)
+    (tmp_path / "src" / "bad.js").write_text("function f( {\n")  # 구문 오류
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([("node --check", (1, "SyntaxError: Unexpected token"))]))
+    err = la.builder_smoke(tmp_path, check_cmds=["npx vitest run"])
+    assert err is not None and "node --check" in err and "SyntaxError" in err
+
+
+def test_builder_smoke_js_clean_passes(tmp_path, monkeypatch):
+    """JS 컴파일 OK + 테스트 파일 없음 → None(구조적 OK; mirror Python clean-pass)."""
+    _write_js_pkg(tmp_path, test_file=None)
+    (tmp_path / "src" / "ok.js").write_text("export const ok = 1;\n")
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([("node --check", (0, ""))]))
+    assert la.builder_smoke(tmp_path, check_cmds=["npx vitest run"]) is None
+
+
+def test_builder_smoke_js_vitest_collect_catches_import_error(tmp_path, monkeypatch):
+    """vitest list(수집)가 테스트의 import 에러를 findability 실패로 잡는다(#138-JS 동형)."""
+    _write_js_pkg(tmp_path)
+    run = _ScriptedSmokeRun([
+        ("node --check", (0, "")),
+        ("vitest list", (1, "Error: Cannot find module '../src/rules'")),
+    ])
+    monkeypatch.setattr(la, "_smoke_run", run)
+    err = la.builder_smoke(tmp_path, check_cmds=["npx vitest run"])
+    assert err is not None and "수집 실패" in err and "Cannot find module" in err
+
+
+def test_builder_smoke_js_discovery_only_would_fail_passes(tmp_path, monkeypatch):
+    """적대 분리: vitest list는 *발견만* — 실행하면 FAIL할 테스트도 수집되면 통과(채점 아님)."""
+    _write_js_pkg(tmp_path, test_body="import {x} from '../src/rules';\ntest('w', () => { expect(x()).toBe(999); });\n")
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([
+        ("node --check", (0, "")),
+        ("vitest list", (0, "src/rules.test.ts > w")),  # 수집 성공(would-fail이어도 list는 0)
+    ]))
+    assert la.builder_smoke(tmp_path, check_cmds=["npx vitest run"]) is None
+
+
+def test_builder_smoke_js_skips_when_vitest_absent(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([
+        ("node --check", (0, "")),
+        ("vitest", (127, "")),  # vitest 미설치 → skip(빌드 막지 않음)
+    ]))
+    assert la.builder_smoke(tmp_path, check_cmds=["npx vitest run"]) is None
+
+
+# ── JS 자기-테스트 ─────────────────────────────────────────────────────────
+
+def test_builder_selftest_js_failing_returns_detail(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([
+        ("vitest run", (1, "FAIL  tests/rules.test.ts > w\nexpected 1 to be 2 // Object.is equality")),
+    ]))
+    detail = la.builder_selftest(tmp_path, check_cmds=["npx vitest run"])
+    assert detail is not None and "자기-테스트 실패" in detail
+    assert "expected 1 to be 2" in detail  # expected vs actual detail
+
+
+def test_builder_selftest_js_passing_returns_none(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([("vitest run", (0, "PASS tests/rules.test.ts"))]))
+    assert la.builder_selftest(tmp_path, check_cmds=["npx vitest run"]) is None
+
+
+def test_builder_selftest_js_no_tests_returns_none(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path, test_file=None)
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([("vitest", (1, "no test files found"))]))
+    assert la.builder_selftest(tmp_path, check_cmds=["npx vitest run"]) is None  # 테스트 파일 없음 → skip
+
+
+def test_builder_selftest_js_tool_absent_returns_none(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([("vitest", (127, ""))]))
+    assert la.builder_selftest(tmp_path, check_cmds=["npx vitest run"]) is None
+
+
+def test_builder_selftest_js_no_cmd_returns_none(tmp_path, monkeypatch):
+    _write_js_pkg(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", _ScriptedSmokeRun([("", (1, "x"))]))
+    assert la.builder_selftest(tmp_path, check_cmds=["echo hi"]) is None  # JS 러너 명령 없음 → skip
+
+
+# ── 라우팅: Python 무회귀 + JS 라우팅 ───────────────────────────────────────
+
+def test_builder_smoke_routes_python_unchanged(tmp_path):
+    """Python 워크트리(.py + pytest)는 기존 Python 경로 그대로 — collection error 잡음(무회귀)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("from nonexistent_pkg_146 import t\ndef test_a():\n    assert True\n")
+    err = la.builder_smoke(tmp_path, check_cmds=["python -m pytest tests/"])
+    assert err is not None and "collect" in err.lower()
+
+
+def test_selftest_js_feedback_iterates_end_to_end(tmp_path, monkeypatch):
+    """엔드투엔드 JS: 실 builder_smoke+builder_selftest 배선, _smoke_run 모킹으로 JS 자기-테스트
+    실패 detail이 다음 턴에 주입되고 타겟-수정 유도 → 2턴째 green까지 반복(루프는 스택-불가지)."""
+    # 테스트 파일은 워크트리에 이미 존재(빌더는 impl을 그 테스트에 맞게 고친다 — _js_test_files 비지 않게).
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "rules.test.ts").write_text(
+        "import {x} from '../src/rules';\ntest('w', () => { expect(x()).toBe(1); });\n"
+    )
+    fake = FakePost([
+        _block("src/rules.ts", "export const x = () => 2;") + f"\n{DONE_MARKER}",
+        _block("src/rules.ts", "export const x = () => 1;") + f"\n{DONE_MARKER}",
+    ])
+    monkeypatch.setattr(la, "post_chat", fake)
+    # node --check OK; vitest list(수집) OK; vitest run: 1턴째 FAIL → 2턴째 PASS.
+    state = {"runs": 0}
+
+    def smoke_run(cmd, cwd, timeout):
+        joined = " ".join(cmd)
+        if "node --check" in joined or "vitest list" in joined:
+            return (0, "")
+        if "vitest run" in joined:
+            state["runs"] += 1
+            return (1, "FAIL > w\nexpected 2 to be 1") if state["runs"] == 1 else (0, "PASS")
+        return (0, "")
+
+    monkeypatch.setattr(la, "_smoke_run", smoke_run)
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=4,
+        verify=la.builder_smoke, selftest=la.builder_selftest,
+    )
+    order = NextOrder(unit="u1", goal="JS 모듈", local_checks=[Check(type=CheckType.test, cmd="npx vitest run")], executor="local")
+    ex.run(order)
+    assert ex.selftest_feedback_count == 1 and ex.last_selftest_passed is True
+    # 주입된 메시지에 JS 실패 detail + 타겟-수정 유도
+    msgs = fake.calls[1]["payload"]["messages"]
+    assert any("expected 2 to be 1" in m.get("content", "") for m in msgs if m["role"] == "user")
+    assert any("타겟 수정" in m.get("content", "") for m in msgs if m["role"] == "user")
+
+
+# ── 적대 분리(sacred) + 서버리스 ───────────────────────────────────────────
+
+def test_js_selftest_is_builder_side_not_judge():
+    """적대 분리: JS 자기-테스트/스모크도 judge/gate/run-judge 무참조 + 서버리스(loopback 금지)."""
+    src = Path(la.__file__).read_text(encoding="utf-8")
+    assert "def _builder_selftest_js" in src and "def _builder_smoke_js" in src
+    assert "vitest" in src  # JS 확장 존재
+    for forbidden in ("haetae.judge", "haetae.gate", "GateResult", "run_judge", "CompositeGate"):
+        assert forbidden not in src, f"local_agent이 {forbidden} 참조(분리 위반)"
+    # 서버리스(#128): 워크트리 내 node/vitest 실행만 — 서버 호스팅/loopback listen 없음
+    for forbidden in ("127.0.0.1", "0.0.0.0", "http.server", ".listen(", "createServer"):
+        assert forbidden not in src, f"local_agent이 {forbidden} 참조(서버리스 위반)"
+
+
+@pytest.mark.skipif(
+    os.environ.get("HAETAE_LOCAL_IT") != "1",
+    reason="실 JS 빌더 통합은 opt-in (HAETAE_LOCAL_IT=1; node+vitest 필요)",
+)
+def test_selftest_js_live_self_consistency(tmp_path):
+    """라이브 JS: 실 로컬 빌더 + JS 자기-테스트로 vitest-green 모듈+테스트를 만든다(node/vitest 있으면)."""
+    endpoint = os.environ.get("HAETAE_LOCAL_ENDPOINT", "http://100.70.109.50:8089/v1")
+    model = os.environ.get("HAETAE_LOCAL_MODEL", "qwen2.5-coder:7b")
+    (tmp_path / "package.json").write_text('{"name":"g","scripts":{"test":"vitest run"}}\n')
+    ex = LocalAgentExecutor(
+        endpoint=endpoint, model=model, workdir=str(tmp_path), max_turns=4,
+        verify=la.builder_smoke, selftest=la.builder_selftest,
+    )
+    order = NextOrder(
+        unit="it_js",
+        goal="src/calc.ts에 add(a,b)를 구현하고 tests/calc.test.ts에 vitest로 add(2,3)===5를 검증하라.",
+        local_checks=[Check(type=CheckType.test, cmd="npx vitest run")],
+        executor="local",
+        deliverable="calc 모듈 + vitest 테스트",
+    )
+    ex.run(order)
+    assert (tmp_path / "src" / "calc.ts").exists()

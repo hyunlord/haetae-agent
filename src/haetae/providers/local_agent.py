@@ -378,6 +378,137 @@ def _py_files(workdir: Path, cap: int = 300) -> list[Path]:
     return files
 
 
+# ──────────────────────────── 스택 감지 + JS/node 미러 (WO#146) ────────────────────────────
+#
+# #145: #144 자기-테스트가 u1 수렴 실증(메커니즘 작동)했으나 Python(pytest/unittest) 전용 —
+# 합성기가 게임에 흔히 고르는 JS/vitest 스택엔 inert(_py_files 비어 → no-op으로 "통과"). 북극성
+# 태스크(snake/crowd-sim/platformer)가 다 JS/Canvas이므로 증명된 lift 메커니즘을 JS로 확장한다.
+# 스모크(findability)·자기-테스트를 *스택에 맞게 라우팅* — Python 경로는 분기 가드로 **무회귀**.
+# 적대 분리 sacred·불변: JS도 빌더-측(자기 테스트 green) — 독립 적대 gate가 진짜 바(gate 무접촉).
+
+# JS 테스트 러너 마커(check_cmds에 있으면 JS 스택 — gate 러너를 권위 신호로). 'npm test'류 포함.
+_JS_TEST_RUNNER_MARKERS = (
+    "vitest", "jest", "npm test", "npm run test", "pnpm test", "pnpm run test",
+    "yarn test", "node --test",
+)
+# JS/TS 소스 확장자(.d.ts 타입선언은 제외 — 컴파일/실행 대상 아님).
+_JS_SRC_EXTS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
+
+
+def _detect_stack(workdir: Path, check_cmds: list[str] | None = None) -> str:
+    """빌더 워크트리/체크명령으로 스택을 감지: "python" | "js"(기본 "python" — 기존 동작 안전).
+
+    1순위 = check_cmds(gate가 실제로 돌릴 러너 — 가장 신뢰): pytest/unittest → python,
+    vitest/jest/npm-test류 → js. 2순위 = 파일: package.json 있으면 js. 그 외 → python(기본).
+    pytest/unittest가 있으면 package.json이 있어도 python(혼합 워크트리서 Python 의도 우선).
+    """
+    blob = " ".join(c for c in (check_cmds or []) if c).lower()
+    if "pytest" in blob or "unittest" in blob:
+        return "python"
+    if any(m in blob for m in _JS_TEST_RUNNER_MARKERS):
+        return "js"
+    if (Path(workdir) / "package.json").is_file():
+        return "js"
+    return "python"
+
+
+def _js_files(workdir: Path, cap: int = 400) -> list[Path]:
+    """workdir의 JS/TS 소스 파일들(노이즈 디렉토리 제외, .d.ts 제외, cap). 구문/스모크 대상."""
+    files: list[Path] = []
+    for root, dirs, names in os.walk(workdir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+        for n in names:
+            if n.endswith(_JS_SRC_EXTS) and not n.endswith(".d.ts"):
+                files.append(Path(root) / n)
+                if len(files) >= cap:
+                    return files
+    return files
+
+
+def _js_test_files(workdir: Path) -> list[Path]:
+    """JS/TS 테스트 파일들(*.test.* / *.spec.*) — 디스커버리/자기-테스트 존재 판정."""
+    return [f for f in _js_files(workdir) if ".test." in f.name or ".spec." in f.name]
+
+
+def _smoke_node_check(workdir: Path, timeout: float) -> str | None:
+    """`node --check`로 평문 JS(.js/.mjs/.cjs) *구문만* 검사(실행 아님). node 부재면 skip(None).
+
+    .ts/.tsx는 node가 못 파싱하므로 제외(_smoke_tsc 소관). py_compile의 JS 동형 — 컴파일/문법만.
+    """
+    for f in _js_files(workdir):
+        if f.suffix not in (".js", ".mjs", ".cjs"):
+            continue
+        rc, out = _smoke_run(["node", "--check", str(f)], workdir, timeout)
+        if rc in (127, 124):
+            return None  # node 부재/타임아웃 → skip(빌드 막지 않음)
+        if rc != 0:
+            rel = os.path.relpath(str(f), str(workdir))
+            return f"[smoke node --check 실패] {rel} (구문 오류):\n{out.strip()[-1500:]}"
+    return None
+
+
+def _smoke_tsc(workdir: Path, timeout: float) -> str | None:
+    """tsconfig.json + 설치된 tsc가 있으면 `tsc --noEmit`(타입/컴파일 검사, *실행 아님*). 없으면 skip.
+
+    오프라인 규율: 설치된 `node_modules/.bin/tsc`만 쓴다(네트워크 install 안 함). 부재면 None(skip).
+    """
+    wd = Path(workdir)
+    if not (wd / "tsconfig.json").is_file():
+        return None
+    tsc = wd / "node_modules" / ".bin" / "tsc"
+    if not tsc.exists():
+        return None  # tsc 미설치 → skip(오프라인; 네트워크 install 금지)
+    rc, out = _smoke_run([str(tsc), "--noEmit"], workdir, timeout)
+    if rc in (127, 124):
+        return None
+    if rc != 0:
+        return f"[smoke tsc --noEmit 실패] (타입/컴파일 오류):\n{out.strip()[-2000:]}"
+    return None
+
+
+def _smoke_vitest_collect(workdir: Path, timeout: float) -> str | None:
+    """`vitest list` = 테스트 *수집/발견만*(실행/채점 아님 — gate 소관·불변). 미설치면 skip(None).
+
+    설치된 `node_modules/.bin/vitest`를 우선, 없으면 `npx --no-install vitest`(오프라인). 수집 실패
+    (import/컴파일 에러 → exit≠0)를 findability 실패로 빌더-측서 잡는다(#138-JS 동형, would-fail
+    테스트도 수집되면 통과 — 실행 안 하므로 채점 아님).
+    """
+    wd = Path(workdir)
+    vbin = wd / "node_modules" / ".bin" / "vitest"
+    cmd = [str(vbin), "list"] if vbin.exists() else ["npx", "--no-install", "vitest", "list"]
+    rc, out = _smoke_run(cmd, workdir, timeout)
+    low = out.lower()
+    if rc in (127, 124) or "not found" in low or "could not determine" in low or "npm error" in low:
+        return None  # vitest 부재 → skip
+    if rc != 0:
+        return (
+            f"[smoke vitest 수집 실패] vitest list (exit {rc}) — 테스트 발견/임포트 실패"
+            "(테스트가 import하는 모듈 경로/이름이 impl과 정확히 일치하는지 확인):\n"
+            + out.strip()[-2000:]
+        )
+    return None
+
+
+def _builder_smoke_js(
+    workdir: Path, *, check_cmds: list[str] | None = None, timeout: float = 60.0
+) -> str | None:
+    """빌더-측 구조적 스모크(JS): (1) node --check 구문 + tsc --noEmit + (2) vitest 수집(발견만).
+
+    builder_smoke의 JS 분기 — Python 경로와 동형(컴파일/문법 → 테스트 있으면 디스커버리). **판정
+    아님**(실행/채점은 독립 적대 gate 소관·불변). 통과면 None, 실패면 정확한 에러(다음 턴 주입).
+    툴 부재면 그 단계 skip(best-effort — 진짜 검증은 gate).
+    """
+    err = _smoke_node_check(workdir, timeout)
+    if err:
+        return err
+    err = _smoke_tsc(workdir, timeout)
+    if err:
+        return err
+    if not _js_test_files(workdir):
+        return None  # 테스트 파일 없음 → 구문 OK로 구조적 충분(mirror Python clean-pass)
+    return _smoke_vitest_collect(workdir, timeout)
+
+
 def _parse_unittest_discovery(cmds: list[str]) -> tuple[str, str] | None:
     """gate 체크 명령들에 `unittest discover`가 있으면 그 -s(start)·-p(pattern)을 뽑는다(WO#141).
 
@@ -523,8 +654,11 @@ def builder_smoke(
     check_cmds(유닛 gate 체크 명령)를 알면 그 러너(pytest/unittest discover)를 미러해 #140의 exit-5
     (스모크 통과인데 gate가 테스트를 못 찾던 불일치)를 빌더-측서 잡는다. 모르면 양쪽 디스커버리.
     best-effort: 툴 부재면 그 단계 skip(빌드 막지 않음 — 진짜 검증은 gate).
+    WO#146: JS/node 스택이면 JS 분기로 라우팅(node --check/tsc/vitest 수집). Python 경로 무회귀.
     """
     workdir = Path(workdir)
+    if _detect_stack(workdir, check_cmds) == "js":
+        return _builder_smoke_js(workdir, check_cmds=check_cmds, timeout=timeout)
     # 1) 컴파일/문법 — py_compile은 *실행하지 않고* 파싱/바이트컴파일만(안전).
     for f in _py_files(workdir):
         try:
@@ -600,6 +734,64 @@ def _selftest_cmd(check_cmds: list[str] | None) -> list[str] | None:
     return None
 
 
+def _selftest_js_cmd(check_cmds: list[str] | None) -> list[str] | None:
+    """check_cmds에서 *JS 테스트 실행* 명령(vitest/jest/npm test)을 골라 실행 가능 argv로 정규화(WO#146).
+
+    gate가 돌릴 러너를 미러하되: bare `vitest`/`jest`는 `npx --no-install` 접두(워크트리 .bin 사용·
+    오프라인), vitest는 one-shot `run` 보장(watch-mode hang 회피; 타임아웃도 백스톱). `npm test`류는
+    그대로(npm on PATH). JS 러너 명령이 없으면 None(skip — findability는 스모크 소관).
+    """
+    for cmd in check_cmds or []:
+        low = cmd.lower()
+        if not any(m in low for m in _JS_TEST_RUNNER_MARKERS):
+            continue
+        try:
+            toks = shlex.split(cmd)
+        except ValueError:
+            toks = cmd.split()
+        if not toks:
+            continue
+        if "vitest" in low:
+            vi = next((j for j, t in enumerate(toks) if "vitest" in t.lower()), None)
+            if vi is not None and "run" not in toks[vi:] and "list" not in toks[vi:]:
+                toks = toks[: vi + 1] + ["run"] + toks[vi + 1:]  # one-shot 강제
+            if toks[0].lower() == "vitest":
+                toks = ["npx", "--no-install", *toks]
+        elif toks[0].lower() == "jest":
+            toks = ["npx", "--no-install", *toks]
+        return toks
+    return None
+
+
+def _builder_selftest_js(
+    workdir: Path, *, check_cmds: list[str] | None = None, timeout: float = 60.0
+) -> str | None:
+    """빌더-측 정밀 자기-테스트(JS) — builder_selftest의 JS 분기(Python 경로와 동형, WO#146).
+
+    빌더가 *자기 vitest/jest 테스트를 실행*해 실패 시 정확한 detail(실패 테스트명·expected vs
+    received·stack)을 반환 → 호출부가 다음 턴에 주입 → *타겟 수정* → green까지 반복. 테스트 파일
+    있을 때만(없으면 None=skip; findability는 스모크 소관). 툴 부재(127)/타임아웃(124) → None.
+    **적대 분리**: 빌더가 *자기 테스트*를 green으로 모는 TDD 자기검사 — judge/gate 무접촉. 독립
+    적대 gate(행동 run-judge·hollow·통합)가 진짜 바(불변): green = 필요조건이지 충분조건 아님.
+    """
+    if not _js_test_files(workdir):
+        return None  # 테스트 파일 없음 → 실행할 자기-테스트 없음
+    cmd = _selftest_js_cmd(check_cmds)
+    if cmd is None:
+        return None  # JS 테스트 명령 모름 → skip(findability는 스모크 안전망)
+    rc, out = _smoke_run(cmd, workdir, timeout)
+    if rc in (127, 124):
+        return None  # 툴 부재/타임아웃 → skip(빌드 막지 않음 — 진짜 검증은 gate)
+    if rc != 0:  # vitest/jest 비0 = 테스트 실패(테스트 파일 존재 → "no tests" 아님) → detail 피드백
+        body = out.strip()[-3000:]
+        return (
+            "[빌더 자기-테스트 실패] " + " ".join(cmd) + f" (exit {rc}). 아래 *정확한 실패 detail*"
+            "(실패 테스트명·expected vs received·stack)을 보고 *실패 지점만 타겟 수정*하라"
+            "(전체 재생성 말고 — 통과 중인 부분은 유지):\n" + body
+        )
+    return None  # rc 0 = green
+
+
 def builder_selftest(
     workdir: Path, *, check_cmds: list[str] | None = None, timeout: float = 60.0
 ) -> str | None:
@@ -615,8 +807,11 @@ def builder_selftest(
     *아님*(import·호출 0). 독립 적대 gate(행동 run-judge·hollow 탐지·통합)가 *진짜 바*로 불변:
     빌더 자기-테스트 green = 필요조건이지 충분조건 아님(gate가 hollow green을 잡는다). 빌트코드 실행은
     스모크와 동일 오프라인 posture(_smoke_run, 네트워크 미부여). ALLOWED_SANDBOXES 불변.
+    WO#146: JS/node 스택이면 JS 분기로 라우팅(vitest/jest 실행→detail). Python 경로 무회귀.
     """
     workdir = Path(workdir)
+    if _detect_stack(workdir, check_cmds) == "js":
+        return _builder_selftest_js(workdir, check_cmds=check_cmds, timeout=timeout)
     if not any("test" in f.name for f in _py_files(workdir)):
         return None  # 테스트 파일 없음 → 실행할 자기-테스트 없음
     cmd = _selftest_cmd(check_cmds)
