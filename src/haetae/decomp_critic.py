@@ -46,11 +46,47 @@ _INTEGRATION_MARKERS = (
 )
 _OVER_LARGE_THRESHOLD = 4  # ≥4개 독립 행동 클로즈를 한 유닛에 묶으면 과대(약한 빌더 기준).
 
+# WO#152: distinct-KIND 책임 분류 — *서로 다른 종류*의 검증가능 로직(판정 vs 상태전이 vs
+# 렌더 vs 입력)을 한 유닛에 묶으면 행동 수가 임계(≥4) 미만이라도 분할(예: #151 u3 =
+# 충돌 *판정*(detection) + game-over *상태고정*(state) = 2 종류 → escalate). 같은-종류
+# 하위측면(벽충돌+자기충돌 = 둘 다 detection)은 한 KIND으로 묶여 과분할 안 함(가드 유지).
+_RESPONSIBILITY_KINDS: dict[str, tuple[str, ...]] = {
+    "판정(detection)": (
+        "충돌", "판정", "감지", "검출", "겹침", "경계 검사", "경계검사",
+        "collision", "collide", "detect", "overlap", "hit-test", "hittest", "boundary check",
+    ),
+    "상태전이(state)": (
+        "게임오버", "game over", "gameover", "game-over", "상태 고정", "상태고정",
+        "상태 전이", "상태전이", "상태 관리", "상태관리", "생명주기", "재시작", "일시정지",
+        "freeze", "transition", "state machine", "lifecycle", "restart", "pause", "reset",
+    ),
+    "렌더(render)": (
+        "렌더", "그리기", "그린다", "canvas", "캔버스", "화면 표시", "화면에 표시",
+        "render", "draw", "display", "paint", "repaint",
+    ),
+    "입력(input)": (
+        "키보드 입력", "키 입력", "입력 처리", "키 이벤트", "화살표 키", "조작 처리",
+        "keyboard", "keypress", "keydown", "arrow key", "input handl", "event handler",
+    ),
+}
+
 
 def _behavior_clauses(text: str) -> list[str]:
     """텍스트를 리스트 구분자로 쪼개 *비자명* 행동 클로즈만 반환(길이<2·순수 filler 제외)."""
     parts = [p.strip(" \t·*-—:") for p in _BEHAVIOR_SEP.split(text or "")]
     return [p for p in parts if len(p) >= 2 and p not in ("및", "등", "그리고", "and")]
+
+
+def _distinct_kinds(text: str) -> list[str]:
+    """blob이 건드리는 *서로 다른 종류*의 책임 라벨 목록(WO#152). 같은 종류 하위측면은
+    한 라벨로 접힌다(벽충돌+자기충돌 = '판정' 1개) → 과분할 가드. 키워드는 구체적이라
+    우연 매칭이 적다. distinct 종류가 ≥2면 단일-책임 위반(판정 vs 상태전이 등) 신호."""
+    low = (text or "").lower()
+    found: list[str] = []
+    for label, kws in _RESPONSIBILITY_KINDS.items():
+        if any(kw.lower() in low for kw in kws):
+            found.append(label)
+    return found
 
 
 def granularity_signal(order: NextOrder) -> str | None:
@@ -65,14 +101,26 @@ def granularity_signal(order: NextOrder) -> str | None:
     if any(m in blob.lower() for m in _INTEGRATION_MARKERS):
         return None  # 통합/조립 유닛 — 모듈 wire(disjoint-scope 소유), 과대 아님
     clauses = _behavior_clauses(blob)
-    if len(clauses) < _OVER_LARGE_THRESHOLD:
+    kinds = _distinct_kinds(blob)  # WO#152: 서로 다른 *종류*의 책임(판정/상태전이/렌더/입력)
+    over_count = len(clauses) >= _OVER_LARGE_THRESHOLD     # 행동 수 과대(#148)
+    distinct_kind = len(kinds) >= 2                        # distinct 종류 묶음(#152 — #151 u3)
+    if not (over_count or distinct_kind):
         return None
-    head = ", ".join(clauses[:6])
+    if distinct_kind:
+        # #152: 행동 수가 임계 미만이어도 서로 다른 종류의 책임이면 분할(같은-종류는 1라벨로 접힘).
+        why = (
+            f"이 유닛이 서로 다른 *종류*의 책임 {len(kinds)}개({', '.join(kinds)})를 묶음 — "
+            "판정·상태전이·렌더·입력처럼 독립적으로 검증되는 distinct 책임은 별도 유닛이어야 "
+            "한다(#151 u3: 충돌 판정 + game-over 상태고정이 한 유닛이라 미수렴·escalate)"
+        )
+    else:
+        head = ", ".join(clauses[:6])
+        why = f"이 유닛이 독립 행동을 약 {len(clauses)}개({head}…) 한 덩어리로 묶음"
     return (
-        f"이 유닛이 독립 행동을 약 {len(clauses)}개({head}…) 한 덩어리로 묶음. 약한 로컬 "
-        "빌더가 단일 유닛으로 신뢰성있게 수렴하기엔 과대 — 각 독립 행동을 *distinct 모듈 "
-        "파일을 소유하는 단일-책임 disjoint-scope 유닛*으로 쪼개고(파일 겹침 0), 별도 통합/"
-        "조립 유닛이 wire하도록 분할 권고."
+        f"{why}. 약한 로컬 빌더가 단일 유닛으로 신뢰성있게 수렴하기엔 과대 — 각 (종류별) "
+        "책임을 *distinct 모듈 파일을 소유하는 단일-책임 disjoint-scope 유닛*으로 쪼개고"
+        "(파일 겹침 0), 별도 통합/조립 유닛이 wire하도록 분할 권고. (단 같은 종류 하위측면은 "
+        "묶음 유지 — 과분할 금지.)"
     )
 
 

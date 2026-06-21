@@ -205,6 +205,41 @@ def test_granularity_signal_exempts_integration_unit():
     ) is None
 
 
+def test_granularity_signal_flags_distinct_kind_responsibilities():
+    """WO#152: ≥4 행동 임계 *미만*이라도 서로 다른 *종류*의 검증가능 책임(판정 + 상태전이)을
+    한 유닛에 묶으면 분할 권고 — #151 u3(충돌 판정 + game-over 상태고정)가 escalate한 케이스.
+    이 케이스는 clause<4라 기존 ≥4-count로는 안 걸리고 distinct-KIND 기준으로 걸려야 한다."""
+    order = NextOrder(
+        unit="u3",
+        goal="collision.js: 벽/자기몸 충돌 판정 및 game over 이후 상태 고정",
+        deliverable="collision.js + test",
+    )
+    # 기존 ≥4-count로는 안 잡히는 입력임을 명시(distinct-KIND가 트리거 — 회귀 격리)
+    from haetae.decomp_critic import _behavior_clauses, _OVER_LARGE_THRESHOLD
+    assert len(_behavior_clauses(order.goal)) < _OVER_LARGE_THRESHOLD
+    sig = granularity_signal(order)
+    assert sig is not None
+    assert "단일-책임" in sig and "disjoint" in sig.lower()
+    assert "종류" in sig or "distinct" in sig.lower()  # distinct-KIND 근거 노출
+
+
+def test_granularity_signal_flags_distinct_kind_render_plus_input():
+    """WO#152 일반성(충돌+상태 외): 렌더 + 입력처럼 다른 종류 책임 묶음도 분할 권고."""
+    order = NextOrder(unit="u4",
+                      goal="canvas 렌더링과 키보드 입력 처리를 함께 구현",
+                      deliverable="ui.js")
+    assert granularity_signal(order) is not None
+
+
+def test_granularity_signal_same_kind_subaspects_not_oversplit():
+    """WO#152 과분할 가드: 같은 종류 하위측면(벽 충돌 + 자기몸 충돌 + 겹침 = 셋 다 detection)은
+    1 KIND → 분할 안 함(과분할 금지). distinct-KIND 기준이 같은-종류를 묶는지 확인."""
+    assert granularity_signal(
+        NextOrder(unit="u3", goal="collision.js: 벽 충돌, 자기몸 충돌, 머리-몸통 겹침 판정",
+                  deliverable="collision.js")
+    ) is None
+
+
 def test_granularity_signal_wired_into_critic_prompt():
     """과대-다행동 유닛이면 입도 신호가 critic(codex) user 프롬프트에 주입된다(codex가 판정)."""
     client = MockClient([_WEAK_YAML])
@@ -257,3 +292,27 @@ def test_decomp_critic_prompt_has_granularity_axis():
     """decomp-critic 프롬프트가 입도/책임 수 축(과대-다행동 유닛 weak)을 담는다(WO#148)."""
     dc = DECOMP_PROMPT.read_text(encoding="utf-8")
     assert "입도" in dc and "단일-책임" in dc
+
+
+def test_synthesizer_prompt_has_distinct_kind_split_criterion():
+    """WO#152: 합성기가 *서로 다른 종류*의 책임(판정/상태전이/렌더/입력) 분할 기준을 담되,
+    같은-종류 하위측면 과분할 금지 가드는 유지(게임오버 상태 ≠ 충돌 판정 = distinct → 분할)."""
+    syn = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8")
+    assert "종류" in syn  # distinct-KIND 분할 기준(행동 수만이 아니라 책임의 종류)
+    assert "하위측면" in syn or "과분할" in syn  # 같은-종류 묶음은 과분할 금지(가드 유지)
+
+
+def test_decomp_critic_prompt_has_distinct_kind_axis():
+    """WO#152: decomp-critic 프롬프트가 distinct-종류 책임 분할 축을 담는다(판정 vs 상태전이 등)."""
+    dc = DECOMP_PROMPT.read_text(encoding="utf-8")
+    assert "종류" in dc
+
+
+def test_decomposition_prompts_stay_concise():
+    """WO#152: distinct-KIND 정밀화를 #150-B 간결 길이 안에서 — 프롬프트 길이 회귀 모니터.
+    (서사 없이 기준만 추가; 합성 콜 수 회귀 0 목표의 프록시.)"""
+    syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
+    dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
+    # #152 직전: synthesizer 343, decomp_critic 73. distinct-KIND 기준은 소폭만 허용.
+    assert syn_lines <= 350, f"synthesizer.md 길이 회귀({syn_lines}>350) — #150-B 간결 위반"
+    assert dc_lines <= 80, f"decomp_critic.md 길이 회귀({dc_lines}>80)"
