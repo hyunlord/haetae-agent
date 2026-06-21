@@ -17,6 +17,7 @@ from haetae.scaffold import (
     commit_scaffold,
     generate_scaffold,
     prepare_worktree_deps,
+    trace_harness_skeleton,
     write_scaffold,
 )
 from haetae.worktree import ROOT_NAME
@@ -424,3 +425,89 @@ def test_executor_sandbox_allowlist_unchanged():
 
     assert ALLOWED_SANDBOXES == ("read-only", "workspace-write")
     assert not any("danger" in s for s in ALLOWED_SANDBOXES)
+
+
+# ──────────────── 트레이스-하니스 스캐폴드 (WO#157, #156 u8 fix) ────────────────
+#
+# #156: 검증 트레이스는 한 end-to-end 유닛이라야 하나(행동-split 금지) 약빌더 역량 초과 → escalate.
+# #27 원칙으로 director가 트레이스-하니스 보일러플레이트(엔진 로드·tick 드라이버·상태 레코더·단언
+# 프레임)를 선제 생성 → 빌더는 시나리오+단언만 채움. 골격은 인프라지 단언/판정 아님(run-judge 독립).
+
+
+def _spec_with_trace(trace_desc="헤드리스 트레이스 하니스로 풀-행동 사슬을 구동해 evidence emit"):
+    return ProjectSpec.model_validate(
+        {
+            "spec_id": "scaf-trace", "version": 1, "order_raw": "snake 게임",
+            "goal": "snake 게임", "task_type": "feature_impl",
+            "verifiability": "objective", "mode": "normal",
+            "acceptance_criteria": [
+                {"id": "ac1", "desc": "d",
+                 "check": {"type": "run", "cmd": "node scripts/trace/full-gameplay.mjs"}}
+            ],
+            "non_goals": ["n"], "done_when": "ac1",
+            "decomposition": [
+                {"unit": "u1", "desc": "이동 엔진", "deps": []},
+                {"unit": "u8", "desc": trace_desc, "deps": ["u1"]},
+            ],
+        }
+    )
+
+
+def test_trace_harness_skeleton_present_for_trace_unit():
+    """WO#157: 검증 트레이스-하니스 유닛이 있으면 보일러플레이트 골격(경로→내용)을 생성한다."""
+    sk = trace_harness_skeleton(_spec_with_trace())
+    assert sk is not None
+    [(path, content)] = list(sk.items())
+    assert path.endswith(".mjs") and "trace" in path
+    for marker in ("import", "drive", "snapshot", "scenario", "evidence", "stdout"):
+        assert marker in content, marker  # 엔진로드·tick·레코더·시나리오·증거·emit 골격
+
+
+def test_trace_harness_skeleton_is_serverless():
+    """WO#157: 골격은 서버리스(#128) — 헤드리스 node, loopback/서버 0."""
+    content = next(iter(trace_harness_skeleton(_spec_with_trace()).values())).lower()
+    for forbidden in ("createserver", ".listen(", "127.0.0.1", "localhost", "express", "app.listen"):
+        assert forbidden not in content, forbidden
+
+
+def test_trace_harness_skeleton_is_boilerplate_not_assertions():
+    """WO#157 적대 분리: 골격은 인프라/TODO지 *단언/판정*이 아니다 — 빌더가 시나리오+단언 채움.
+    run-judge가 트레이스 출력을 #113 풀-사슬로 독립 평가(바 불변)."""
+    content = next(iter(trace_harness_skeleton(_spec_with_trace()).values()))
+    assert "TODO(builder)" in content        # 빌더가 채울 자리
+    assert "scenario = [" in content          # 시나리오 자리(빈 배열 + TODO)
+    low = content.lower()
+    assert "assert(" not in low and "expect(" not in low  # 박힌 단언 0
+    assert "describe(" not in low                          # 박힌 테스트/판정 0
+
+
+def test_trace_harness_skeleton_none_without_trace_unit():
+    """WO#157 무회귀: 트레이스 유닛 없는 spec(빌드 유닛만) → 골격 없음(None)."""
+    assert trace_harness_skeleton(_spec()) is None
+
+
+def test_trace_harness_skeleton_skips_prep_naming_unit():
+    """WO#157: 트레이스를 *언급*만 하는 준비/네이밍 유닛은 골격 트리거 안 함(#99 동형)."""
+    assert trace_harness_skeleton(_spec_with_trace(trace_desc="trace 스크립트 이름 준비만")) is None
+
+
+def test_generate_scaffold_merges_trace_skeleton():
+    """WO#157: generate_scaffold가 (LLM) 스택 골격 + (결정적) 트레이스 골격을 합친다."""
+    scaffold = generate_scaffold(_spec_with_trace(), MockClient([SCAFFOLD_YAML]))
+    assert scaffold is not None
+    assert "package.json" in scaffold.files                       # 스택 골격 보존
+    assert any("harness.skeleton" in p for p in scaffold.files)   # 트레이스 골격 병합
+
+
+def test_generate_scaffold_trace_only_when_no_stack():
+    """WO#157: 스택 불필요(LLM null)여도 트레이스 유닛 있으면 트레이스 골격만 반환(install=False)."""
+    scaffold = generate_scaffold(_spec_with_trace(), MockClient(["null"]))
+    assert scaffold is not None and scaffold.install is False
+    assert any("harness.skeleton" in p for p in scaffold.files)
+
+
+def test_generate_scaffold_no_trace_unit_unchanged():
+    """WO#157 무회귀: 트레이스 유닛 없으면 generate_scaffold 동작 불변(스택만, 트레이스 골격 0)."""
+    scaffold = generate_scaffold(_spec(), MockClient([SCAFFOLD_YAML]))
+    assert scaffold is not None and "package.json" in scaffold.files
+    assert not any("harness.skeleton" in p for p in scaffold.files)

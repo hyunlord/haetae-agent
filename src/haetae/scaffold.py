@@ -68,7 +68,7 @@ def _dump_spec(spec: ProjectSpec) -> str:
     )
 
 
-def generate_scaffold(
+def _generate_stack_scaffold(
     spec: ProjectSpec,
     client: LLMClient,
     prompt_path: str | Path = DEFAULT_SCAFFOLD_PROMPT_PATH,
@@ -109,6 +109,117 @@ def generate_scaffold(
         )
     except ValidationError:
         return None
+
+
+# ──────────────────────── 트레이스-하니스 스캐폴드 (WO#157) ────────────────────────
+#
+# #156 진단: 검증 *트레이스*(풀-사슬 플레이스루)는 한 end-to-end 유닛이라야 한다(행동-split 금지 —
+# #157 decomp-critic). 그러나 그 한 유닛이 약빌더 역량 초과 → escalate. #27 원칙으로 director가
+# 트레이스-하니스 *보일러플레이트*(엔진 로드·결정적 tick 드라이버·상태 레코더·단언 프레임)를 선제
+# 생성해 tractable화한다. **빌더는 시나리오 시퀀스 + 행동별 단언만 채운다**(아래 TODO). 스캐폴드는
+# 인프라(보일러플레이트)지 *단언/시나리오/판정이 아니다* — run-judge가 트레이스 *출력*을 #113 풀-사슬로
+# 독립 평가(적대 분리·바 불변). 서버리스(#128): 헤드리스 node, loopback/서버 금지.
+
+# 트레이스-하니스 유닛 탐지(보수적·로컬 — intake와 동형, import 사이클 회피).
+_TRACE_UNIT_MARKERS = (
+    "트레이스", "하니스", "헤드리스", "trace", "harness", "headless", "playthrough", "플레이스루",
+)
+_TRACE_UNIT_EXCLUDE = (  # 트레이스를 *언급*만 하고 생산 안 하는 준비/네이밍 유닛(#99 동형)
+    "이름 준비", "이름만", "구조만", "네이밍", "naming", "스크립트 이름",
+)
+
+# 별도 *참고 경로* — 빌더의 실제 트레이스 파일/스택 파일을 덮어쓰지 않는다(continue-from seed 안전).
+_TRACE_HARNESS_SKELETON_PATH = "scripts/trace/harness.skeleton.mjs"
+# 보일러플레이트 골격(결정적·서버리스). 빌더가 TODO(시나리오+단언)만 채운다 — 판정/단언 아님.
+_TRACE_HARNESS_SKELETON = '''\
+// haetae 트레이스-하니스 스캐폴드 (#157 · #27 원칙) — *보일러플레이트 골격*.
+// 빌더는 아래 TODO(시나리오 시퀀스 + 행동별 단언)만 채운다. 검증 트레이스는 한 end-to-end 유닛
+// (행동-split 금지, #157) — 한 플레이스루로 통합 게임 전체를 구동해 증거를 emit한다.
+// 판정은 *이 파일이 안 한다* — 독립 run-judge가 트레이스 *출력(stdout JSON)*을 #113 풀-사슬로
+// 평가한다(부분 트레이스는 fail — 바 불변). 서버리스(#128): 헤드리스 node, http/listen/서버 금지.
+
+// -- 1. 엔진/모듈 로드 (빌더: 실제 import 경로로 교체) -----------------------------------
+// import { createGame, step } from "../../src/engine/index.js"  // TODO(builder): 실제 경로
+
+// -- 2. 상태 레코더 (틱별 관측 상태 캡처 - 빌더: 검증할 필드 채움) ------------------------
+function snapshot(game) {
+  // TODO(builder): 검증할 상태 필드를 game에서 캡처(head/length/score/collision/game_over 등)
+  return {};
+}
+
+// -- 3. 결정적 tick 드라이버 (입력 시퀀스를 한 틱씩 진행하며 상태 기록) -------------------
+function drive(game, inputs) {
+  const frames = [];
+  for (const input of inputs) {
+    // TODO(builder): step(game, input) 으로 한 틱 진행
+    frames.push(snapshot(game));
+  }
+  return frames;
+}
+
+// -- 4. 시나리오 (빌더: 풀-사슬 입력 시퀀스 - 이동/먹이/성장/점수/벽충돌/자기충돌/game over) --
+const scenario = [
+  // TODO(builder): 전체 행동 사슬을 한 플레이스루로 구동하는 결정적 입력 시퀀스
+];
+
+// -- 5. 실행 + 단언 프레임 (빌더: frames에서 행동별 증거 채움) ----------------------------
+function main() {
+  // const game = createGame(/* TODO(builder) */);
+  // const frames = drive(game, scenario);
+  const evidence = {
+    // TODO(builder): 관측된 frames로부터 행동별 증거(directions_covered, ate, grew,
+    //                score_increased, wall_collision, self_collision, game_over ...)
+  };
+  process.stdout.write(JSON.stringify(evidence));  // 단일 JSON만 stdout(#86 위생)
+}
+
+main();
+'''
+
+
+def _spec_has_trace_harness_unit(spec: ProjectSpec) -> bool:
+    """spec 분해에 *검증 트레이스-하니스* 유닛이 있는지 보수적 판정(WO#157)."""
+    for u in (spec.decomposition or []):
+        low = (getattr(u, "desc", None) or "").lower()
+        if any(m in low for m in _TRACE_UNIT_MARKERS) and not any(
+            x in low for x in _TRACE_UNIT_EXCLUDE
+        ):
+            return True
+    return False
+
+
+def trace_harness_skeleton(spec: ProjectSpec) -> dict[str, str] | None:
+    """검증 트레이스-하니스 유닛이 있으면 *보일러플레이트 골격* 파일(경로→내용)을, 없으면 None (WO#157).
+
+    골격 = 인프라(엔진 로드·tick 드라이버·상태 레코더·단언 프레임)지 *단언/시나리오/판정 아님* —
+    빌더가 TODO(시나리오+단언)만 채워 풀-사슬 트레이스를 단일-유닛 역량 내로 끌어온다. 서버리스(#128).
+    결정적(LLM 무관). 별도 *참고 경로*라 빌더의 실제 트레이스 파일을 덮어쓰지 않는다(seed 안전).
+    """
+    if not _spec_has_trace_harness_unit(spec):
+        return None
+    return {_TRACE_HARNESS_SKELETON_PATH: _TRACE_HARNESS_SKELETON}
+
+
+def generate_scaffold(
+    spec: ProjectSpec,
+    client: LLMClient,
+    prompt_path: str | Path = DEFAULT_SCAFFOLD_PROMPT_PATH,
+) -> Scaffold | None:
+    """선제 스캐폴드: (LLM) dep-스택 골격 + (결정적·WO#157) 트레이스-하니스 골격을 합쳐 반환.
+
+    스택 골격은 best-effort(`_generate_stack_scaffold` — 실패/불필요면 None). 거기에 검증
+    트레이스-하니스 유닛이 있으면 결정적 트레이스 골격을 *추가*한다(#157 — 빌더가 시나리오+단언만
+    채우게). 둘 다 없으면 None(기존 동작 불변). 트레이스 골격은 별도 경로라 스택/빌더 파일과 충돌 0.
+    스캐폴드(인프라)는 단언/판정이 아니다 — run-judge가 트레이스 출력을 독립 평가(#113 바 불변).
+    """
+    stack = _generate_stack_scaffold(spec, client, prompt_path)
+    trace = trace_harness_skeleton(spec)
+    if trace is None:
+        return stack
+    files = dict(stack.files) if stack is not None else {}
+    for path, content in trace.items():
+        files.setdefault(path, content)  # 충돌 안 나게(스택이 이미 쓴 경로 보존)
+    return Scaffold(files=files, install=(stack.install if stack is not None else False))
 
 
 # ──────────────────────────── 파일 쓰기 ────────────────────────────

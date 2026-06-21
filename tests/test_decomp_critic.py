@@ -313,12 +313,14 @@ def test_decomposition_prompts_stay_concise():
     (서사 없이 기준만 추가; 합성 콜 수 회귀 0 목표의 프록시.)
     WO#155: end-to-end 검증의 구조적 분리(wire | 트레이스-하니스 §1e) + 풀-행동 사슬 scenario
     예시는 통합 floor의 핵심 신규 지침이라 ceiling을 소폭(350→365) 올린다 — 여전히 *기준만*(서사
-    없이), 합성 콜 회귀 0 의도 보존."""
+    없이), 합성 콜 회귀 0 의도 보존.
+    WO#157: 검증-트레이스 비-split(end-to-end) + #27 트레이스-하니스 스캐폴드 지침(synthesizer §1e +
+    decomp_critic 축)은 #156 u8 floor 직격이라 ceiling 소폭 상향(syn 365→378·dc 80→92) — *기준만*."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
-    # #152 직전: synthesizer 343, decomp_critic 73. #155: wire|트레이스-하니스 분리 + 풀-사슬 예시.
-    assert syn_lines <= 365, f"synthesizer.md 길이 회귀({syn_lines}>365) — 간결 위반"
-    assert dc_lines <= 80, f"decomp_critic.md 길이 회귀({dc_lines}>80)"
+    # #152 직전: synthesizer 343, decomp_critic 73. #157: 검증-트레이스 end-to-end + 스캐폴드 지침.
+    assert syn_lines <= 378, f"synthesizer.md 길이 회귀({syn_lines}>378) — 간결 위반"
+    assert dc_lines <= 92, f"decomp_critic.md 길이 회귀({dc_lines}>92)"
 
 
 # ──────────────── 통합-급 구조적 재분해 (WO#155) ────────────────
@@ -394,3 +396,64 @@ def test_decomp_critic_prompt_has_integration_structural_axis():
     dc = DECOMP_PROMPT.read_text(encoding="utf-8")
     assert "구조적 재분해" in dc
     assert "트레이스-하니스" in dc
+
+
+# ──────────────── 검증-트레이스 = end-to-end 유닛 (WO#157, #156 u8 fix) ────────────────
+#
+# #156 u8: 풀-사슬 트레이스(이동·먹이·성장·점수·충돌·game-over)를 한 유닛에 담자 granularity_signal이
+# #148(행동수)/#152(종류수)로 split 권고 → critic이 "이동만"으로 좁힘 → #113 풀-사슬 바가 도로
+# 확장 → 약빌더 미수렴·escalate. fix: 검증 트레이스-하니스 유닛은 end-to-end → split 면제(빌드
+# 모듈은 #152 KIND-split 무회귀). 빌드 분해 ≠ 검증 분해.
+
+
+def test_granularity_signal_exempts_verification_trace_full_chain():
+    """WO#157: 풀-사슬 검증 트레이스 유닛(트레이스 마커 O·통합 마커 X)은 여러 행동/종류를 담아도
+    split 권고 안 함(None) — end-to-end가 정상(#156 u8 직격: 이전엔 #148/#152로 잘못 flag됐다)."""
+    order = NextOrder(
+        unit="u8",
+        goal=("결정적 플레이스루 트레이스로 이동, 먹이 섭취, 성장, 점수 증가, 벽 충돌, "
+              "자기몸 충돌, game over 증거를 헤드리스 트레이스로 emit"),
+        deliverable="scripts/trace/full-gameplay.mjs",
+    )
+    assert granularity_signal(order) is None
+
+
+def test_granularity_signal_build_module_still_kind_split():
+    """WO#157 무회귀: 빌드 모듈(트레이스 마커 없음)은 #152 distinct-KIND split 그대로 —
+    충돌 판정 + game-over 상태전이를 한 유닛에 묶으면 여전히 flag(검증-트레이스 면제와 구분)."""
+    order = NextOrder(
+        unit="ux",
+        goal="벽/자기몸 충돌 판정과 game over 상태 전이를 한 모듈에서 처리",
+        deliverable="engine/rules.js",
+    )
+    sig = granularity_signal(order)
+    assert sig is not None
+    assert "종류" in sig  # #152 distinct-KIND 신호(검증-트레이스 면제로 가려지지 않음)
+
+
+def test_granularity_signal_integration_plus_trace_still_structural():
+    """WO#157 무회귀: 통합(wire) + 트레이스 *겸함*은 여전히 #155 구조적 재분해(트레이스-only 면제와 다름)."""
+    order = NextOrder(
+        unit="u9",
+        goal="모듈을 wire해 앱으로 조립하고 헤드리스 트레이스 하니스로 전체 행동을 구동해 evidence emit",
+        deliverable="app.js",
+    )
+    sig = granularity_signal(order)
+    assert sig is not None
+    assert "구조적 재분해" in sig
+
+
+def test_decomp_critic_prompt_has_verification_trace_end_to_end():
+    """WO#157: decomp-critic 프롬프트가 '검증-트레이스 = end-to-end(행동-split 금지)' 축을 담는다."""
+    dc = DECOMP_PROMPT.read_text(encoding="utf-8")
+    assert "#157" in dc
+    assert "end-to-end" in dc
+    assert "행동별로 쪼개지 마라" in dc or "행동 부분집합" in dc
+
+
+def test_decomp_critic_module_is_director_side_no_judgment():
+    """WO#157 적대 분리: decomp_critic 모듈은 판정 주체(gate/run_judge/CompositeGate)·
+    ALLOWED_SANDBOXES를 참조하지 않는다(director-side 계획 — 적대 gate 독립)."""
+    src = (REPO_ROOT / "src" / "haetae" / "decomp_critic.py").read_text(encoding="utf-8")
+    for forbidden in ("ALLOWED_SANDBOXES", "run_judge", "CompositeGate", "import gate"):
+        assert forbidden not in src, forbidden

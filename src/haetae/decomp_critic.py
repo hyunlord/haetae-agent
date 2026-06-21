@@ -123,6 +123,16 @@ def granularity_signal(order: NextOrder) -> str | None:
                 "겸할 때만 분리.)"
             )
         return None  # 순수 조립/wire 유닛 — disjoint-scope 소유, 과대 아님(트레이스-하니스 미겸)
+    # WO#157: *순수* 검증 트레이스-하니스 유닛(트레이스-하니스 마커 O·통합 마커 X)은 본질적으로
+    # end-to-end다 — 한 플레이스루가 *통합 게임 전체*(이동·먹이·성장·점수·충돌·game-over…)를
+    # 입증하는 게 목적이라 여러 행동/종류를 담는 게 *정상*(과대 아님). 행동별로 쪼개면 #113 풀-사슬
+    # 바가 도로 확장돼 붕괴한다(#156 u8: 이동만으로 좁힘 → 풀-사슬 재확장 → 약빌더 미수렴·escalate).
+    # 근본: *빌드 분해 ≠ 검증 분해* — 검증 트레이스는 한 end-to-end 유닛으로 유지하고(#148 행동수·
+    # #152 종류수 split 면제), 대신 #27 스캐폴드(scaffold.trace_harness_skeleton)로 tractable화한다.
+    # 빌드 모듈(트레이스 마커 없음)은 아래 #148/#152 split 그대로(무회귀). **바 완화 아님** —
+    # run-judge의 #113 풀-사슬 판정은 불변(부분 트레이스는 여전히 fail).
+    if any(m in low for m in _TRACE_HARNESS_MARKERS):
+        return None
     clauses = _behavior_clauses(blob)
     kinds = _distinct_kinds(blob)  # WO#152: 서로 다른 *종류*의 책임(판정/상태전이/렌더/입력)
     over_count = len(clauses) >= _OVER_LARGE_THRESHOLD     # 행동 수 과대(#148)
