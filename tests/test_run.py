@@ -147,6 +147,30 @@ def test_main_rejects_bad_reasoning_effort(monkeypatch):
         main(["--order", "x", "--executor", "codex", "--reasoning-effort", "ultra"])
 
 
+# ──────────────────────────── --local-timeout 배선 (WO#150) ────────────────────────────
+
+
+def test_main_local_timeout_wires_into_local_executor(monkeypatch):
+    """--local-timeout이 LocalAgentExecutor.timeout(=#54 idle-timeout)으로 전달된다."""
+    from haetae.providers.local_agent import LocalAgentExecutor
+
+    captured = _capture_main_run(monkeypatch)
+    rc = main(["--order", "x", "--executor", "local",
+               "--local-endpoint", "http://h:8089/v1", "--local-model", "m",
+               "--local-timeout", "250"])
+    assert rc == 0
+    ex = captured["executor"]
+    assert isinstance(ex, LocalAgentExecutor)
+    assert ex.timeout == 250.0
+
+
+def test_main_local_timeout_default_is_loaded_box_tolerant(monkeypatch):
+    """미설정 기본은 로드-박스 내성(≥180s) — #149 confound(180s 정각 truncate) 방지."""
+    captured = _capture_main_run(monkeypatch)
+    main(["--order", "x", "--executor", "local"])
+    assert captured["executor"].timeout >= 180.0
+
+
 # ──────────────────────────── 헤드룸 기본값/배선 (WO#24 Part B) ────────────────────────────
 
 

@@ -239,6 +239,20 @@ def test_synthesizer_prompt_has_single_responsibility_disjoint_scope():
     assert "disjoint" in syn.lower()
 
 
+def test_synthesizer_single_responsibility_guidance_is_concise():
+    """WO#150(B): #148 단일-책임/disjoint-scope 지침은 *의도를 보존*하되 *간결*하다 —
+    6-콜 합성을 유발한 장황한 #147 서사(이동+성장+충돌+먹이+점수 긴 나열)는 제거하고,
+    핵심 의도(단일-책임·distinct 모듈·disjoint·통합 유닛·≥4 과대·하위측면 과분할 금지)는 유지."""
+    syn = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8")
+    # 의도 보존 (분해 SPLIT 동작 #149 확증 — 길이만 다이어트):
+    assert "단일-책임" in syn and "disjoint" in syn.lower()
+    assert "통합" in syn or "integration" in syn.lower()  # 조립/통합 유닛 wire
+    assert "과대" in syn or "4" in syn  # ≥4 독립 행동 = 과대 → 쪼개라
+    assert "하위측면" in syn or "과분할" in syn  # 한 책임의 하위측면은 과분할 금지(over-split guard)
+    # 간결화: 장황한 #147 행동 나열 서사는 제거됨(토큰↓).
+    assert "이동+성장+충돌+먹이+점수" not in syn
+
+
 def test_decomp_critic_prompt_has_granularity_axis():
     """decomp-critic 프롬프트가 입도/책임 수 축(과대-다행동 유닛 weak)을 담는다(WO#148)."""
     dc = DECOMP_PROMPT.read_text(encoding="utf-8")

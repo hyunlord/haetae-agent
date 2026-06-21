@@ -671,6 +671,16 @@ def main(argv: list[str] | None = None) -> int:
         help="--executor local 에이전틱 루프 턴 상한 (기본 3; 28 t/s 경제성·#134 단발 선호)",
     )
     parser.add_argument(
+        "--local-timeout",
+        type=float,
+        default=300.0,
+        help=(
+            "--executor local 모델 스트림 **idle-timeout(초)** — 토큰 간 최대 무응답(#54). "
+            "스트리밍이라 느리지만-진행 생성은 (총 길이 무관) 완주하고 진짜 stall만 중단한다. "
+            "기본 300(로드-박스 내성; #149: 14 t/s 로드-박스서 180s 총-캡이 편집 블록 전 truncate→스텁)."
+        ),
+    )
+    parser.add_argument(
         "--local-smoke",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -988,6 +998,7 @@ def main(argv: list[str] | None = None) -> int:
         executor = LocalAgentExecutor(
             endpoint=args.local_endpoint, model=args.local_model,
             workdir=args.workdir, max_turns=args.local_max_turns,
+            timeout=args.local_timeout,  # WO#150: idle-timeout(#54)
             verify=(builder_smoke if args.local_smoke else None),
             selftest=(builder_selftest if args.local_smoke else None),
             heartbeat=heartbeat, transcript=transcript,
@@ -1021,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory = lambda wt: LocalAgentExecutor(
                 endpoint=args.local_endpoint, model=args.local_model,
                 workdir=wt, max_turns=args.local_max_turns,
+                timeout=args.local_timeout,  # WO#150: idle-timeout(#54)
                 verify=(builder_smoke if args.local_smoke else None),
                 selftest=(builder_selftest if args.local_smoke else None),
                 heartbeat=heartbeat, transcript=transcript,

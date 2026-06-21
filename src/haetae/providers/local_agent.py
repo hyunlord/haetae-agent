@@ -207,37 +207,97 @@ def apply_edits(workdir: Path, edits: list[FileEdit]) -> list[str]:
 # ──────────────────────────── OpenAI 호환 호출(stdlib urllib) ────────────────────────────
 
 
-def post_chat(endpoint: str, payload: dict, timeout: float) -> dict:
-    """OpenAI 호환 `/chat/completions`에 POST하고 JSON 응답(dict)을 반환한다(테스트 seam).
+def _read_sse_stream(resp, idle_timeout: float) -> dict:
+    """SSE 스트림(`stream: True`)을 읽어 OpenAI **비-스트리밍 형태 dict**로 조립한다(WO#150).
 
-    endpoint는 `.../v1` 형태(끝 슬래시 무관). 여기서 `/chat/completions`를 붙인다. 네트워크/HTTP/
-    JSON 오류는 LocalAgentError로 변환한다. **이 함수가 유일한 네트워크 표면**이라 테스트는 이걸
+    각 `readline()`은 소켓 idle_timeout까지 블록한다 — 청크(토큰)가 오면 다음 readline이 새
+    카운트다운을 시작하므로 **느리지만-진행** 생성은 (총 길이·로드-박스 무관) 완주한다. idle_timeout
+    동안 *한 청크도* 안 오면(진짜 stall) readline이 TimeoutError를 내고 LocalAgentError로 중단한다.
+    이것이 #54 원칙("idle timeout over total-duration cap")의 적용 — #149 confound(로드-박스 14 t/s서
+    180s 정각 truncate→스텁) 차단. 반환 dict는 `_message_text`/`_usage_from_resp`가 그대로 소비한다.
+    빌더-측 *전송 디테일*일 뿐 — 판정/codex와 무관(적대 분리 불변).
+    """
+    parts: list[str] = []
+    usage: dict | None = None
+    finish: str | None = None
+    while True:
+        try:
+            raw = resp.readline()
+        except TimeoutError as e:  # = socket.timeout(py3.10+): idle_timeout 내 무토큰 = 진짜 stall
+            raise LocalAgentError(
+                f"로컬 모델 무응답 stall(idle>{idle_timeout}s 토큰 없음)", str(e)
+            ) from e
+        if not raw:
+            break  # EOF
+        line = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+        line = line.strip()
+        if not line or line.startswith(":"):
+            continue  # 빈 줄 / SSE 코멘트(keepalive)
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except (ValueError, TypeError):
+            continue  # 비-JSON 청크는 건너뜀(best-effort)
+        if not isinstance(chunk, dict):
+            continue
+        choices = chunk.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            ch0 = choices[0]
+            delta = ch0.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                parts.append(delta["content"])
+            # 일부 서버는 종료 청크에 비-스트림 message.content를 싣는다(폴백).
+            msg = ch0.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                parts.append(msg["content"])
+            if ch0.get("finish_reason"):
+                finish = ch0["finish_reason"]
+        u = chunk.get("usage")
+        if isinstance(u, dict):  # usage 청크(stream_options.include_usage) — 없으면 None(날조 금지)
+            usage = u
+    out: dict = {"choices": [{"message": {"content": "".join(parts)}, "finish_reason": finish}]}
+    if usage is not None:
+        out["usage"] = usage
+    return out
+
+
+def post_chat(endpoint: str, payload: dict, timeout: float) -> dict:
+    """OpenAI 호환 `/chat/completions`에 **스트리밍** POST하고 조립된 응답(dict)을 반환한다(테스트 seam).
+
+    endpoint는 `.../v1` 형태(끝 슬래시 무관). 여기서 `/chat/completions`를 붙인다. **`stream: True`**로
+    보내고 SSE 청크를 `_read_sse_stream`으로 누적한다 — `timeout`은 이제 **#54 idle-timeout**(토큰 간
+    최대 무응답; 느리지만-진행은 완주, 진짜 stall만 중단), 총-호출 캡이 아니다(WO#150, #149 confound 차단).
+    네트워크/HTTP 오류는 LocalAgentError로 변환한다. **이 함수가 유일한 네트워크 표면**이라 테스트는 이걸
     monkeypatch해 라이브 엔드포인트 없이 단위 검증한다(codex 테스트가 subprocess.run을 패치하듯).
     """
     url = endpoint.rstrip("/") + "/chat/completions"
-    data = json.dumps(payload).encode("utf-8")
+    body = {**payload, "stream": True, "stream_options": {"include_usage": True}}
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        resp = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
-        body = ""
+        detail = ""
         try:
-            body = e.read().decode("utf-8")
+            detail = e.read().decode("utf-8")
         except Exception:  # noqa: BLE001
             pass
-        raise LocalAgentError(f"로컬 엔드포인트 HTTP {e.code} 오류 ({url})", body) from e
+        raise LocalAgentError(f"로컬 엔드포인트 HTTP {e.code} 오류 ({url})", detail) from e
     except (urllib.error.URLError, OSError) as e:
         raise LocalAgentError(f"로컬 엔드포인트 연결 실패 ({url}): {e}") from e
     try:
-        obj = json.loads(raw)
-    except (ValueError, TypeError) as e:
-        raise LocalAgentError(f"로컬 엔드포인트 응답이 JSON이 아님 ({url})", raw) from e
-    if not isinstance(obj, dict):
-        raise LocalAgentError(f"로컬 엔드포인트 응답이 객체가 아님 ({url})", raw)
-    return obj
+        with resp:
+            return _read_sse_stream(resp, timeout)
+    except LocalAgentError:
+        raise
+    except (urllib.error.URLError, OSError) as e:
+        raise LocalAgentError(f"로컬 엔드포인트 스트림 오류 ({url}): {e}") from e
 
 
 def _message_text(resp: dict) -> str:
@@ -845,7 +905,8 @@ class LocalAgentExecutor:
     workdir:     빌더 작업 루트. 편집은 이 폴더 안으로 *가둬진다*(safe_target).
     max_turns:   에이전틱 루프 상한(기본 3 — 28 t/s 경제성, #134 단발 선호). done 신호나
                  더 낼 편집이 없으면 조기 종료.
-    timeout:     한 번의 모델 호출 타임아웃(초).
+    timeout:     모델 스트림 **idle-timeout(초)** — 토큰 간 최대 무응답(#54). 느리지만-진행
+                 생성은 (총 길이·로드-박스 무관) 완주, 진짜 stall만 중단(WO#150, #149 confound 차단).
     temperature/max_tokens: 생성 파라미터(코드라 낮은 temp 기본).
     verify:      빌더-측 *구조적 스모크* 콜백(예: `builder_smoke` = 컴파일 + *gate 디스커버리 컨벤션
                  미러*(pytest collect / unittest discover findability), WO#139/#141). 편집 적용 후
@@ -1022,7 +1083,7 @@ class LocalAgentExecutor:
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "stream": False,
+            "stream": True,  # WO#150: 스트리밍 — timeout=토큰 단위 idle-timeout(#54, #149 confound 차단)
         }
         hb_handle = self._hb_start()
         try:

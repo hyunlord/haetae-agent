@@ -188,7 +188,7 @@ def test_run_payload_shape_and_protocol_system_prompt(tmp_path, monkeypatch):
     ex.run(_order(goal="고유한_목표_문자열"))
     payload = fake.calls[0]["payload"]
     assert payload["model"] == "qwen2.5-coder:7b"
-    assert payload["stream"] is False
+    assert payload["stream"] is True  # WO#150: 스트리밍(토큰 단위 idle-timeout, #54)
     assert fake.calls[0]["endpoint"] == "http://host:8089/v1"
     sys_msg = payload["messages"][0]
     user_msg = payload["messages"][1]
@@ -301,34 +301,74 @@ def test_max_turns_must_be_positive():
         LocalAgentExecutor(endpoint="http://x/v1", model="m", max_turns=0)
 
 
-def test_post_chat_builds_url_and_parses(monkeypatch):
-    """post_chat이 베이스 URL에 /chat/completions를 붙이고 JSON을 파싱한다(urlopen 모킹)."""
+class _FakeSSEResp:
+    """SSE 스트림 모킹 — readline()이 스크립트된 라인을 순서대로 내고, 'STALL' 마커면
+    socket idle-timeout처럼 TimeoutError를 raise한다. 빈 라인 소진 시 EOF(b'')."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def readline(self):
+        if not self._lines:
+            return b""  # EOF
+        item = self._lines.pop(0)
+        if item == "STALL":
+            raise TimeoutError("timed out")  # = socket.timeout (py3.10+): 토큰 무응답 stall
+        return item if isinstance(item, bytes) else item.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_read_sse_stream_accumulates_slow_progressing():
+    """WO#150: 느리지만-진행 스트림(여러 delta 청크)은 *전부 누적*돼 truncate되지 않는다(#54)."""
+    lines = [
+        'data: {"choices":[{"delta":{"content":"He"}}]}\n',
+        'data: {"choices":[{"delta":{"content":"llo"}}]}\n',
+        'data: {"choices":[{"delta":{"content":" world"}}]}\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":3,"completion_tokens":5}}\n',
+        "data: [DONE]\n",
+    ]
+    out = la._read_sse_stream(_FakeSSEResp(lines), idle_timeout=30)
+    assert out["choices"][0]["message"]["content"] == "Hello world"  # 완주(미-truncate)
+    assert out["usage"]["completion_tokens"] == 5  # usage 청크 캡처(없으면 None — 날조 금지)
+
+
+def test_read_sse_stream_raises_on_idle_stall():
+    """WO#150: 진짜 stall(idle_timeout 동안 무토큰 → readline 타임아웃)은 LocalAgentError로 중단."""
+    lines = [
+        'data: {"choices":[{"delta":{"content":"par"}}]}\n',
+        "STALL",  # 다음 토큰이 idle_timeout 내 안 옴 = 진짜 무응답
+    ]
+    with pytest.raises(LocalAgentError):
+        la._read_sse_stream(_FakeSSEResp(lines), idle_timeout=5)
+
+
+def test_post_chat_streams_and_passes_idle_timeout(monkeypatch):
+    """WO#150: post_chat이 stream:True로 보내고 timeout을 *소켓 idle-timeout*으로 넘긴다."""
     import json as _json
 
     captured = {}
 
-    class _FakeResp:
-        def __init__(self, body):
-            self._b = body.encode("utf-8")
-
-        def read(self):
-            return self._b
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
     def fake_urlopen(req, timeout=None):
         captured["url"] = req.full_url
         captured["body"] = _json.loads(req.data.decode("utf-8"))
-        return _FakeResp(_json.dumps({"choices": [{"message": {"content": "hi"}}]}))
+        captured["timeout"] = timeout
+        return _FakeSSEResp([
+            'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
+            "data: [DONE]\n",
+        ])
 
     monkeypatch.setattr(la.urllib.request, "urlopen", fake_urlopen)
-    out = la.post_chat("http://host:8089/v1", {"model": "m", "messages": []}, timeout=5)
+    out = la.post_chat("http://host:8089/v1", {"model": "m", "messages": []}, timeout=42)
     assert captured["url"] == "http://host:8089/v1/chat/completions"
     assert captured["body"]["model"] == "m"
+    assert captured["body"]["stream"] is True  # 스트리밍 요청
+    assert captured["timeout"] == 42  # idle-timeout = 소켓 타임아웃(per-readline 리셋)
     assert out["choices"][0]["message"]["content"] == "hi"
 
 
