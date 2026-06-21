@@ -5,6 +5,7 @@
 """
 
 import subprocess
+import sys
 from pathlib import Path
 
 from haetae.deps import HASH_SIDECAR, InstallResult, ensure_deps
@@ -62,7 +63,8 @@ def test_detect_pip_requirements(tmp_path):
     rec = RecRunner()
     res = ensure_deps(tmp_path, runner=rec)
     assert res.manager == "pip"
-    assert rec.calls[0][0] == ["pip", "install", "-r", "requirements.txt"]
+    # WO#144 wart#1: 맨-pip 대신 venv python -m pip(uv venv엔 pip 바이너리 없음 → #138/#143 근본원인)
+    assert rec.calls[0][0] == [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
 
 
 def test_detect_pip_pyproject(tmp_path):
@@ -70,7 +72,8 @@ def test_detect_pip_pyproject(tmp_path):
     rec = RecRunner()
     res = ensure_deps(tmp_path, runner=rec)
     assert res.manager == "pip"
-    assert rec.calls[0][0] == ["pip", "install", "-e", "."]
+    # WO#144 wart#1: venv python -m pip
+    assert rec.calls[0][0] == [sys.executable, "-m", "pip", "install", "-e", "."]
 
 
 def test_detect_none_is_noop(tmp_path):

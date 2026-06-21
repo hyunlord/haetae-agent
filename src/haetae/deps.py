@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,11 +60,13 @@ def _detect(wd: Path) -> tuple[str, list[str] | None, list[str]]:
     if (wd / "package.json").is_file():
         return ("npm", ["npm", "install"],
                 ["package.json", "package-lock.json", "npm-shrinkwrap.json"])
+    # WO#144 wart#1: 맨 `pip`(uv venv엔 pip 바이너리가 없어 #138 exit-127·#143 스퓨리어스
+    # (install) 실패의 근본원인) 대신 *현재 인터프리터의* `python -m pip`을 쓴다(venv-일관).
     if (wd / "requirements.txt").is_file():
-        return ("pip", ["pip", "install", "-r", "requirements.txt"],
+        return ("pip", [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
                 ["requirements.txt"])
     if (wd / "pyproject.toml").is_file():
-        return ("pip", ["pip", "install", "-e", "."],
+        return ("pip", [sys.executable, "-m", "pip", "install", "-e", "."],
                 ["pyproject.toml", "uv.lock", "poetry.lock"])
     return ("none", None, [])
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -598,6 +599,195 @@ def test_last_elapsed_surfaced_in_summary(tmp_path, monkeypatch):
     result = ex.run(_order())
     assert ex.last_elapsed_s >= 0.0
     assert "s\n" in result or "s " in result  # 벽시계 표면화
+
+
+# ──────────────── 정밀 자기-테스트 피드백 + smoke -k 미러 (WO#144) ────────────────
+
+
+def test_parse_pytest_k():
+    """gate 체크 명령서 pytest -k <expr> 키워드를 뽑는다(없으면 None)."""
+    assert la._parse_pytest_k(["python -m pytest -k board_rules"]) == "board_rules"
+    assert la._parse_pytest_k(["pytest -k 'a and b'"]) == "a and b"
+    assert la._parse_pytest_k(["python -m pytest tests/"]) is None
+    assert la._parse_pytest_k(["python -m unittest discover -s tests"]) is None
+    assert la._parse_pytest_k([]) is None
+
+
+def test_smoke_pytest_k_catches_unmatched(tmp_path):
+    """wart#2: gate가 `pytest -k board_rules`인데 테스트가 그 키워드에 안 맞으면 스모크가 findability로 잡는다."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_other.py").write_text("def test_other():\n    assert True\n")
+    err = la.builder_smoke(tmp_path, check_cmds=["python -m pytest -k board_rules"])
+    assert err is not None and "발견 실패" in err and "board_rules" in err
+
+
+def test_smoke_pytest_k_matched_passes(tmp_path):
+    """-k 키워드에 맞는 테스트가 있으면 통과(over-constraint 아님)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_board_rules.py").write_text("def test_board_rules_x():\n    assert True\n")
+    assert la.builder_smoke(tmp_path, check_cmds=["python -m pytest -k board_rules"]) is None
+
+
+def test_smoke_no_k_unaffected(tmp_path):
+    """-k 없는 gate cmd면 기존대로 collect-all(무회귀) — would-fail도 collect 통과(채점 아님)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("def test_would_fail():\n    assert False\n")
+    assert la.builder_smoke(tmp_path, check_cmds=["python -m pytest tests/test_x.py"]) is None
+
+
+def test_selftest_cmd_normalizes_interpreter():
+    """check_cmds의 pytest/unittest 명령을 venv python -m 형으로 정규화한다(없으면 None)."""
+    assert la._selftest_cmd(["python -m pytest -k board_rules"]) == [sys.executable, "-m", "pytest", "-k", "board_rules"]
+    assert la._selftest_cmd(["pytest -q"]) == [sys.executable, "-m", "pytest", "-q"]
+    assert la._selftest_cmd(["python -m unittest discover -s tests"]) == [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+    assert la._selftest_cmd(["echo hi"]) is None
+    assert la._selftest_cmd([]) is None
+
+
+def test_builder_selftest_failing_test_returns_detail(tmp_path):
+    """#144 A: builder_selftest가 *테스트를 실행*해 실패 시 detail(테스트명·assertion) 반환."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_rules.py").write_text("def test_w():\n    assert 1 == 2\n")
+    detail = la.builder_selftest(tmp_path, check_cmds=["python -m pytest -q"])
+    assert detail is not None
+    assert "자기-테스트 실패" in detail
+    assert "test_w" in detail  # 실패 테스트명
+    assert "assert" in detail.lower()  # assertion detail
+
+
+def test_builder_selftest_passing_returns_none(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_ok.py").write_text("def test_ok():\n    assert 1 == 1\n")
+    assert la.builder_selftest(tmp_path, check_cmds=["python -m pytest -q"]) is None
+
+
+def test_builder_selftest_no_tests_returns_none(tmp_path):
+    (tmp_path / "mod.py").write_text("x = 1\n")
+    assert la.builder_selftest(tmp_path, check_cmds=["python -m pytest -q"]) is None
+
+
+def test_builder_selftest_no_test_cmd_returns_none(tmp_path):
+    """실행할 테스트 명령을 모르면 skip(None) — findability는 스모크 안전망."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a():\n    assert False\n")
+    assert la.builder_selftest(tmp_path, check_cmds=["true"]) is None
+
+
+def test_builder_selftest_skips_when_pytest_absent(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a():\n    assert False\n")
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (127, ""))
+    assert la.builder_selftest(tmp_path, check_cmds=["python -m pytest -q"]) is None
+
+
+def test_builder_selftest_exit5_no_match_returns_none(tmp_path, monkeypatch):
+    """exit 5(테스트/매칭 0)은 자기-테스트 실패 아님 — findability는 스모크 소관(None)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (5, "no tests ran"))
+    assert la.builder_selftest(tmp_path, check_cmds=["python -m pytest -k zzz"]) is None
+
+
+class _ScriptedSelftest:
+    """N번 실패(detail 반환) 후 통과(None). 호출 인자(check_cmds) 기록."""
+
+    def __init__(self, fail_times, detail="[빌더 자기-테스트 실패] AssertionError: assert winner([]) is None"):
+        self.fail_times = fail_times
+        self.detail = detail
+        self.calls = 0
+        self.seen_cmds = None
+
+    def __call__(self, workdir, check_cmds=None):
+        self.calls += 1
+        self.seen_cmds = check_cmds
+        return self.detail if self.calls <= self.fail_times else None
+
+
+def test_selftest_feedback_injects_detail_and_iterates(tmp_path, monkeypatch):
+    """#144 A 핵심: 스모크 통과 *후* 자기-테스트 실패 detail을 다음 턴에 주입 → 타겟 수정 → green까지 반복."""
+    fake = FakePost([
+        _block("src/a.py", "v1"),
+        _block("src/a.py", "v2"),
+        _block("src/a.py", "v3") + f"\n{DONE_MARKER}",
+    ])
+    monkeypatch.setattr(la, "post_chat", fake)
+    st = _ScriptedSelftest(fail_times=2)
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=4,
+        verify=lambda wd: None,   # 스모크(findability) 항상 통과
+        selftest=st,               # 자기-테스트 2회 실패 후 green
+    )
+    ex.run(_order())
+    assert len(fake.calls) == 3            # build → fix → fix(green)
+    assert ex.selftest_feedback_count == 2
+    assert ex.last_selftest_passed is True
+    # 주입된 메시지에 *정확한 실패 detail*(assertion)과 타겟-수정 유도 문구가 들어갔다
+    for ci in (1, 2):
+        msgs = fake.calls[ci]["payload"]["messages"]
+        assert any("AssertionError" in m.get("content", "") for m in msgs if m["role"] == "user")
+        assert any("타겟 수정" in m.get("content", "") for m in msgs if m["role"] == "user")
+    # 자기-테스트가 유닛 gate 체크 명령(order.local_checks)을 받았다(gate 러너 미러)
+    assert st.seen_cmds == ["pytest -q"]
+
+
+def test_selftest_runs_only_after_smoke_passes(tmp_path, monkeypatch):
+    """순서: 스모크(findability) 실패 동안엔 자기-테스트 안 돌고, 스모크 통과 후에야 돈다."""
+    fake = FakePost([
+        _block("src/a.py", "v1"),
+        _block("src/a.py", "v2") + f"\n{DONE_MARKER}",
+    ])
+    monkeypatch.setattr(la, "post_chat", fake)
+    smoke = _ScriptedSmoke(fail_times=1, err="ImportError: x")  # 1턴 스모크 실패
+    st = _ScriptedSelftest(fail_times=0)  # 자기-테스트는 항상 green
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=4,
+        verify=smoke, selftest=st,
+    )
+    ex.run(_order())
+    # turn0: 스모크 실패(자기-테스트 안 돔). turn1: 스모크 통과 → 자기-테스트 1회(green).
+    assert smoke.calls == 2
+    assert st.calls == 1
+    assert ex.last_selftest_passed is True
+
+
+def test_selftest_off_by_default_no_extra_turns(tmp_path, monkeypatch):
+    """selftest 미지정이면 자기-테스트 단계 없음(스모크만) — #141 즉시-반환 무회귀."""
+    fake = FakePost([_block("a.py", "x")])  # DONE 없음
+    monkeypatch.setattr(la, "post_chat", fake)
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=5, verify=lambda wd: None
+    )
+    ex.run(_order())
+    assert len(fake.calls) == 1  # 스모크 통과 → 즉시 반환(selftest 없음)
+    assert ex.last_selftest_passed is False
+    assert ex.selftest_feedback_count == 0
+
+
+def test_selftest_exhausts_turns_returns_not_raises(tmp_path, monkeypatch):
+    """자기-테스트가 끝내 green 못 해도 turn 상한서 멈추고 *반환*(gate가 이후 판정)."""
+    monkeypatch.setattr(la, "post_chat", FakePost([_block("a.py", "x")]))  # 매번 같은 편집
+    ex = LocalAgentExecutor(
+        endpoint="http://x/v1", model="m", workdir=tmp_path, max_turns=2,
+        verify=lambda wd: None,
+        selftest=lambda wd, check_cmds=None: "[빌더 자기-테스트 실패] AssertionError: always",
+    )
+    result = ex.run(_order())
+    assert ex.last_selftest_passed is False
+    assert ex.selftest_feedback_count >= 1
+    assert "자기-테스트" in result  # 요약에 자기-테스트 상태 표면화
+
+
+def test_selftest_is_builder_side_not_judge():
+    """적대 분리(sacred): builder_selftest는 *자기 워크트리서 테스트 실행*만 — judge/gate/run-judge 무접촉.
+
+    빌더가 *자기 유닛 테스트*를 green으로 모는 TDD 자기검사일 뿐, 독립 적대 gate(행동 run-judge·
+    hollow 탐지·통합)는 불변·독립(소스 레벨 단언; 모듈 전역 분리는 위 테스트들이 커버).
+    """
+    src = Path(la.__file__).read_text(encoding="utf-8")
+    assert "def builder_selftest" in src
+    # gate-판정 토큰 무참조(complete() 부재는 구조적 test_local_executor_is_not_a_judge_client가 커버).
+    for forbidden in ("haetae.judge", "haetae.gate", "GateResult", "run_judge", "CompositeGate"):
+        assert forbidden not in src, f"local_agent이 {forbidden} 참조(분리 위반)"
 
 
 # ──────────────────────────── (선택) 라이브 통합 — opt-in ────────────────────────────

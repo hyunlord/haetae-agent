@@ -25,6 +25,7 @@ import inspect
 import json
 import os
 import py_compile
+import shlex
 import subprocess
 import sys
 import time
@@ -426,14 +427,47 @@ def _smoke_conventions(
     return (True, (start, "test*.py"))
 
 
-def _smoke_pytest_collect(workdir: Path, timeout: float) -> str | None:
-    """pytest --collect-only(import/collection 검사). 미설치/타임아웃이면 None(skip). 채점 아님."""
-    rc, out = _smoke_run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"], workdir, timeout
-    )
+def _parse_pytest_k(cmds: list[str]) -> str | None:
+    """gate 체크 명령들에 pytest `-k <expr>`가 있으면 그 keyword expr 반환(없으면 None, WO#144 wart#2).
+
+    예: "python -m pytest -k board_rules" → "board_rules". `-k "a and b"`(따옴표 묶인 표현식)도
+    shlex로 처리. pytest 명령이 아니거나 -k가 없으면 None.
+    """
+    for cmd in cmds or []:
+        if "pytest" not in cmd.lower():
+            continue
+        try:
+            toks = shlex.split(cmd)
+        except ValueError:
+            toks = cmd.split()
+        for i, t in enumerate(toks):
+            if t == "-k" and i + 1 < len(toks):
+                return toks[i + 1].strip() or None
+            if t.startswith("-k") and len(t) > 2:
+                return t[2:].strip().strip("'\"") or None
+    return None
+
+
+def _smoke_pytest_collect(workdir: Path, timeout: float, k_expr: str | None = None) -> str | None:
+    """pytest --collect-only(import/collection 검사). 미설치/타임아웃이면 None(skip). 채점 아님.
+
+    WO#144 wart#2: gate가 `pytest -k <expr>`면 그 -k를 *미러*(--collect-only -k expr)해, 수집은
+    되나 -k 매칭 0인 경우(=#143 exit-5형, gate 러너가 못 찾음)를 findability 실패로 빌더-측서 잡는다.
+    *발견만* — collect-only는 테스트를 실행/채점하지 않는다(적대 분리 불변).
+    """
+    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
+    if k_expr:
+        cmd += ["-k", k_expr]
+    rc, out = _smoke_run(cmd, workdir, timeout)
     low = out.lower()
     if rc in (127, 124) or "no module named pytest" in low or "no module named \"pytest\"" in low:
         return None
+    if k_expr and rc == 5:  # -k 매칭 0 → gate(`pytest -k`)가 테스트를 못 찾는다(findability).
+        return (
+            f"[smoke pytest -k 발견 실패] --collect-only -k {k_expr} → 매칭 테스트 0개. gate가 "
+            f"`pytest -k {k_expr}`로 실행하니 테스트 노드ID(파일/클래스/함수명)에 '{k_expr}' 키워드가 "
+            f"들어가게 해라(예: tests/test_{k_expr}.py 또는 def test_{k_expr}_*())."
+        )
     if rc not in (0, 5):  # 0=수집됨, 5=테스트 없음 → 구조적 OK. 그 외(2=collection error)=실패.
         return f"[smoke pytest collect 실패] pytest --collect-only (exit {rc}):\n{out.strip()[-2000:]}"
     return None
@@ -505,8 +539,9 @@ def builder_smoke(
         return None
     # 2) gate 디스커버리 컨벤션 미러(collect/discover — *발견만*, 실행/채점 아님).
     do_pytest, ut_spec = _smoke_conventions(workdir, check_cmds)
+    k_expr = _parse_pytest_k(check_cmds or [])  # WO#144 wart#2: gate의 pytest -k 키워드 미러
     if do_pytest:
-        err = _smoke_pytest_collect(workdir, timeout)
+        err = _smoke_pytest_collect(workdir, timeout, k_expr=k_expr)
         if err:
             return err
     if ut_spec is not None:
@@ -526,6 +561,79 @@ def _call_verify(verify, workdir: Path, check_cmds: list[str]):
     except (ValueError, TypeError):
         pass
     return verify(workdir)
+
+
+# ──────────────────────────── 빌더-측 정밀 자기-테스트 (WO#144) ────────────────────────────
+#
+# #143 진단: Qwen3.6는 정답성 테스트까지 *도달*하나(7B보다 멀리) u1 미수렴 — gate의 맨 exit-1
+# (어느 assertion이 깨졌는지 detail 無)만 보고 빌더가 *풀-재생성*→발산. 해법: 스모크(findability)
+# 통과 *후*, 빌더가 *자기 유닛 테스트를 실행*(TDD 자기검사)해 실패 시 *정확한 detail*(테스트명·
+# assertion·traceback)을 다음 턴에 주입 → *타겟 수정*(전체 재생성 아님) → 자기 테스트 green까지 반복.
+#
+# 적대 분리(sacred·최우선): 빌더가 *자기가 쓴* 유닛 테스트를 green으로 모는 건 빌더-측 TDD
+# 자기검사다. **독립 적대 gate는 불변**: 행동 run-judge(유닛 테스트 *너머* 행동 검증)·hollow-테스트
+# 탐지(#98 시나리오 계약)·통합 판정이 *진짜 바*. 빌더 자기-테스트 green = 필요조건이지 *충분조건
+# 아님*(gate가 hollow green을 잡는다). judge/run-judge/gate/critic 코드·경로엔 일절 닿지 않는다
+# (import·호출 0). 빌트코드 실행은 스모크와 동일 오프라인 posture(_smoke_run). ALLOWED_SANDBOXES 불변.
+
+
+def _selftest_cmd(check_cmds: list[str] | None) -> list[str] | None:
+    """check_cmds에서 *테스트 실행* 명령(pytest/unittest)을 골라 venv `python -m` argv로 정규화한다.
+
+    gate가 실제로 돌릴 체크 명령(예: "python -m pytest -k board_rules", "pytest -q",
+    "python -m unittest discover -s tests")을 그대로 미러하되 인터프리터는 현재 venv로 고정한다
+    (cwd가 sys.path에 들어가 빌더 워크트리 모듈이 import된다). 테스트 명령이 없으면 None(skip).
+    """
+    for cmd in check_cmds or []:
+        low = cmd.lower()
+        if "pytest" not in low and "unittest" not in low:
+            continue
+        try:
+            toks = shlex.split(cmd)
+        except ValueError:
+            toks = cmd.split()
+        runner = "pytest" if "pytest" in low else "unittest"
+        idx = next((j for j, t in enumerate(toks) if runner in t.lower()), None)
+        if idx is None:
+            continue
+        return [sys.executable, "-m", runner, *toks[idx + 1:]]
+    return None
+
+
+def builder_selftest(
+    workdir: Path, *, check_cmds: list[str] | None = None, timeout: float = 60.0
+) -> str | None:
+    """빌더-측 *정밀 자기-테스트*(WO#144): 빌더가 *자기 유닛 테스트를 실행*해 실패 detail을 받는다.
+
+    스모크(findability) 통과 *후* 호출. gate 체크 명령(check_cmds)을 venv `python -m`으로 정규화해
+    빌더 워크트리서 실행:
+      - 통과(exit 0) → None(green).
+      - 실패(exit 1)/collection 에러(exit 2) → *정확한 실패 detail*(테스트명·assertion·expected vs
+        actual·traceback tail) 반환 → 호출부가 다음 bounded 턴에 주입 → 빌더가 *타겟 수정*.
+      - 테스트/매칭 0(exit 5)·툴 부재(127)·타임아웃(124) → None(best-effort; findability는 스모크 소관).
+    **적대 분리(sacred)**: 빌더가 *자기가 쓴* 유닛 테스트를 green으로 모는 TDD 자기검사 — judge/gate
+    *아님*(import·호출 0). 독립 적대 gate(행동 run-judge·hollow 탐지·통합)가 *진짜 바*로 불변:
+    빌더 자기-테스트 green = 필요조건이지 충분조건 아님(gate가 hollow green을 잡는다). 빌트코드 실행은
+    스모크와 동일 오프라인 posture(_smoke_run, 네트워크 미부여). ALLOWED_SANDBOXES 불변.
+    """
+    workdir = Path(workdir)
+    if not any("test" in f.name for f in _py_files(workdir)):
+        return None  # 테스트 파일 없음 → 실행할 자기-테스트 없음
+    cmd = _selftest_cmd(check_cmds)
+    if cmd is None:
+        return None  # 실행할 테스트 명령 모름 → skip(스모크 findability가 안전망)
+    rc, out = _smoke_run(cmd, workdir, timeout)
+    low = out.lower()
+    if rc in (127, 124) or "no module named pytest" in low or "no module named \"pytest\"" in low:
+        return None  # 툴 부재/타임아웃 → skip(빌드 막지 않음 — 진짜 검증은 gate)
+    if rc in (1, 2):  # 1=테스트 실패, 2=collection 에러 → *정확한 실패 detail*을 빌더에 피드백.
+        body = out.strip()[-3000:]
+        return (
+            "[빌더 자기-테스트 실패] " + " ".join(cmd) + f" (exit {rc}). 아래 *정확한 실패 detail*"
+            "(실패 테스트명·assertion·expected vs actual·traceback)을 보고 *실패 지점만 타겟 수정*하라"
+            "(전체 재생성 말고 — 통과 중인 부분은 유지):\n" + body
+        )
+    return None  # rc 0 = green / rc 5 = 테스트·매칭 0(findability는 스모크 소관)
 
 
 # ──────────────────────────── LocalAgentExecutor ────────────────────────────
@@ -564,6 +672,7 @@ class LocalAgentExecutor:
         temperature: float = 0.2,
         max_tokens: int = 4096,
         verify: Callable[[Path], str | None] | None = None,
+        selftest: Callable[[Path], str | None] | None = None,
         heartbeat=None,
         transcript=None,
     ):
@@ -577,6 +686,11 @@ class LocalAgentExecutor:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.verify = verify
+        # WO#144: 스모크(findability) 통과 *후* 돌리는 빌더-측 *정밀 자기-테스트* 콜백
+        # (예: `builder_selftest` = 빌더가 자기 유닛 테스트를 실행→실패 detail 주입→타겟 수정→green).
+        # **판정 아님** — 빌더 자기-테스트 green = 필요조건이지 충분조건 아님(독립 적대 gate 불변).
+        # verify가 set일 때만 동작(스모크 통과 *후*). None이면 미사용(#141 즉시-반환 무회귀).
+        self.selftest = selftest
         self.heartbeat = heartbeat
         self.transcript = transcript
         # 빌드 전체(여러 턴)의 누적 token usage(WO#33 동형). 미노출이면 None(날조 금지).
@@ -588,6 +702,10 @@ class LocalAgentExecutor:
         self.last_smoke_error: str | None = None
         self.last_smoke_passed: bool = False
         self.smoke_feedback_count: int = 0
+        # WO#144 빌더-측 정밀 자기-테스트 상태(보고/테스트용).
+        self.last_selftest_error: str | None = None
+        self.last_selftest_passed: bool = False
+        self.selftest_feedback_count: int = 0
         # WO#141: 직전 run의 벽시계(초) — 빌드 요약에 표면화(속도 튜닝 가시성).
         self.last_elapsed_s: float = 0.0
 
@@ -600,6 +718,9 @@ class LocalAgentExecutor:
         self.last_smoke_error = None
         self.last_smoke_passed = False
         self.smoke_feedback_count = 0
+        self.last_selftest_error = None
+        self.last_selftest_passed = False
+        self.selftest_feedback_count = 0
         self.last_elapsed_s = 0.0
         _t0 = time.monotonic()
 
@@ -654,8 +775,31 @@ class LocalAgentExecutor:
                         continue
                     # 턴 소진 — 스모크 미통과인 채 반환(이후 독립 gate가 판정).
                     break
-                # 구조적 통과 → *즉시 반환*(불필요 턴 0; gate가 정답성 판정).
+                # 구조적(findability) 통과.
                 self.last_smoke_passed = True
+                # WO#144: 스모크 통과 *후* 빌더-측 *정밀 자기-테스트*(자기 유닛 테스트 실행). 실패 시
+                # *정확한 detail*(테스트명·assertion·traceback)을 다음 턴에 주입 → *타겟 수정* → green까지
+                # 반복. green/off면 반환(독립 적대 gate가 *행동·hollow·통합*을 진짜 바로 판정 — 불변).
+                if self.selftest is not None:
+                    sterr = self._safe_selftest(order)
+                    if sterr:
+                        self.last_selftest_error = sterr
+                        self.selftest_feedback_count += 1
+                        if turn < self.max_turns - 1:
+                            messages.append({"role": "assistant", "content": text})
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "빌더 자기-테스트 실패. 아래 *정확한 실패 detail*(테스트명·assertion·"
+                                    "expected vs actual·traceback)을 보고 *실패 지점만 타겟 수정*하라"
+                                    f"(전체 재생성 말고 — 통과 중인 부분은 유지):\n{sterr}\n고친 뒤 {DONE_MARKER}."
+                                ),
+                            })
+                            continue
+                        # 턴 소진 — 자기-테스트 미green인 채 반환(이후 독립 gate가 판정).
+                        break
+                    self.last_selftest_passed = True
+                # 스모크(+자기-테스트) 통과 → 반환(gate가 정답성·행동·통합 독립 판정).
                 break
 
             if done or not edits:
@@ -716,6 +860,21 @@ class LocalAgentExecutor:
         except Exception:  # noqa: BLE001 — 주입 체크의 크래시가 빌더를 죽이지 않는다
             return None
 
+    def _safe_selftest(self, order: NextOrder | None = None) -> str | None:
+        """selftest(빌더 정밀 자기-테스트) 콜백을 best-effort로 부른다(예외 흡수 — 검증이 빌드 안 죽임).
+
+        유닛 gate 체크 명령(order.local_checks)을 check_cmds로 넘겨 *gate 러너를 미러*해 빌더가
+        자기 유닛 테스트를 실행한다(WO#144). _call_verify가 1-arg 콜백(테스트 모킹)엔 back-compat.
+        **적대 분리**: gate/run-judge를 부르지 않는다 — 빌더 워크트리서 자기 테스트만 돌린다.
+        """
+        if self.selftest is None:
+            return None
+        cmds = [c.cmd for c in order.local_checks if c.cmd] if order is not None else []
+        try:
+            return _call_verify(self.selftest, self.workdir, cmds)
+        except Exception:  # noqa: BLE001 — 자기-테스트 크래시가 빌더를 죽이지 않는다
+            return None
+
     def _summary(self, applied: list[str], last_text: str) -> str:
         tail = (last_text or "").strip()
         if len(tail) > 600:
@@ -727,10 +886,17 @@ class LocalAgentExecutor:
             smoke = f"스모크 미통과({self.smoke_feedback_count}회 피드백 후 턴 소진)"
         else:
             smoke = "스모크 off"
+        segs = [f"턴 {self.last_turns}/{self.max_turns}", smoke]
+        # WO#144: 자기-테스트가 *동작했을 때만* 상태 표면화(off 노이즈 회피).
+        if self.last_selftest_passed:
+            segs.append("자기-테스트 green")
+        elif self.selftest_feedback_count:
+            segs.append(f"자기-테스트 미green({self.selftest_feedback_count}회 피드백)")
+        segs.append(f"{self.last_elapsed_s:.0f}s")
         return (
             f"로컬 빌더({self.model}) 완료 — 적용 파일 {len(applied)}개: {files}\n"
-            f"턴 {self.last_turns}/{self.max_turns} · {smoke} · {self.last_elapsed_s:.0f}s\n"
-            f"--- 모델 최종 메시지(tail) ---\n{tail}"
+            + " · ".join(segs) + "\n"
+            + f"--- 모델 최종 메시지(tail) ---\n{tail}"
         )
 
     # 텔레메트리(duck-typed, best-effort — 절대 run을 죽이지 않는다; #55/#67 패턴).

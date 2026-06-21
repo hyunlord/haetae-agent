@@ -18,6 +18,7 @@ from haetae.executors import (
     HumanRelayExecutor,
     LocalAgentExecutor,
     Tier,
+    builder_selftest,
     builder_smoke,
     tier_label,
 )
@@ -674,9 +675,10 @@ def main(argv: list[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "--executor local 빌더-측 구조적 스모크(컴파일+pytest --collect-only) ON(기본). 실패 시 "
-            "정확 에러를 다음 빌더 턴에 피드백해 self-fix(#139). --no-local-smoke로 끔. "
-            "**판정 아님** — 정답/완결은 독립 적대 gate(불변)."
+            "--executor local 빌더-측 자기검사 ON(기본). (1) 구조적 스모크(컴파일+디스커버리 "
+            "findability, #139/#141) 통과 후 (2) *정밀 자기-테스트*(자기 유닛 테스트 실행→실패 "
+            "detail 주입→타겟 수정→green, #144). --no-local-smoke로 둘 다 끔. "
+            "**판정 아님** — 정답/행동/완결/통합은 독립 적대 gate(불변)."
         ),
     )
     parser.add_argument("--state-path", default=None, help="최종 State를 저장할 YAML 경로")
@@ -987,6 +989,7 @@ def main(argv: list[str] | None = None) -> int:
             endpoint=args.local_endpoint, model=args.local_model,
             workdir=args.workdir, max_turns=args.local_max_turns,
             verify=(builder_smoke if args.local_smoke else None),
+            selftest=(builder_selftest if args.local_smoke else None),
             heartbeat=heartbeat, transcript=transcript,
         )
     else:
@@ -1019,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
                 endpoint=args.local_endpoint, model=args.local_model,
                 workdir=wt, max_turns=args.local_max_turns,
                 verify=(builder_smoke if args.local_smoke else None),
+                selftest=(builder_selftest if args.local_smoke else None),
                 heartbeat=heartbeat, transcript=transcript,
             )
         else:
