@@ -44,6 +44,14 @@ _INTEGRATION_MARKERS = (
     "통합", "조립", "조합", "결합", "조율", "오케스트", "wire", "wiring",
     "compose", "composition", "integrat", "assemble", "orchestr",
 )
+# WO#155: 트레이스-하니스 KIND 마커(전체 행동 사슬 구동 + evidence emit). 통합 유닛이 조립에
+# *더해* 이 KIND까지 한 유닛에 묶으면(엔진-파사드 + 트레이스-재구성) = 서로 다른 *종류*라 in-place
+# 축소로 부족(#153) → 구조적 재분해(전용 트레이스-하니스 유닛 분리) 대상. 순수 조립 유닛(이 마커
+# 없음)은 면제 유지. distinct 트레이스/하니스/evidence 어휘만 — 모듈명 우연매칭 회피.
+_TRACE_HARNESS_MARKERS = (
+    "트레이스", "하니스", "헤드리스", "trace", "harness", "headless",
+    "evidence", "증거", "행동 구동", "사슬 구동", "구동해", "playthrough", "플레이스루",
+)
 _OVER_LARGE_THRESHOLD = 4  # ≥4개 독립 행동 클로즈를 한 유닛에 묶으면 과대(약한 빌더 기준).
 
 # WO#152: distinct-KIND 책임 분류 — *서로 다른 종류*의 검증가능 로직(판정 vs 상태전이 vs
@@ -98,8 +106,23 @@ def granularity_signal(order: NextOrder) -> str | None:
     주입되는 *신호*다(LLM이 최종 판정·오버블록 회피). gate/run-judge와 무관(director-side).
     """
     blob = " ".join(p for p in (order.goal, order.scope, order.deliverable) if p)
-    if any(m in blob.lower() for m in _INTEGRATION_MARKERS):
-        return None  # 통합/조립 유닛 — 모듈 wire(disjoint-scope 소유), 과대 아님
+    low = blob.lower()
+    if any(m in low for m in _INTEGRATION_MARKERS):
+        # WO#155: 순수 조립(모듈 wire = 1 KIND)은 면제(#51/#123). 그러나 통합 유닛이 조립에 *더해*
+        # 트레이스-하니스 KIND(전체 행동 사슬 구동 + evidence emit)까지 묶으면 = 서로 다른 *종류*의
+        # 책임(조립 vs 검증-하니스)이라 in-place 축소로 부족 → *구조적 재분해*(유닛 추가) 권고.
+        if any(m in low for m in _TRACE_HARNESS_MARKERS):
+            return (
+                "이 통합 유닛이 모듈 조립(wire)에 *더해* 트레이스-하니스(전체 행동 사슬 구동 + "
+                "evidence emit)까지 한 유닛에 묶음 — 조립 vs 검증-하니스는 서로 다른 *종류*의 책임이라 "
+                "in-place 축소로는 부족하다(#153: 엔진-파사드 + 브라우저-어댑터 + 트레이스-재구성 3종, "
+                "OR-alt 축소 불충분). *구조적 재분해* 권고 — in-place 축소가 아니라 *유닛을 추가*해 "
+                "(1) wire/파사드 유닛(모듈 조립)과 (2) *전용 트레이스-하니스 유닛*(wire에 deps, 풀-행동 "
+                "사슬을 구동해 evidence emit)으로 분리하라. 트레이스가 자체 유닛이라 빌더가 집중하고 "
+                "gate가 별도 검증한다. (단 *순수 조립*만 하는 통합 유닛은 면제 — 트레이스-하니스를 "
+                "겸할 때만 분리.)"
+            )
+        return None  # 순수 조립/wire 유닛 — disjoint-scope 소유, 과대 아님(트레이스-하니스 미겸)
     clauses = _behavior_clauses(blob)
     kinds = _distinct_kinds(blob)  # WO#152: 서로 다른 *종류*의 책임(판정/상태전이/렌더/입력)
     over_count = len(clauses) >= _OVER_LARGE_THRESHOLD     # 행동 수 과대(#148)
@@ -274,5 +297,8 @@ def build_decomp_feedback(crit: DecompCritique) -> str:
         "직전에 실패/거부된 접근을 그대로 반복하지 마라. "
         "유닛에 독립 행동이 여럿이면(이동/충돌/먹이/game-over 등) 각각을 *distinct 모듈 파일을 "
         "소유하는 단일-책임 disjoint-scope 유닛*으로 쪼개고(파일 겹침 0 → 통합 벽 악화 방지), "
-        "별도 통합/조립 유닛이 그 모듈들을 wire하게 하라."
+        "별도 통합/조립 유닛이 그 모듈들을 wire하게 하라. "
+        "통합 유닛이 조립에 *더해* 트레이스-하니스(전체 행동 사슬 구동 + evidence emit)까지 겸하면, "
+        "in-place로 줄이지 말고 wire/파사드 유닛과 *전용 트레이스-하니스 유닛*(wire에 deps)으로 "
+        "*유닛을 추가*해 구조적으로 분리하라(#155)."
     )

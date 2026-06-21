@@ -310,9 +310,87 @@ def test_decomp_critic_prompt_has_distinct_kind_axis():
 
 def test_decomposition_prompts_stay_concise():
     """WO#152: distinct-KIND 정밀화를 #150-B 간결 길이 안에서 — 프롬프트 길이 회귀 모니터.
-    (서사 없이 기준만 추가; 합성 콜 수 회귀 0 목표의 프록시.)"""
+    (서사 없이 기준만 추가; 합성 콜 수 회귀 0 목표의 프록시.)
+    WO#155: end-to-end 검증의 구조적 분리(wire | 트레이스-하니스 §1e) + 풀-행동 사슬 scenario
+    예시는 통합 floor의 핵심 신규 지침이라 ceiling을 소폭(350→365) 올린다 — 여전히 *기준만*(서사
+    없이), 합성 콜 회귀 0 의도 보존."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
-    # #152 직전: synthesizer 343, decomp_critic 73. distinct-KIND 기준은 소폭만 허용.
-    assert syn_lines <= 350, f"synthesizer.md 길이 회귀({syn_lines}>350) — #150-B 간결 위반"
+    # #152 직전: synthesizer 343, decomp_critic 73. #155: wire|트레이스-하니스 분리 + 풀-사슬 예시.
+    assert syn_lines <= 365, f"synthesizer.md 길이 회귀({syn_lines}>365) — 간결 위반"
     assert dc_lines <= 80, f"decomp_critic.md 길이 회귀({dc_lines}>80)"
+
+
+# ──────────────── 통합-급 구조적 재분해 (WO#155) ────────────────
+#
+# #153: 통합 유닛이 over-bundled(엔진-파사드 + 브라우저-어댑터 + 트레이스-재구성 = 3 distinct
+# KIND) + 풀-행동 트레이스가 전체 사슬 미실증 → run-judge 정직 거부. director-side 보정: 통합
+# 유닛이 조립에 *더해* 트레이스-하니스 KIND까지 겸하면 granularity_signal이 *구조적 재분해*
+# (유닛 추가 — wire | 트레이스-하니스 분리) 신호를 낸다. 순수 조립은 면제 유지(과직렬화 회피).
+
+
+def test_granularity_signal_flags_integration_bundling_trace_harness():
+    """WO#155: 통합 유닛이 조립(wire)에 *더해* 트레이스-하니스(행동 사슬 구동+evidence)까지 겸하면
+    구조적 재분해(유닛 추가) 권고 — in-place 축소 아님(#153 over-bundle 직격)."""
+    order = NextOrder(
+        unit="u9",
+        goal="engine.js가 모듈을 wire하고 헤드리스 트레이스 하니스로 전체 행동 사슬을 구동해 evidence emit",
+        deliverable="engine.js + trace.ts",
+    )
+    sig = granularity_signal(order)
+    assert sig is not None
+    assert "구조적 재분해" in sig          # in-place 축소 아닌 유닛 추가
+    assert "트레이스-하니스" in sig and "wire" in sig.lower()
+    assert "deps" in sig.lower()           # 트레이스-하니스가 wire에 의존
+
+
+def test_granularity_signal_pure_wire_integration_still_exempt():
+    """WO#155 가드: 순수 조립(트레이스-하니스 미겸)만 하는 통합 유닛은 *여전히 면제*(None) —
+    구조적 재분해 신호가 순수 wire를 오탐하지 않는다(과직렬화 회피, #51/#123)."""
+    # 트레이스/하니스 어휘 없는 순수 wire — 모듈명(collision/gameover)을 *언급*해도 면제.
+    assert granularity_signal(
+        NextOrder(unit="u9", goal="engine.js가 move, collision, food, gameover 모듈을 조립/wire",
+                  deliverable="engine.js")
+    ) is None
+
+
+def test_granularity_signal_pure_trace_harness_unit_no_signal():
+    """WO#155: 이미 *분리된* 전용 트레이스-하니스 유닛(wire 마커 없음)엔 신호 없음 — 자체 유닛이라
+    더 쪼갤 것 없음(구조적 재분해는 wire+트레이스 *겸함*에만)."""
+    assert granularity_signal(
+        NextOrder(unit="u8", goal="헤드리스 trace 하니스로 풀-행동 사슬 트레이스 emit", deliverable="trace.ts")
+    ) is None
+
+
+def test_granularity_signal_structural_wired_into_critic_prompt():
+    """WO#155: 통합+트레이스 over-bundle 신호가 critic(codex) user 프롬프트에 *참고*로 주입된다."""
+    over = NextOrder(unit="u9",
+                     goal="모듈을 wire하고 헤드리스 트레이스 하니스로 전체 행동을 구동해 evidence emit",
+                     deliverable="engine.js")
+    client = MockClient([_WEAK_YAML])
+    critique_decomposition(over, _spec(), _state(), client, prompt_path=DECOMP_PROMPT)
+    user = client.calls[0]["user"]
+    assert "입도 신호" in user and "구조적 재분해" in user
+
+
+def test_build_decomp_feedback_guides_integration_trace_harness_split():
+    """WO#155: weak 피드백이 통합 트레이스-하니스 겸함 → wire | 전용 트레이스-하니스 분리(유닛 추가)를 유도."""
+    fb = build_decomp_feedback(DecompCritique(verdict="weak", reason="통합이 조립+트레이스 겸함", unit="u9"))
+    assert "트레이스-하니스" in fb
+    assert "전용" in fb or "유닛을 추가" in fb
+
+
+def test_synthesizer_prompt_has_wire_trace_harness_split():
+    """WO#155: 합성기가 end-to-end 검증을 wire/파사드 유닛 | 전용 트레이스-하니스 유닛(wire에 deps)으로
+    분리하도록 유도한다(distinct KIND·DAG)."""
+    syn = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8")
+    assert "트레이스-하니스" in syn
+    assert "wire" in syn.lower() and "파사드" in syn
+    assert "deps" in syn.lower()  # 트레이스-하니스가 wire에 의존(DAG)
+
+
+def test_decomp_critic_prompt_has_integration_structural_axis():
+    """WO#155: decomp-critic 프롬프트가 통합-급 구조적 재분해 축(조립+트레이스-하니스 겸함 → 유닛 추가)을 담는다."""
+    dc = DECOMP_PROMPT.read_text(encoding="utf-8")
+    assert "구조적 재분해" in dc
+    assert "트레이스-하니스" in dc

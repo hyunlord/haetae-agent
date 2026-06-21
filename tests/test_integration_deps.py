@@ -357,3 +357,40 @@ def test_synthesizer_prompt_has_integration_dep_guidance():
     assert "엮는 유닛들에 의존" in src or "엮는 유닛" in src
     assert "과직렬화" in src                 # 병렬성 보존 명시
     assert "머지 충돌" in src                 # 근본 차단 의도
+
+
+# ──────────────────── WO#155: wire | 트레이스-하니스 분리 (DAG) ────────────────────
+
+
+def test_synthesizer_prompt_has_wire_trace_harness_dag():
+    """WO#155: synthesizer.md가 end-to-end 검증을 wire/파사드 유닛 | 전용 트레이스-하니스 유닛으로
+    분리하고 트레이스-하니스가 wire에 deps(DAG상 wire 뒤)하도록 유도한다."""
+    src = PROMPT_PATH.read_text(encoding="utf-8")
+    assert "트레이스-하니스" in src and "파사드" in src
+    assert "deps" in src.lower()
+    assert "DAG" in src  # wire 뒤에 빌드되는 의존 순서(트레이스-하니스 → wire)
+
+
+def test_is_integration_unit_recognizes_trace_harness_and_wire():
+    """WO#155: wire/파사드 유닛과 전용 트레이스-하니스 유닛 둘 다 통합 성격으로 인식 →
+    deps-넛지가 트레이스-하니스의 wire 의존(과소지정 시)을 보수적으로 교정 가능(트레이스-하니스→wire DAG)."""
+    assert _is_integration_unit("wire/파사드 유닛: 빌더 모듈들을 import해 조립") is True
+    assert _is_integration_unit("전용 트레이스-하니스 유닛: 풀-행동 사슬 구동·evidence emit") is True
+    # 순수 빌더는 여전히 비통합(과직렬화 회피 — #155가 오탐을 늘리지 않음).
+    assert _is_integration_unit("move.js 이동 로직") is False
+
+
+def test_trace_harness_unit_recognized_and_nudged():
+    """WO#155: 전용 트레이스-하니스 유닛이 (통합 성격으로 인식돼) deps 과소지정 시 gap으로 잡힌다 —
+    #155 이전엔 '트레이스-하니스' 어휘가 미인식이라 넛지 누락(detached 빌드 위험). 이제 안전망이
+    커버한다. (트레이스-하니스 → *wire 유닛* 의존 자체는 합성기 §1e가 유도; deps-넛지는 통합→비통합
+    빌더만 다루므로 여기선 트레이스할 빌더 모듈 의존을 보수적으로 교정 — wire 유닛은 통합이라 제외됨.)"""
+    spec = _spec([
+        ("u1", "move.js 이동 로직", []),
+        ("u2", "collision.js 충돌 판정", []),
+        ("u3", "food.js 먹이/성장", []),
+        ("uH", "전용 트레이스-하니스 유닛: 풀-행동 사슬 구동·evidence emit", []),  # deps 누락
+    ])
+    gaps = _integration_dep_gaps(spec)
+    assert "uH" in gaps  # 트레이스-하니스가 통합 성격으로 인식돼 deps gap에 잡힘(#155 이전엔 미인식)
+    assert set(gaps["uH"]) >= {"u1", "u2", "u3"}  # 트레이스할 빌더 모듈들에 의존하도록 교정

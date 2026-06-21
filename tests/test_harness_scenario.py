@@ -144,6 +144,26 @@ def test_synthesizer_scenario_steps_is_builder_steer_not_bar():
     assert "run-judge가 한다" in src or "run-judge가 그런" in src
 
 
+def test_synthesizer_has_full_chain_scenario_example():
+    """WO#155(#113): 합성기가 게임류 트레이스-하니스에 *풀-행동 사슬* scenario_steps를 유도한다 —
+    스폰→이동→먹이→성장→점수→벽충돌→자기충돌→game-over 전체를 한 플레이스루로(부분 트레이스 금지)."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    assert "풀-행동 사슬" in src or "전체 사슬" in src
+    for beh in ("스폰", "먹이", "성장", "점수", "game-over"):
+        assert beh in src, beh
+    assert "플레이스루" in src
+    # 커버리지지 *바 완화 아님* — 각 STEP을 evidence_field로 입증(step→field) 유지.
+    assert "step→field" in src or "evidence_field" in src
+
+
+def test_full_chain_scenario_is_coverage_not_bar_relaxation():
+    """WO#155 불변: 풀-사슬 scenario는 *빌드-측 커버리지*지 적대 run-judge 바 완화가 아니다(#113)."""
+    src = SYNTH_PROMPT.read_text(encoding="utf-8")
+    # 부분 트레이스가 거짓 음성이라는 #153 직격(전체 사슬 미실증 → run-judge 정당 거부) 명시.
+    assert "거짓 음성" in src
+    assert "run-judge가 한다" in src  # 값/행동 판정은 여전히 독립 run-judge(바 불변)
+
+
 # ════════════════════ 3. verification-harness 스킬 — 흔한 시나리오 실수 ════════════════════
 
 
