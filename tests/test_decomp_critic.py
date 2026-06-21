@@ -11,6 +11,7 @@ import yaml
 from haetae.decomp_critic import (
     build_decomp_feedback,
     critique_decomposition,
+    granularity_signal,
     is_weak,
 )
 from haetae.llm import MockClient
@@ -162,3 +163,83 @@ def test_build_decomp_feedback_includes_reason():
     fb = build_decomp_feedback(DecompCritique(verdict="weak", reason="전체 재진술", unit="u1"))
     assert "전체 재진술" in fb
     assert "더 작은" in fb  # 더 작은 진전 스텝으로 분해 지시
+
+
+# ──────────────────── 입도/책임 수 축 (WO#148) ────────────────────
+#
+# #147: snake 엔진 전체(이동+성장+충돌+먹이+점수+game-over)를 한 유닛에 몰아 약한 로컬
+# 빌더가 미수렴(gate=self-test 정렬·순수 용량). granularity_signal = director-side 결정적
+# 탐지(LLM 아님·gate 아님) — 과대-다행동 유닛을 critic 프롬프트에 신호로 주입(codex가 판정).
+
+
+def _multi_behavior_order() -> NextOrder:
+    return NextOrder(
+        unit="u2",
+        goal="snake 엔진 상태, 이동 규칙, 방향 전환, 먹이 섭취, 점수, 벽/자기몸 충돌, game over 로직",
+        deliverable="engine 모듈과 vitest",
+    )
+
+
+def test_granularity_signal_flags_over_large_multi_behavior():
+    sig = granularity_signal(_multi_behavior_order())
+    assert sig is not None
+    assert "단일-책임" in sig and ("disjoint" in sig.lower())
+    assert "쪼" in sig or "분할" in sig  # 분할 권고
+
+
+def test_granularity_signal_none_for_right_sized():
+    # 단일 책임(이동만) — 신호 없음(과분할 nagging 방지)
+    assert granularity_signal(
+        NextOrder(unit="u2", goal="engine/move.js에 이동 로직만 구현(방향에 따라 머리 한 칸 전진)",
+                  deliverable="move.js + move.test.js")
+    ) is None
+    # 충돌 한 책임(벽·자기몸 = 충돌의 하위측면, 2 clause < 임계) — 신호 없음
+    assert granularity_signal(NextOrder(unit="u3", goal="collision.js: 벽 충돌, 자기몸 충돌 판정")) is None
+
+
+def test_granularity_signal_exempts_integration_unit():
+    # 통합/조립 유닛은 모듈을 wire(조립 파일 소유) — 다수 모듈 언급해도 면제(disjoint-scope 설계)
+    assert granularity_signal(
+        NextOrder(unit="u9", goal="engine.js가 move, collision, food, gameover 모듈을 조립/wire",
+                  deliverable="engine.js")
+    ) is None
+
+
+def test_granularity_signal_wired_into_critic_prompt():
+    """과대-다행동 유닛이면 입도 신호가 critic(codex) user 프롬프트에 주입된다(codex가 판정)."""
+    client = MockClient([_WEAK_YAML])
+    critique_decomposition(_multi_behavior_order(), _spec(), _state(), client, prompt_path=DECOMP_PROMPT)
+    user = client.calls[0]["user"]
+    assert "입도 신호" in user and "단일-책임" in user
+
+
+def test_granularity_signal_absent_for_right_sized_prompt():
+    """적정-입도 유닛엔 입도 신호 섹션 없음(과분할 권고 안 함)."""
+    client = MockClient([_PROGRESS_YAML])
+    critique_decomposition(_order(), _spec(), _state(), client, prompt_path=DECOMP_PROMPT)
+    assert "입도 신호" not in client.calls[0]["user"]
+
+
+def test_build_decomp_feedback_guides_disjoint_scope():
+    fb = build_decomp_feedback(DecompCritique(verdict="weak", reason="과대-다행동 유닛", unit="u2"))
+    assert "단일-책임" in fb and "disjoint" in fb.lower()
+
+
+def test_decomp_critic_is_director_side_not_gate():
+    """적대 분리: decomp_critic은 gate/run-judge/judge를 import·참조하지 않는다(director-side 계획)."""
+    src = REPO_ROOT.joinpath("src/haetae/decomp_critic.py").read_text(encoding="utf-8")
+    for forbidden in ("haetae.gate", "run_judge", "haetae.judge", "GateResult", "CompositeGate"):
+        assert forbidden not in src, f"decomp_critic이 {forbidden} 참조(분리 위반)"
+
+
+def test_synthesizer_prompt_has_single_responsibility_disjoint_scope():
+    """합성기 분해 프롬프트가 단일-책임 + disjoint-scope 분해 지침을 담는다(WO#148)."""
+    syn = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8")
+    assert "단일-책임" in syn
+    assert "disjoint" in syn.lower()
+
+
+def test_decomp_critic_prompt_has_granularity_axis():
+    """decomp-critic 프롬프트가 입도/책임 수 축(과대-다행동 유닛 weak)을 담는다(WO#148)."""
+    dc = DECOMP_PROMPT.read_text(encoding="utf-8")
+    assert "입도" in dc and "단일-책임" in dc

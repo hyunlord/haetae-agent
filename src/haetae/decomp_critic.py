@@ -18,6 +18,7 @@ LEAP 교훈: 이 리뷰어 ablation → 형식상 멀쩡한데 무진전인 분�
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from haetae.llm import LLMClient
@@ -25,6 +26,54 @@ from haetae.models import DecompCritique, NextOrder, PlanState, ProjectSpec, Sta
 from haetae.parsing import ParseError, parse_yaml_model
 
 DEFAULT_DECOMP_CRITIC_PROMPT_PATH = "prompts/decomp_critic.md"
+
+
+# ──────────────────────────── 입도/책임 수 축 (WO#148) ────────────────────────────
+#
+# #147 진단: snake 엔진 전체(이동+성장+충돌+먹이+점수+game-over)를 한 유닛에 몰자 약한
+# 로컬 빌더가 4 dispatch + OR-alt 내내 미수렴 — gate의 test:engine이 self-test와 *정렬*
+# (인공 바 아님)이라 순수 *유닛 용량* 문제. director-side 보정: 과대-다행동 유닛을 결정적
+# 으로 탐지해 critic 프롬프트에 *신호*로 주입(codex critic이 최종 판정 — LLM 권위 유지·
+# 오버블록 회피). 통합/조립 유닛은 면제(distinct 조립 파일 소유 = disjoint-scope, #51/#123).
+# gate/run-judge/judge와 무관(director-side 계획 신호일 뿐).
+
+# 독립 행동을 가르는 리스트 구분자(경로의 '/'는 제외 — 파일경로 false-count 회피).
+_BEHAVIOR_SEP = re.compile(r"[,，;；·、]|\+| 및 | and | & |\n")
+# 통합/조립 유닛 마커(다수 모듈을 wire — distinct 조립 파일 소유, 과대 아님 → 면제).
+_INTEGRATION_MARKERS = (
+    "통합", "조립", "조합", "결합", "조율", "오케스트", "wire", "wiring",
+    "compose", "composition", "integrat", "assemble", "orchestr",
+)
+_OVER_LARGE_THRESHOLD = 4  # ≥4개 독립 행동 클로즈를 한 유닛에 묶으면 과대(약한 빌더 기준).
+
+
+def _behavior_clauses(text: str) -> list[str]:
+    """텍스트를 리스트 구분자로 쪼개 *비자명* 행동 클로즈만 반환(길이<2·순수 filler 제외)."""
+    parts = [p.strip(" \t·*-—:") for p in _BEHAVIOR_SEP.split(text or "")]
+    return [p for p in parts if len(p) >= 2 and p not in ("및", "등", "그리고", "and")]
+
+
+def granularity_signal(order: NextOrder) -> str | None:
+    """과대-다행동 유닛이면 *분할 권고 신호*(한 줄)를, 아니면 None을 반환(결정적·director-side).
+
+    WO#148: 한 유닛 goal/scope/deliverable에 독립 행동이 임계(≥4) 이상 묶이면 약한 로컬
+    빌더가 단일 유닛으로 신뢰성있게 수렴하기 과대 → 단일-책임 disjoint-scope 유닛들로 쪼갠다.
+    통합/조립 유닛(모듈 wire)은 면제(distinct 조립 파일 소유). **판정 아님** — critic(codex)에
+    주입되는 *신호*다(LLM이 최종 판정·오버블록 회피). gate/run-judge와 무관(director-side).
+    """
+    blob = " ".join(p for p in (order.goal, order.scope, order.deliverable) if p)
+    if any(m in blob.lower() for m in _INTEGRATION_MARKERS):
+        return None  # 통합/조립 유닛 — 모듈 wire(disjoint-scope 소유), 과대 아님
+    clauses = _behavior_clauses(blob)
+    if len(clauses) < _OVER_LARGE_THRESHOLD:
+        return None
+    head = ", ".join(clauses[:6])
+    return (
+        f"이 유닛이 독립 행동을 약 {len(clauses)}개({head}…) 한 덩어리로 묶음. 약한 로컬 "
+        "빌더가 단일 유닛으로 신뢰성있게 수렴하기엔 과대 — 각 독립 행동을 *distinct 모듈 "
+        "파일을 소유하는 단일-책임 disjoint-scope 유닛*으로 쪼개고(파일 겹침 0), 별도 통합/"
+        "조립 유닛이 wire하도록 분할 권고."
+    )
 
 
 class DecompCriticError(ParseError):
@@ -95,7 +144,7 @@ def _build_user(
     checks = ", ".join(
         f"[{c.type.value}] {c.cmd or '(cmd 없음)'}" for c in order.local_checks
     ) or "(없음)"
-    return (
+    base = (
         f"# work_order (replan이 낸 다음 분해 — 판정 대상)\n"
         f"- unit: {order.unit}\n"
         f"- goal: {order.goal}\n"
@@ -108,6 +157,16 @@ def _build_user(
         f"# progress (현재 plan 상태)\n{_plan_progress(state)}\n\n"
         f"# 직전 진행(last_result)\n{last_result or '(아직 없음)'}"
     )
+    # WO#148: 과대-다행동 유닛이면 입도 신호를 *참고*로 주입(판정은 너의 몫 — 오버블록 회피).
+    sig = granularity_signal(order)
+    if sig:
+        base += (
+            "\n\n# 입도 신호 (자동 탐지 — 입도/책임 수 축, WO#148)\n"
+            f"{sig}\n"
+            "(이 신호는 *판정이 아니라 참고*다. 행동들이 실제로 독립이고 한 유닛이 과대하면 "
+            "weak로 단일-책임 disjoint-scope 분할을 권고하고, 한 책임의 하위측면일 뿐이면 무시하라.)"
+        )
+    return base
 
 
 def critique_decomposition(
@@ -164,5 +223,8 @@ def build_decomp_feedback(crit: DecompCritique) -> str:
         f"- 사유: {reason}\n"
         "→ 전체 goal을 재진술하지 말고, 남은 거리를 *의미있게 줄이는 더 작은 한 조각*으로 "
         "분해하라. 이번 유닛이 완료되면 무엇이 명확히 진전되는지 goal에 드러나게 하라. "
-        "직전에 실패/거부된 접근을 그대로 반복하지 마라."
+        "직전에 실패/거부된 접근을 그대로 반복하지 마라. "
+        "유닛에 독립 행동이 여럿이면(이동/충돌/먹이/game-over 등) 각각을 *distinct 모듈 파일을 "
+        "소유하는 단일-책임 disjoint-scope 유닛*으로 쪼개고(파일 겹침 0 → 통합 벽 악화 방지), "
+        "별도 통합/조립 유닛이 그 모듈들을 wire하게 하라."
     )

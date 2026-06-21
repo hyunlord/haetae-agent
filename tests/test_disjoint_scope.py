@@ -287,17 +287,20 @@ def test_adopt_scope_only_structural_change_returns_original():
 
 
 def test_decomp_critic_unchanged_scope_overlap_not_weak_trigger():
-    """scope-overlap은 decomp critic의 weak 트리거가 *아니다*(progress-only 유지)."""
+    """머지-충돌 scope-overlap 메커니즘(#59/#123)은 decomp critic에 *없다* — 합성/루프 경로 전용.
+
+    (WO#148이 입도 축으로 *분할 권고* disjoint-scope 텍스트를 critic에 추가했으나, 그건 과대-유닛
+    을 단일-책임 유닛들로 쪼개라는 권고지 머지-충돌 scope-overlap *verdict 트리거*가 아니다 —
+    아래 머지 메커니즘 부재 + progress-only 정규화는 유지된다.)
+    """
     import inspect
 
     import haetae.decomp_critic as dc
 
     src = inspect.getsource(dc)
-    # decomp_critic은 disjoint-scope 개념을 모른다(#59는 합성 경로 전용 — critic 무변경).
-    # ('scope'는 NextOrder.scope=작업지시서 scope를 포맷하느라 등장하는 *무관* 필드라 제외.)
-    assert "disjoint" not in src.lower()
+    # 머지-충돌 scope-overlap 메커니즘(#59/#123)은 critic에 없다(합성/루프 경로 전용).
     assert "_scope_overlaps" not in src and "disjoint_scope_feedback" not in src
-    # weak 정규화는 'weak' 별칭만 — scope-overlap 같은 새 트리거 없음(progress-only 유지).
+    # weak 정규화는 'weak' 별칭만 — scope-overlap 같은 새 *verdict* 트리거 없음(progress-only 유지).
     assert dc._norm_verdict("weak") == "weak"
     assert dc._norm_verdict("scope-overlap") == "progress"  # 미지값 → progress(안 막음)
 
