@@ -3,7 +3,7 @@
 > 해태(獬豸) = 시비·선악을 판별하는 신수. 차별점 = **언제 done이 아닌지 아는 governed GATE.**
 > autonomous director: 의뢰 하나 → governed spec → `synthesize → replan → [분해 critic] → dispatch(executor) → gate → replan` 루프 → done/escalate/stop.
 >
-> **최종 갱신: 2026-06-20 · WO#1–129 · 1043 tests · main @38b89d6 · 🎮 Mario 챕터 첫 완주(#129) — #128 fix(증거계약 dep-배치 + server-less 게임플레이 검증)로 *깨끗한 done*(통합 8/8·스캐폴드 낭비 0·EPERM 0·검증역전 0·~17M ≈ 7× 저렴; #126이 크레딧 소진으로 못 받은 verdict 획득) · 🎯 crowd-sim 캘리브레이션 종결(#124, tight 근접 collision-free·gate 정직성 inversion 0) · OMC 차용 4종 전부 ✅(#1·#2·#3 phase 1·2·#4)**
+> **최종 갱신: 2026-06-21 · WO#1–153 · 1138 tests · main @8d12689 · 🧪 로컬-모델 executor arc(#133–153, §8) — 약한 로컬 Qwen3.6 빌더 + 풀 파이프라인이 실제 JS 게임(snake)의 단일-책임 검증 유닛 *5/6 수렴* = thesis 실질 실증(오케스트레이션 > 모델 강도 · 적대 gate 전 arc 정직 · 검증역전 0); 남은 floor = integration(wire + 풀-행동 트레이스) · 직전: 🎮 Mario 첫 완주(#129) · 🎯 crowd-sim 캘리브레이션 종결(#124) · OMC 차용 4종 전부 ✅(§7)**
 
 ---
 
@@ -234,3 +234,46 @@ OMC(CC-플러그인 오케스트레이터)와 haetae가 또 같은 자리 수렴
 4. ✅ **스킬 자동 학습 learner (WO#103)** — 완주 캡스톤서 재사용 *패턴* 후보를 staging(`skills/_candidates/`) 추출 + provenance. **F.1 거버넌스: 자동채택 0**(load_skills가 `_`접두 구조적 제외·사람 `--approve` 전 미편입·미주입) · 빌더-측만(judge 무수신)·**독립 적대 gate가 backstop**(나쁜 학습 스킬도 나쁜 산출 통과 불가 = 자기학습 표류 안전망) · lint(자가채점/바완화/구현덤프 차단)·IP 원본. #32(seeded)의 거버넌스형 자동화.
 
 **차별점 유지**: OMC verifier=같은 시스템 opus 에이전트 체크리스트 / haetae gate=적대·독립 + 검증기 자체 검증(#78~#86 사슬). "정직한 실패" 축 우위는 보존하며 차용.
+
+---
+
+## 8. 로컬-모델 executor arc (#133–#153) — thesis 실질 실증
+
+> **약한 로컬 모델을 *빌더*로, 강한 codex를 *judge/critic*으로.** 전 파이프라인(분해 · 적대 gate · self-test 피드백 · OR · 통합 적응)이 모델 강도를 보강하는가? — 실제 JS 게임에서 **단일-책임 검증 유닛 5/6 수렴 = thesis 실질 실증.** GB10 로컬 추론 사다리(#133–#136) → `--executor local`(#137) → lift 측정(#138) → 빌더-측 정련(#139–#153).
+
+### thesis
+적당히 작은 *최신* 로컬 모델 + 모든 기법(분해 · 적대 gate · self-test 피드백 · OR · 통합 적응) = **검증된 결과**. **오케스트레이션 > 모델 강도.** §0의 "범용 LLM + agentic harness면 충분 · executor는 pluggable"을 *약한 빌더* 극단으로 민 것 = provider-agnostic(§0 3축)의 라이브 실증. 외부 수렴(2026): 모델은 구조화 하니스 안에서 현저히 더 잘 작동(§5 Loop Engineering · CRDAL 분리-검증자와 같은 자리).
+
+### 빌더 구성 (DGX Spark GB10, #133–#137)
+- **모델**: Qwen3.6-35B-A3B Q4_K_XL + MTP(`--spec-type draft-mtp --spec-draft-n-max 3`, ~1.36×) + **thinking-off**. llama.cpp(84de01a, GB10 sm_121) idle **~55 t/s**.
+- **교훈**: MoE 희소성 ≠ 속도(GB10 反證) · MTP가 실효 속도 레버 · thinking-on은 hang. GPU 추론은 ollama/SGLang 아닌 **llama.cpp**서 풀림(#136 — sm_121 스택 미성숙 게이트 해소).
+- **분리**: judge/critic = 강한 **codex**(불변 · 적대 분리). 빌더만 로컬 — `providers/local_agent.py LocalAgentExecutor`(#137, OpenAI 엔드포인트 · stdlib만 · `complete()` 부재라 judge_client 불가 = 구조적 분리).
+
+### lift 결과 — 약한 빌더가 진짜 코드를 수렴
+- **실제 JS 게임(snake) 단일-책임 유닛 5/6 수렴**: 약한 로컬 빌더 → 실코드 → builder-side self-test green → **codex 행동 gate → pass**. **per-unit lift 라이브 실증.**
+- ttt(#138): u1 수렴 · u2(minimax)는 *인공 전수-무적 바*(critic-강화 v2)서 막힘 — 빌더 역량 아닌 *바 난이도*.
+
+### floor 사다리 (각 막힘 → fix, 매번 위로)
+| floor (막힘) | fix |
+|---|---|
+| collection-error #138 (테스트가 자기 impl에 없는 API import) | builder-side smoke `collect-only` #139 |
+| smoke ↔ gate discovery 불일치 #140 | gate-discovery 정렬 #141 |
+| 정답성 / 루프-수렴 #143 | 정밀 self-test 피드백(assertion-detail → 타겟 수정) #144 |
+| JS 미커버(Python만) #145 | self-test JS/vitest 확장 #146 |
+| 분해 입도 — 엔진 한 덩어리 #147 | 단일-책임 disjoint-scope 분할 #148 |
+| truncation → 스텁(로드된 박스) #149 | 스트리밍 idle-timeout(#54 원칙) #150 |
+| 유닛 밀집 u3(detection + state 혼재) #151 | distinct-KIND 분할 재균형 #152 |
+| 유닛 밀집 u4 — KIND-탐지 라이브 돌파 #153 | **→ 남은: integration floor** |
+
+### ★ 적대 분리 라이브 실증 ★
+**self-test green = 필요조건이지 충분조건 아님.** 빌더가 *자기 테스트*를 green 내도 gate의 *행동 바*가 진짜 바 — #145 u2 · #147 · #151서 입증(self-test 통과 산출이 행동 gate서 정직하게 fail). 빌더-측 보조(smoke/self-test: #139·#144·#146) · director-측 계획(decomp-critic 입도: #148·#152)이 **적대 gate(행동 run-judge · hollow #98 · 통합)를 타락 안 시킴** — 전 arc **검증역전 0**. §7-2 보장층 독립성의 *약-빌더 극단* 입증.
+
+### 남은 floor = integration
+wire + **풀-행동 트레이스**(전체 행동 사슬을 *한 플레이스루*로 실증)가 **어떤 단일 유닛보다 어렵다.** 통합 유닛이 over-bundled(파사드 + 어댑터 + 트레이스 = 3 KIND). 다음 sub-arc:
+- **(a)** decomp-critic가 통합-급 유닛에 *구조적 재분해*(현재 in-place 재계획 부족 — #152 KIND-분할의 통합판).
+- **(b)** 전용 트레이스-하니스 유닛 + 풀-사슬 `scenario_steps`(#113 "시나리오 커버리지 = gate 엄밀성 상한" 원칙).
+- **(c)** 비용(아래).
+
+### 비용 구조
+- 약한 빌더 **쌈**(~10K/유닛) · 강한 codex judge/critic **비쌈**(풀 런 ~1.4M; #138 실측 codex judge ~461K ≫ 로컬 빌더 ~10K).
+- codex replan **~5분/콜 = 벽시계 병목**(토큰 아닌 *시간*) → 효율 백로그(§3)와 연결.
