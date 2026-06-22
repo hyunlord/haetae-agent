@@ -285,6 +285,14 @@ wire + **풀-행동 트레이스**(전체 행동 사슬을 *한 플레이스루*
 - **비용**: 트레이스 재시도가 비쌈(#158 ~2.18M, u7 단독 206K — 매 실패가 codex run-judge 1콜). 통합-급 유닛이 비용 핫스팟.
 - **적대 분리/무결성**: 전 sub-arc 검증역전 0·#113 바 불완화·서버리스(#128)·judge=codex 불변. 빌더-측(self-test)·director-측(decomp/scaffold) 보강이 적대 gate를 타락 안 시킴.
 
+### integration sub-arc 결론 (#160–#163) — DOM-경계 역량 ceiling
+- **#160–#161 성과**: facade 계약 + runtime-smoke로 *빌드-passes-but-crashes* 통합 계약버그(Food.generate static/instance 류)를 통합서 포착 → 빌더가 수정 → **게임이 실제로 빌드+작동**(독립검증: 먹이/점수/충돌/game-over/헤드리스 bootstrap 정확). #158 명확히 넘어섬.
+- **#162–#163 — floor가 닫히지 않고 *옮겨감***: #162가 트레이스 하니스에 검증된 헤드리스 어댑터(installHeadlessDOM)+정확 import 스캐폴드 → #163서 *같은* 약빌더 혼동(jsdom 끌어옴·헤드리스-테스트 vs 브라우저-앱 DOM)이 *통합으로 이동*(app.js/main.js에 jsdom→build+smoke 깨짐; 어댑터 제공됐으나 빌더 0회 사용). piecemeal 수정 = floor 이동이지 폐쇄 아님.
+- **🔑 발견 — 약빌더 × DOM-경계 역량 ceiling**: 약 Qwen3.6 빌더는 *비-DOM 행동 로직*을 안정 수렴(매 런 6/6 단일-책임 유닛)하나, *DOM-경계*(브라우저-앱 조립 + 헤드리스 검증 인프라: 브라우저-DOM vs 헤드리스-테스트 구분, jsdom 회피)에 지속적 ceiling. DOM-닿는 유닛마다 같은 혼동 재출현(트레이스→통합). 궤적 점근-아님(고칠 버그가 아니라 raw 역량 한계).
+- **thesis 결론(경계지어 입증)**: *오케스트레이션 > 모델 강도* 는 정밀히 경계지어 성립 — 파이프라인이 약빌더로 (a)역량 내(행동 로직, + runtime-smoke로 통합 계약버그까지) *검증된-좋은 결과*를 내게 하고, (b)역량 밖(DOM-경계)은 *정직하게 게이트*(절대 가짜 done 0). 5+런 검증역전 0·#113 바 불완화·적대 분리·서버리스 전 구간 유지. = 안 도는/미검증 게임에 도장 0이 파이프라인 핵심 가치의 결정적 입증.
+- **남은 옵션(서브프로젝트 재개 시)**: 포괄적 DOM-steering(app 진입점=실DOM·jsdom 금지 + 모든 헤드리스 하니스=installHeadlessDOM, synthesizer/scaffold 가이드). 단 *옮겨가는 floor* 특성상 강한 스캐폴드를 약빌더 특정 약점에 쌓는 것이라 thesis 깨끗함과 trade-off — 또는 강한 tier 빌더로 DOM-경계만 격상. 정직 baseline = ceiling 발견 자체가 완결된 결과.
+- **비용 메모**: 통합/트레이스 재시도가 비용 핫스팟(#161 3.13M·#163 1.76M, codex judge/critic 지배). 행동 로직은 cheap+안정.
+
 ### 비용 구조
 - 약한 빌더 **쌈**(~10K/유닛) · 강한 codex judge/critic **비쌈**(풀 런 ~1.4M; #138 실측 codex judge ~461K ≫ 로컬 빌더 ~10K).
 - codex replan **~5분/콜 = 벽시계 병목**(토큰 아닌 *시간*) → 효율 백로그(§3)와 연결.
