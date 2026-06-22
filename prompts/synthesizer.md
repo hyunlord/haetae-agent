@@ -121,21 +121,26 @@ spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge
   예: `check: { type: run, cmd: "npm run sim:trace -- --ticks 300 --spawn high" }`
 - 그리고 **`decomposition`에 그 트레이스 진입점을 만드는 unit을 명시**하라 — 진입점이 없으면
   `run` 기준은 충족 불가능한 죽은 기준이 된다.
+- **검증 트레이스는 *단일 end-to-end 유닛*(#157 비-split) — 엔진 트레이스와 앱-bootstrap 트레이스를
+  별도 유닛으로 쪼개지 마라.** runtime-smoke가 bootstrap-runs를 이미 입증하고 스캐폴드된 헤드리스
+  어댑터가 단일 트레이스로 앱+엔진 전체를 서버 없이 구동한다(둘로 나누면 산출물 2배 → #161 u7/u8 escalate).
 - **하니스는 *node로 실행 가능한 가벼운 헤드리스 트레이스*여야 한다 — 실브라우저 E2E 금지.**
   게이트는 **오프라인 clean-install 환경**(네트워크·브라우저 바이너리 없음)에서 트레이스를
-  실행한다. 그러니 하니스 cmd는 실제 엔진/로직 모듈을 **`import`** 해 **순수 JS(또는 JSDOM)** 로
-  헤드리스 구동하고 JSON을 emit하는 **`node`(또는 tsx) 스크립트**여야 한다.
+  실행한다. 그러니 하니스 cmd는 실제 엔진/로직 모듈을 **`import`** 해 **순수 JS(또는 스캐폴드된
+  헤드리스 어댑터)** 로 헤드리스 구동하고 JSON을 emit하는 **`node`(또는 tsx) 스크립트**여야 한다.
   - 예(O): `cmd: "npm run trace:behavior"` → `"trace:behavior": "node --import tsx scripts/trace/x.ts"`.
   - **금지(X): playwright·puppeteer·chromium·실브라우저·headless Chrome** 의존 — 게이트 오프라인서
     `exit 1` 나고, 빌더가 못 돌리는 하니스로 재시도를 반복해 *검증기가 검증 대상보다 비싸진다*
     (캡스톤 #83: 브라우저 하니스가 전체 비용 66~89% 태우고 미수렴; node 트레이스는 완주).
   - UI 앱이면 **로직을 렌더링에서 분리**하라 — 엔진/상태/규칙을 DOM·canvas 없이 import해 node서
-    trace한다(canvas 픽셀이 아니라 *로직*이 검증 대상). DOM 이벤트/rect가 필요하면 JSDOM으로 가볍게.
+    trace한다(canvas 픽셀이 아니라 *로직*이 검증 대상). DOM 이벤트/canvas/rAF가 필요하면 **스캐폴드된
+    헤드리스 어댑터**(`installHeadlessDOM` — 서버리스 fake document/canvas/window/rAF)를 import해 쓴다.
+    **jsdom 등 미설치 패키지·`navigator` 같은 읽기전용 전역 monkeypatch 금지**(#161 u8 직격: 크래시→빈 트레이스).
   - **게임/플랫포머 등 — 게임플레이 검증은 *server-less*다(#126 "플랫포머 onset", 안전 강화).** 행동 권위는
     **in-sandbox engine-trace**(서버 불요·node 헤드리스로 엔진/규칙 import·전체 행동 증거: 이동·점프·중력·
     충돌·코인 수집·적 처치/피격·라이프·게임오버·클리어). **`127.0.0.1` 등 loopback 서버를 띄우지 마라** —
     샌드박스가 loopback listen을 `EPERM`으로 차단한다(`vite --host`·dev/preview 서버·headless-Chrome-on-localhost·
-    CDP-to-local-server 회피). 시각/렌더 확인이 필요하면 **`file://`·data-URI 로드**(서버 불요)나 JSDOM으로만,
+    CDP-to-local-server 회피). 시각/렌더 확인이 필요하면 **`file://`·data-URI 로드**(서버 불요)나 *스캐폴드된 헤드리스 어댑터*로만,
     그것도 *best-effort*로 두고 — `run` 행동 기준(=통합 게이트가 강제)은 **engine-trace에 둬라**(browser-render가
     통합 실패를 유발하면 안 됨). 검증 *깊이*는 유지된다(engine-trace가 전체 행동을 권위로 검증 — hollow 아님).
     근거(#126): 플랫포머 빌더가 `trace:browser-render`로 127.0.0.1 서버를 띄우려다 EPERM으로 통합 실패 —

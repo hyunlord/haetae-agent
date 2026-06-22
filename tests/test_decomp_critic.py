@@ -317,12 +317,15 @@ def test_decomposition_prompts_stay_concise():
     WO#157: 검증-트레이스 비-split(end-to-end) + #27 트레이스-하니스 스캐폴드 지침(synthesizer §1e +
     decomp_critic 축)은 #156 u8 floor 직격이라 ceiling 소폭 상향(syn 365→378·dc 80→92) — *기준만*.
     WO#160: 통합 facade 계약 + 런타임-smoke(synthesizer §1f + decomp_critic 1줄)은 #158 통합 floor
-    (build-pass≠runtime-works) 직격이라 ceiling 소폭 상향(syn 378→383) — *기준만*(서사 없이·콜 회귀 0 의도)."""
+    (build-pass≠runtime-works) 직격이라 ceiling 소폭 상향(syn 378→383) — *기준만*(서사 없이·콜 회귀 0 의도).
+    WO#162: 트레이스-하니스 헤드리스 어댑터 재사용(synthesizer JSDOM→어댑터 redirect + 단일 트레이스
+    consolidation; decomp_critic 1줄)은 #161 u7/u8 트레이스 floor(약빌더가 DOM 인프라를 못 짬) 직격이라
+    ceiling 소폭 상향(syn 383→388·dc 92→93) — *기준만*(서사 없이·콜 회귀 0 의도)."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
     # #152 직전: synthesizer 343, decomp_critic 73. #157: 검증-트레이스 end-to-end + 스캐폴드 지침.
-    assert syn_lines <= 383, f"synthesizer.md 길이 회귀({syn_lines}>383) — 간결 위반"
-    assert dc_lines <= 92, f"decomp_critic.md 길이 회귀({dc_lines}>92)"
+    assert syn_lines <= 388, f"synthesizer.md 길이 회귀({syn_lines}>388) — 간결 위반"
+    assert dc_lines <= 93, f"decomp_critic.md 길이 회귀({dc_lines}>93)"
 
 
 # ──────────────── 통합-급 구조적 재분해 (WO#155) ────────────────

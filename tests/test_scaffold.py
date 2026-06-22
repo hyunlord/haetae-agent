@@ -602,3 +602,128 @@ def test_runtime_smoke_tick_omitted_when_contract_tick_empty():
     body = runtime_smoke_harness(spec)["scripts/trace/runtime-smoke.mjs"]
     assert "new Game()" in body
     assert ".tick(" not in body  # tick 미지정 → construct-only
+
+
+# ──────────── WO#162: 트레이스 하니스 헤드리스 DOM 어댑터(검증된 런타임-smoke 패턴 재사용) ────────────
+
+
+def test_headless_dom_adapter_emitted_with_trace_unit_and_contract():
+    """WO#162: 트레이스 유닛 + facade 계약 → 헤드리스 DOM 어댑터 파일 생성(검증된 인프라 재사용)."""
+    from haetae.scaffold import headless_dom_adapter
+
+    a = headless_dom_adapter(_spec_trace_contract(with_contract=True))
+    assert a is not None
+    [(path, content)] = list(a.items())
+    assert path == "scripts/trace/headless-dom.mjs"
+    for marker in (
+        "export function installHeadlessDOM", "MockCanvas", "MockContext2D",
+        "getContext", "document", "window", "requestAnimationFrame", "dispatchKey",
+    ):
+        assert marker in content, marker  # install 함수 + canvas/context/document/window/rAF mock
+
+
+def test_headless_dom_adapter_none_without_contract():
+    """WO#162 무회귀: facade 계약 없으면 어댑터 미생성(None) — #157/#160 동작 보존."""
+    from haetae.scaffold import headless_dom_adapter
+
+    assert headless_dom_adapter(_spec_trace_contract(with_contract=False)) is None
+
+
+def test_headless_dom_adapter_none_without_trace_unit():
+    """WO#162 무회귀: 트레이스 유닛 없으면 어댑터 미생성(None) — 빌드-only spec 불변."""
+    from haetae.scaffold import headless_dom_adapter
+
+    assert headless_dom_adapter(_spec()) is None
+
+
+def test_headless_dom_adapter_serverless():
+    """WO#162: 어댑터는 서버리스(#128) — http 서버/loopback 0(헤드리스 fake DOM이지 서버 아님)."""
+    from haetae.scaffold import headless_dom_adapter
+
+    content = next(iter(headless_dom_adapter(_spec_trace_contract(with_contract=True)).values())).lower()
+    for forbidden in ("createserver", ".listen(", "127.0.0.1", "localhost", "express", "app.listen", "http://"):
+        assert forbidden not in content, forbidden
+
+
+def test_headless_dom_adapter_no_jsdom_no_readonly_global():
+    """WO#162 (#161 u8 직격): 어댑터는 jsdom을 *import*하지 않고 navigator(읽기전용 전역)에 *대입*하지 않는다.
+
+    #161 근본: 빌더가 jsdom을 끌어오고(미설치→크래시) navigator(읽기전용 getter)를 대입(throw)했다.
+    어댑터는 순수 JS mock만 쓰고 쓰기 가능한 globalThis.document/window/rAF만 설치한다.
+    (주석은 'jsdom/navigator를 쓰지 마라' 규칙을 *설명*하므로 단어 자체는 등장 — 코드 import/대입만 금지.)
+    """
+    from haetae.scaffold import headless_dom_adapter
+
+    low = next(iter(headless_dom_adapter(_spec_trace_contract(with_contract=True)).values())).lower()
+    assert '"jsdom"' not in low and "'jsdom'" not in low          # jsdom 모듈 import/require 0(미설치→크래시)
+    assert "navigator =" not in low and "navigator=" not in low   # navigator(읽기전용 getter) 대입 0(throw)
+    assert "globalthis.navigator" not in low and "global.navigator" not in low
+    assert "globalthis.document" in low and "globalthis.window" in low  # 쓰기 가능한 전역만 설치
+
+
+def test_headless_dom_adapter_is_infra_not_assertions():
+    """WO#162 적대 분리: 어댑터는 인프라(mock+install)지 *단언/시나리오/판정 아님* —
+    run-judge가 트레이스 출력을 #113 풀-사슬로 독립 평가(바 불변)."""
+    from haetae.scaffold import headless_dom_adapter
+
+    low = next(iter(headless_dom_adapter(_spec_trace_contract(with_contract=True)).values())).lower()
+    for forbidden in ("assert(", "expect(", "describe(", " it(", "test("):
+        assert forbidden not in low, forbidden
+
+
+def test_trace_skeleton_imports_adapter_with_contract():
+    """WO#162: 계약 있으면 트레이스 골격이 어댑터 import + main()에 installHeadlessDOM() 선설치.
+    #160-A facade import 선채움은 보존(빌더는 여전 시나리오+단언만 채운다)."""
+    body = trace_harness_skeleton(_spec_trace_contract(with_contract=True))["scripts/trace/harness.skeleton.mjs"]
+    assert 'import { installHeadlessDOM } from "./headless-dom.mjs"' in body  # 어댑터 선채움
+    assert "installHeadlessDOM();" in body                                    # main() 선설치
+    assert "#162" in body                                                     # 표시
+    assert 'import { GameEngine } from "../../src/engine/engine.js"' in body  # #160-A 보존
+    assert "createGame, step" not in body                                     # placeholder 제거 유지
+
+
+def test_trace_skeleton_no_adapter_import_without_contract():
+    """WO#162 무회귀: 계약 없으면 어댑터 import 0(골격 byte-identical — #157 동작 보존)."""
+    from haetae.scaffold import _TRACE_HARNESS_SKELETON
+
+    body = trace_harness_skeleton(_spec_with_trace())["scripts/trace/harness.skeleton.mjs"]
+    assert body == _TRACE_HARNESS_SKELETON       # byte-identical(무계약 경로 불변)
+    assert "headless-dom.mjs" not in body
+    assert "installHeadlessDOM" not in body
+
+
+def test_generate_scaffold_includes_headless_adapter_with_contract():
+    """WO#162: 계약 있으면 generate_scaffold가 어댑터 + 트레이스 골격 + 런타임-smoke 모두 포함."""
+    sc = generate_scaffold(_spec_trace_contract(with_contract=True), MockClient(["null"]))
+    assert sc is not None
+    assert "scripts/trace/headless-dom.mjs" in sc.files
+    assert "scripts/trace/harness.skeleton.mjs" in sc.files
+    assert "scripts/trace/runtime-smoke.mjs" in sc.files
+    assert "installHeadlessDOM" in sc.files["scripts/trace/headless-dom.mjs"]
+
+
+def test_generate_scaffold_no_adapter_without_trace_unit():
+    """WO#162 무회귀: 트레이스 유닛 없으면 어댑터 0(스택만, 기존 동작 불변)."""
+    sc = generate_scaffold(_spec(), MockClient([SCAFFOLD_YAML]))
+    assert sc is not None and "package.json" in sc.files
+    assert "scripts/trace/headless-dom.mjs" not in sc.files
+
+
+def test_trace_skeleton_bar_unrelaxed_empty_evidence_with_adapter():
+    """WO#162 바 불변: 어댑터 제공해도 골격은 *빈 evidence TODO* — 빌더가 시나리오+단언을 안 채우면
+    빈 트레이스 → run-judge #113 fail. 어댑터는 인프라지 증거/판정이 아니다(#113 불완화)."""
+    body = trace_harness_skeleton(_spec_trace_contract(with_contract=True))["scripts/trace/harness.skeleton.mjs"]
+    assert "TODO(builder)" in body        # 빌더가 채울 시나리오+단언 자리
+    assert "scenario = [" in body
+    low = body.lower()
+    assert "assert(" not in low and "expect(" not in low and "describe(" not in low  # 박힌 판정 0
+
+
+def test_scaffold_no_judgment_coupling():
+    """WO#162 적대 분리(source-scan): scaffold.py는 judge/gate/run_judge 모듈을 import/참조 안 한다 —
+    스캐폴드(어댑터·import·보일러플레이트)는 director-side 인프라지 판정 레이어가 아니다."""
+    import haetae.scaffold as scaffold_mod
+
+    src = Path(scaffold_mod.__file__).read_text(encoding="utf-8")
+    for forbidden in ("haetae.judge", "haetae.gate", "haetae.run_judge", "ALLOWED_SANDBOXES"):
+        assert forbidden not in src, forbidden

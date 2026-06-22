@@ -191,6 +191,91 @@ _TRACE_IMPORT_PLACEHOLDER = (
 )
 _RUNTIME_SMOKE_PATH = "scripts/trace/runtime-smoke.mjs"
 
+# ──────────── WO#162: 트레이스 하니스 헤드리스 DOM 어댑터(검증된 런타임-smoke 패턴 재사용) ────────────
+# #161 진단: 게임은 빌드+작동(runtime-smoke 통과)했으나 트레이스 유닛(u7/u8)이 escalate — 약빌더가
+# 트레이스 하니스 *인프라*(fake DOM/canvas/window/rAF)를 못 짠다: jsdom 미설치 import·읽기전용
+# navigator monkeypatch·미완성 문법 → 하니스가 시작서 크래시 → 빈 트레이스 → 정직한 gate 거부
+# (게임 결함 아님 — 엔진은 정확함이 독립 검증됨). fix: #160 런타임-smoke가 입증한 헤드리스 DOM
+# 패턴을 *스캐폴드 인프라*로 제공 → 빌더는 시나리오+단언만 채운다. 인프라지 단언/시나리오/판정
+# 아님 — run-judge의 #113 풀-사슬 바 불변(빈/부분 트레이스는 여전 fail).
+_HEADLESS_DOM_ADAPTER_PATH = "scripts/trace/headless-dom.mjs"
+# 어댑터 본문(결정적·서버리스). 빌더 TODO 0(인프라) — 빌더는 *이걸 import해* 시나리오를 구동한다.
+_HEADLESS_DOM_ADAPTER = '''\
+// haetae 헤드리스 DOM 어댑터 스캐폴드 (#162 · #128 서버리스) — #160 런타임-smoke가 입증한
+// fake DOM/canvas/window/requestAnimationFrame 패턴을 트레이스 하니스 *인프라*로 재사용한다.
+// 빌더가 DOM 흉내를 맨손으로 안 짜게 한다(#161 u8 직격: jsdom 미설치 import·읽기전용 navigator
+// monkeypatch·미완성 문법 -> 하니스 크래시 -> 빈 트레이스 -> 정직한 gate 거부).
+// 규칙: (1) jsdom 등 미설치 패키지 import 금지 — 순수 JS mock만. (2) navigator 같은 *읽기전용
+// 전역*(getter) 직접 대입 금지 — 쓰기 가능한 globalThis.document/window/requestAnimationFrame만
+// 설치. (3) http 서버 금지(서버리스). 인프라지 *단언/시나리오/판정 아님* — run-judge가 트레이스
+// 출력을 #113 풀-사슬로 독립 평가(바 불변).
+
+class MockContext2D {
+  constructor() { this.calls = []; }
+  // canvas 2D API no-op(픽셀이 아니라 *로직*이 검증 대상)
+  fillRect() {} clearRect() {} strokeRect() {} fillText() {} strokeText() {}
+  beginPath() {} closePath() {} moveTo() {} lineTo() {} arc() {} rect() {}
+  fill() {} stroke() {} save() {} restore() {} translate() {} scale() {}
+  rotate() {} setTransform() {} drawImage() {} measureText() { return { width: 0 }; }
+}
+
+class MockCanvas {
+  constructor(width = 400, height = 400) {
+    this.width = width; this.height = height; this._ctx = new MockContext2D();
+  }
+  getContext() { return this._ctx; }
+  addEventListener() {} removeEventListener() {}
+  getBoundingClientRect() {
+    return { left: 0, top: 0, right: this.width, bottom: this.height, width: this.width, height: this.height };
+  }
+}
+
+// 서버리스 헤드리스 DOM을 globalThis에 설치(쓰기 가능한 전역만). 핸들을 반환한다.
+export function installHeadlessDOM({ width = 400, height = 400 } = {}) {
+  const canvas = new MockCanvas(width, height);
+  const listeners = {};
+  const addEL = (type, handler) => { (listeners[type] = listeners[type] || []).push(handler); };
+  const removeEL = () => {};
+  const doc = {
+    getElementById: () => canvas,
+    querySelector: () => canvas,
+    querySelectorAll: () => [canvas],
+    createElement: () => new MockCanvas(width, height),
+    addEventListener: addEL, removeEventListener: removeEL,
+    body: { appendChild() {}, addEventListener: addEL, removeEventListener: removeEL },
+  };
+  const rafQueue = [];
+  const win = {
+    addEventListener: addEL, removeEventListener: removeEL,
+    requestAnimationFrame: (cb) => { rafQueue.push(cb); return rafQueue.length; },
+    cancelAnimationFrame: () => {},
+    document: doc, innerWidth: width, innerHeight: height,
+  };
+  // 쓰기 가능한 전역만 설치 — navigator 같은 읽기전용 getter는 *건드리지 않는다*(#161 직격).
+  globalThis.document = doc;
+  globalThis.window = win;
+  globalThis.requestAnimationFrame = win.requestAnimationFrame;
+  globalThis.cancelAnimationFrame = win.cancelAnimationFrame;
+  // 키 입력을 코드로 디스패치(결정적 시나리오 구동) + rAF 콜백을 결정적으로 진행(시간 의존 제거).
+  const dispatchKey = (key, type = "keydown") => {
+    const ev = { key, code: key, type, preventDefault() {}, stopPropagation() {} };
+    for (const h of (listeners[type] || [])) h(ev);
+  };
+  const flushFrames = (n = 1) => {
+    for (let i = 0; i < n; i++) {
+      const batch = rafQueue.splice(0, rafQueue.length);
+      for (const cb of batch) cb(i);
+    }
+  };
+  return { canvas, document: doc, window: win, dispatchKey, flushFrames, listeners };
+}
+'''
+# 트레이스 골격에 선채움하는 어댑터 import 줄(facade 계약 있을 때만 — #160-A import 선채움과 동조건).
+_HEADLESS_ADAPTER_IMPORT = (
+    'import { installHeadlessDOM } from "./headless-dom.mjs";'
+    "  // (#162 헤드리스 어댑터 — 서버리스 fake DOM/canvas/window/rAF · jsdom 불요 · navigator 미설정)"
+)
+
 
 def _facade_import_line(contract) -> str:
     """facade 계약 → ES import 한 줄. named(`import {{ X }}`) 기본, export_kind=='default'면 default import."""
@@ -271,13 +356,38 @@ def trace_harness_skeleton(spec: ProjectSpec) -> dict[str, str] | None:
     contract = getattr(spec, "facade_contract", None)
     if contract is not None:
         # (A) #160: placeholder import 한 줄을 facade 계약 import로 *선채움*(빌더 추측 제거 — #158 직격).
+        # (B) #162: 그 위에 헤드리스 어댑터 import를 *함께 선채움* + main()에 installHeadlessDOM() 선설치
+        # → 빌더는 DOM 인프라(jsdom/navigator monkeypatch)를 안 짜고 시나리오+단언만 채운다(#161 u8 직격).
         # 나머지 골격(레코더·드라이버·시나리오·단언 TODO)은 불변 — 빌더는 여전 시나리오+단언만 채운다.
         prefilled = (
-            _facade_import_line(contract)
+            _HEADLESS_ADAPTER_IMPORT
+            + "\n"
+            + _facade_import_line(contract)
             + "  // (#160 facade 계약 — 선채움; 빌더는 시나리오+단언만 채운다)"
         )
         skeleton = skeleton.replace(_TRACE_IMPORT_PLACEHOLDER, prefilled)
+        skeleton = skeleton.replace(
+            "function main() {\n",
+            "function main() {\n"
+            "  installHeadlessDOM();  // (#162) 헤드리스 DOM 선설치 — 앱 bootstrap이 서버/jsdom 없이 돈다\n",
+        )
     return {_TRACE_HARNESS_SKELETON_PATH: skeleton}
+
+
+def headless_dom_adapter(spec: ProjectSpec) -> dict[str, str] | None:
+    """검증 트레이스-하니스 유닛 + facade 계약이 있으면 헤드리스 DOM 어댑터 파일을, 없으면 None (WO#162).
+
+    #160 런타임-smoke가 입증한 fake DOM/canvas/window/requestAnimationFrame 패턴을 트레이스 하니스
+    *인프라*로 재사용한다(서버리스 #128·jsdom 불요·읽기전용 navigator 미설정) — #161 u8(약빌더가 DOM
+    인프라를 못 짜 jsdom/navigator/문법 버그로 하니스 크래시)을 직격한다. 결정적(LLM 무관)·별도 경로라
+    빌더 파일을 덮어쓰지 않는다(seed 안전). 단언/시나리오/판정 아님 — run-judge·#113 풀-사슬 바 불변.
+    facade 계약 게이트는 #160-A import 선채움과 *동조건*(계약 없으면 미생성 = 기존 동작 불변).
+    """
+    if not _spec_has_trace_harness_unit(spec):
+        return None
+    if getattr(spec, "facade_contract", None) is None:
+        return None
+    return {_HEADLESS_DOM_ADAPTER_PATH: _HEADLESS_DOM_ADAPTER}
 
 
 def generate_scaffold(
@@ -295,10 +405,11 @@ def generate_scaffold(
     stack = _generate_stack_scaffold(spec, client, prompt_path)
     trace = trace_harness_skeleton(spec)
     smoke = runtime_smoke_harness(spec)  # WO#160 (B): facade 계약 있으면 런타임-smoke 하니스 추가
-    if trace is None and smoke is None:
+    adapter = headless_dom_adapter(spec)  # WO#162: facade 계약 있으면 헤드리스 DOM 어댑터(트레이스 인프라) 추가
+    if trace is None and smoke is None and adapter is None:
         return stack
     files = dict(stack.files) if stack is not None else {}
-    for extra in (trace, smoke):
+    for extra in (trace, smoke, adapter):
         if extra:
             for path, content in extra.items():
                 files.setdefault(path, content)  # 충돌 안 나게(스택이 이미 쓴 경로 보존)
