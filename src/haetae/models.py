@@ -232,6 +232,32 @@ class CapabilityProvenance(BaseModel):
     poc_ok: bool | None = None
 
 
+# ──────────────────────────── Facade 계약 (WO#160) ────────────────────────────
+
+
+class FacadeContract(BaseModel):
+    """WO#160: wire된 엔진의 *고정 facade 계약* — 합성기가 명시, 스캐폴드/트레이스/런타임-smoke가
+    *동일* 계약을 참조해 추측을 제거(결정적). #158 진단: 빌더가 트레이스 import를 추측(createGameEngine
+    vs 실제 GameEngine)해 ERR_MODULE_NOT_FOUND + 통합 런타임 계약 버그(Food.generate static/instance →
+    빌드되나 크래시)로 미수렴. optional·비파괴: 없으면 placeholder import + smoke 미생성(기존 #157 동작).
+
+    스캐폴드(인프라)지 단언/판정 아님 — run-judge의 #113 풀-사슬 트레이스 바는 불변(런타임-smoke는
+    필요조건이지 충분조건 아님). 서버리스(#128): 헤드리스 node.
+    """
+
+    # wire된 엔진이 노출되는 workdir-상대 모듈 경로(예 "src/engine/engine.js").
+    module_path: str
+    # 그 모듈에서 import할 export 식별자(예 "GameEngine").
+    export_name: str
+    # named export(`import { X }`) 기본. class|factory|named 모두 named로 취급.
+    export_kind: str = "class"
+    # 인스턴스화 식(런타임-smoke용; 비면 export_kind로 추론: class→`new X()`, 그 외→`X()`).
+    # 이름은 `construct_expr` — pydantic BaseModel.construct(deprecated) shadow 회피.
+    construct_expr: str = ""
+    # 1-tick 진행 식(런타임-smoke용; 비면 construct-only smoke — 인스턴스화 크래시만 검사).
+    tick: str = ""
+
+
 # ──────────────────────────── ProjectSpec ────────────────────────────
 
 
@@ -251,6 +277,10 @@ class ProjectSpec(BaseModel):
     non_goals: list[str]
     done_when: str
     decomposition: list[DecompositionUnit] = Field(default_factory=list)
+    # WO#160: wire된 엔진의 고정 facade 계약(선택). 있으면 스캐폴드가 트레이스 import를 선채움 +
+    # 런타임-smoke 하니스를 생성해 빌드-passes-but-crashes(계약 불일치)를 통합서 조기 포착한다.
+    # 없으면 기존 #157 동작(placeholder import·smoke 미생성). 비파괴(optional 패턴 — 라운드트립 안전).
+    facade_contract: FacadeContract | None = None
     open_questions: list[Any] = Field(default_factory=list)
     # 능력 획득(WO#53 F.1, opt-in): 빌드가 필요로 하는 *없는 능력*(라이브러리/툴) 요청.
     # 합성기가 선언할 수 있으나 선택 — 기본 빈 리스트(기존 spec 무영향). 능력 플래그 OFF면 무시.

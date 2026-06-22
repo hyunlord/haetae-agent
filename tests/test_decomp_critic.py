@@ -315,11 +315,13 @@ def test_decomposition_prompts_stay_concise():
     예시는 통합 floor의 핵심 신규 지침이라 ceiling을 소폭(350→365) 올린다 — 여전히 *기준만*(서사
     없이), 합성 콜 회귀 0 의도 보존.
     WO#157: 검증-트레이스 비-split(end-to-end) + #27 트레이스-하니스 스캐폴드 지침(synthesizer §1e +
-    decomp_critic 축)은 #156 u8 floor 직격이라 ceiling 소폭 상향(syn 365→378·dc 80→92) — *기준만*."""
+    decomp_critic 축)은 #156 u8 floor 직격이라 ceiling 소폭 상향(syn 365→378·dc 80→92) — *기준만*.
+    WO#160: 통합 facade 계약 + 런타임-smoke(synthesizer §1f + decomp_critic 1줄)은 #158 통합 floor
+    (build-pass≠runtime-works) 직격이라 ceiling 소폭 상향(syn 378→383) — *기준만*(서사 없이·콜 회귀 0 의도)."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
     # #152 직전: synthesizer 343, decomp_critic 73. #157: 검증-트레이스 end-to-end + 스캐폴드 지침.
-    assert syn_lines <= 378, f"synthesizer.md 길이 회귀({syn_lines}>378) — 간결 위반"
+    assert syn_lines <= 383, f"synthesizer.md 길이 회귀({syn_lines}>383) — 간결 위반"
     assert dc_lines <= 92, f"decomp_critic.md 길이 회귀({dc_lines}>92)"
 
 

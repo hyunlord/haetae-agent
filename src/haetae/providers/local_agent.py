@@ -891,6 +891,41 @@ def builder_selftest(
     return None  # rc 0 = green / rc 5 = 테스트·매칭 0(findability는 스모크 소관)
 
 
+# ──────────────────────────── WO#160: 통합 런타임-smoke (빌더 self-test) ────────────────────────────
+# #158: wire된 게임이 *빌드는 되나 런타임 크래시*(엔진 facade 계약 불일치: Food.generate static/instance →
+# new GameEngine()서 throw). 빌드-only 통합 ac가 미포착 — 행동 트레이스만 잡았고 약빌더가 트레이스로 고생.
+# 해법: 통합 유닛 빌드 시 스캐폴드된 런타임-smoke(scripts/trace/runtime-smoke.mjs: import→인스턴스화→
+# 1-tick→throw 0)를 빌더-측 self-test로 *조기* 실행 → 크래시면 정확한 에러를 다음 턴에 주입 → 빌더가
+# 계약 버그 수정 → 트레이스는 *도는 게임*을 트레이스. 적대 분리(sacred): 빌더 워크트리서 node 1회 실행
+# (gate/run-judge 무접촉) — 트레이스 run-judge·#113 풀-사슬 바 불변(런타임-smoke=필요조건이지 충분조건 아님).
+
+_RUNTIME_SMOKE_REL = "scripts/trace/runtime-smoke.mjs"
+
+
+def integration_runtime_smoke(workdir: Path, order: NextOrder, timeout: float) -> str | None:
+    """통합 유닛 빌드 시 런타임-smoke(scripts/trace/runtime-smoke.mjs)를 실행해 크래시면 에러를 반환(WO#160 B).
+
+    *통합 유닛*(order.unit == "integration")이고 스캐폴드된 런타임-smoke 하니스가 있을 때만 동작 —
+    그 외(다른 유닛·하니스 없음=facade 계약 미선언)는 None(no-op, #157 무회귀). node 부재/타임아웃이면
+    skip(None — 빌드 막지 않음). 크래시(exit≠0)면 *정확한 에러*를 반환(빌더 self-fix용). 빌트코드 실행은
+    스모크와 동일 오프라인 posture(_smoke_run, 네트워크 미부여). ALLOWED_SANDBOXES 불변. 판정 아님.
+    """
+    if getattr(order, "unit", "") != "integration":
+        return None
+    smoke = workdir / _RUNTIME_SMOKE_REL
+    if not smoke.is_file():
+        return None  # facade 계약 미선언(스캐폴드 미생성) → no-op (#157 무회귀)
+    rc, out = _smoke_run(["node", str(smoke)], workdir, timeout)
+    if rc in (124, 127):
+        return None  # node 부재/타임아웃 → skip(빌드 막지 않음)
+    if rc != 0:
+        return (
+            f"[통합 런타임-smoke 실패] node {_RUNTIME_SMOKE_REL} (exit {rc}) — wire된 게임이 빌드는 "
+            f"되나 런타임에 크래시한다. 엔진 facade 계약대로 인스턴스화+tick 되게 고쳐라:\n{out.strip()[-2000:]}"
+        )
+    return None  # rc 0 = 런타임-smoke green(인스턴스화+1-tick 크래시 0)
+
+
 # ──────────────────────────── LocalAgentExecutor ────────────────────────────
 
 
@@ -962,6 +997,11 @@ class LocalAgentExecutor:
         self.last_selftest_error: str | None = None
         self.last_selftest_passed: bool = False
         self.selftest_feedback_count: int = 0
+        # WO#160 통합 런타임-smoke 상태(보고/테스트용). 통합 유닛 + 스캐폴드된 런타임-smoke 하니스가
+        # 있을 때만 동작(그 외 no-op·#157 무회귀).
+        self.last_runtime_smoke_error: str | None = None
+        self.last_runtime_smoke_passed: bool = False
+        self.runtime_smoke_feedback_count: int = 0
         # WO#141: 직전 run의 벽시계(초) — 빌드 요약에 표면화(속도 튜닝 가시성).
         self.last_elapsed_s: float = 0.0
 
@@ -977,6 +1017,9 @@ class LocalAgentExecutor:
         self.last_selftest_error = None
         self.last_selftest_passed = False
         self.selftest_feedback_count = 0
+        self.last_runtime_smoke_error = None
+        self.last_runtime_smoke_passed = False
+        self.runtime_smoke_feedback_count = 0
         self.last_elapsed_s = 0.0
         _t0 = time.monotonic()
 
@@ -1055,7 +1098,34 @@ class LocalAgentExecutor:
                         # 턴 소진 — 자기-테스트 미green인 채 반환(이후 독립 gate가 판정).
                         break
                     self.last_selftest_passed = True
-                # 스모크(+자기-테스트) 통과 → 반환(gate가 정답성·행동·통합 독립 판정).
+                # WO#160 (B): 통합 유닛이면 *런타임-smoke*(scripts/trace/runtime-smoke.mjs) 실행 —
+                # wire된 엔진이 빌드뿐 아니라 *런타임에 도는지*(인스턴스화+1-tick 크래시 0). 빌드-passes-
+                # but-crashes(facade 계약 불일치: #158 Food.generate)를 *트레이스 前* 조기 포착 → 빌더가
+                # 계약 버그 수정. 하니스 없으면(facade 계약 미선언) no-op(#157 무회귀). 빌더-측 self-test
+                # (gate/run-judge 무접촉) — 트레이스 run-judge·#113 풀-사슬 바 불변(필요조건이지 충분조건 아님).
+                rserr = integration_runtime_smoke(self.workdir, order, self.timeout)
+                if rserr:
+                    self.last_runtime_smoke_error = rserr
+                    self.runtime_smoke_feedback_count += 1
+                    if turn < self.max_turns - 1:
+                        messages.append({"role": "assistant", "content": text})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "통합 런타임-smoke 실패 — wire된 게임이 빌드는 되나 *런타임에 크래시*한다"
+                                "(엔진 facade 계약 불일치 가능: 예 static/instance 메서드 혼동). 아래 *정확한 "
+                                f"에러*를 보고 같은 편집 프로토콜(path= 펜스 블록)로 고쳐라:\n{rserr}\n"
+                                f"고친 뒤 {DONE_MARKER}."
+                            ),
+                        })
+                        continue
+                    # 턴 소진 — 런타임-smoke 미통과인 채 반환(이후 독립 gate가 판정).
+                    break
+                # *실제 실행되어* 통과했을 때만 passed=True (비-통합/하니스 없음=no-op은 제외 — 보고 정확성).
+                if (getattr(order, "unit", "") == "integration"
+                        and (self.workdir / _RUNTIME_SMOKE_REL).is_file()):
+                    self.last_runtime_smoke_passed = True
+                # 스모크(+자기-테스트+런타임-smoke) 통과/no-op → 반환(gate가 정답성·행동·통합 독립 판정).
                 break
 
             if done or not edits:
@@ -1148,6 +1218,11 @@ class LocalAgentExecutor:
             segs.append("자기-테스트 green")
         elif self.selftest_feedback_count:
             segs.append(f"자기-테스트 미green({self.selftest_feedback_count}회 피드백)")
+        # WO#160: 통합 런타임-smoke가 *동작했을 때만* 표면화(통합 유닛+하니스 있을 때만 — off 노이즈 회피).
+        if self.last_runtime_smoke_passed:
+            segs.append("런타임-smoke green")
+        elif self.runtime_smoke_feedback_count:
+            segs.append(f"런타임-smoke 미green({self.runtime_smoke_feedback_count}회 피드백)")
         segs.append(f"{self.last_elapsed_s:.0f}s")
         return (
             f"로컬 빌더({self.model}) 완료 — 적용 파일 {len(applied)}개: {files}\n"

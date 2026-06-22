@@ -176,6 +176,76 @@ function main() {
 main();
 '''
 
+# ──────────── WO#160: facade 계약 → 트레이스 import 선채움 (A) + 런타임-smoke 하니스 (B) ────────────
+# #158 진단: 빌더가 트레이스 import를 *추측*(createGameEngine vs 실제 GameEngine 계약)해
+# ERR_MODULE_NOT_FOUND; 통합 런타임 계약 버그(Food.generate static/instance → 빌드되나 new에서 크래시)가
+# 빌드-only ac를 통과. 합성기가 명시한 *고정 facade 계약*(spec.facade_contract)을 스캐폴드가 결정화 —
+# (A) 트레이스 import 선채움(추측 제거), (B) 런타임-smoke 하니스 생성(빌드-passes-but-crashes 조기 포착).
+# 인프라지 단언/판정 아님 — 트레이스 run-judge의 #113 풀-사슬 바는 불변(smoke=필요조건이지 충분조건 아님).
+
+# 트레이스/스모크 하니스는 scripts/trace/ 아래(2단계 깊이) → workdir-상대 모듈을 ../../ 로 참조.
+_TRACE_DIR_TO_ROOT = "../../"
+# 트레이스 골격의 placeholder import 줄(계약 있으면 이 한 줄을 선채움 import로 치환 — 나머지 골격 불변).
+_TRACE_IMPORT_PLACEHOLDER = (
+    '// import { createGame, step } from "../../src/engine/index.js"  // TODO(builder): 실제 경로'
+)
+_RUNTIME_SMOKE_PATH = "scripts/trace/runtime-smoke.mjs"
+
+
+def _facade_import_line(contract) -> str:
+    """facade 계약 → ES import 한 줄. named(`import {{ X }}`) 기본, export_kind=='default'면 default import."""
+    mp = (contract.module_path or "").strip().lstrip("./")
+    rel = _TRACE_DIR_TO_ROOT + mp
+    if (contract.export_kind or "").lower() == "default":
+        return f'import {contract.export_name} from "{rel}";'
+    return f'import {{ {contract.export_name} }} from "{rel}";'
+
+
+def _facade_construct_expr(contract) -> str:
+    """인스턴스화 식. contract.construct 우선, 없으면 export_kind로 추론(class→`new X()`, 그 외→`X()`)."""
+    if (contract.construct_expr or "").strip():
+        return contract.construct_expr.strip()
+    if (contract.export_kind or "class").lower() == "class":
+        return f"new {contract.export_name}()"
+    return f"{contract.export_name}()"
+
+
+def _runtime_smoke_harness(contract) -> str:
+    """런타임-smoke 하니스(#160 B): wire된 엔진을 facade 계약대로 import→인스턴스화→(1-tick)→throw 0.
+    빌드-passes-but-crashes(계약 불일치: #158 Food.generate static/instance)를 *통합*서 조기 포착한다.
+    완전 생성(빌더 TODO 0) — 빌더는 *엔진을 계약에 맞춰* 이 smoke를 통과시킨다. 크래시 0만 검사(단언/판정
+    아님) — 풀-사슬 행동은 트레이스 run-judge가 #113으로 검증(불변). 서버리스(#128): 헤드리스 node.
+    """
+    import_line = _facade_import_line(contract)
+    construct = _facade_construct_expr(contract)
+    tick = (contract.tick or "").strip()
+    tick_line = f"  {tick};  // ← 1-tick(계약)\n" if tick else ""
+    return (
+        "// haetae 런타임-smoke 스캐폴드 (#160) — 통합 엔진이 *빌드뿐 아니라 런타임에 도는지* 검사.\n"
+        "// facade 계약대로 wire된 엔진을 import → 인스턴스화 → (1-tick) → throw 0. 헤드리스 node(#128 서버리스).\n"
+        "// 판정/단언 아님(인프라): 크래시 0만 검사 — 풀-사슬 행동은 트레이스 run-judge가 #113으로 검증(불변).\n"
+        f"{import_line}  // ← facade 계약(선채움)\n"
+        "function main() {\n"
+        f"  const engine = {construct};  // ← construct(계약) — 여기서 throw면 통합 런타임 계약 버그\n"
+        f"{tick_line}"
+        '  process.stdout.write(JSON.stringify({ runtime_smoke: "ok", engine: typeof engine }));\n'
+        "}\n"
+        "main();\n"
+    )
+
+
+def runtime_smoke_harness(spec: ProjectSpec) -> dict[str, str] | None:
+    """facade 계약이 있으면 런타임-smoke 하니스 파일(경로→내용)을, 없으면 None (WO#160 B).
+
+    통합 acceptance가 빌드 → 빌드 + 런타임-smoke로 강화돼 빌드-passes-but-crashes(계약 불일치)를
+    *통합*서(트레이스 前) 조기 포착한다. 결정적(완전 생성·LLM 무관). 서버리스(#128). 별도 참고 경로라
+    빌더 파일을 덮어쓰지 않는다(seed 안전). 트레이스 run-judge·#113 바 불변(smoke=필요조건이지 충분조건 아님).
+    """
+    contract = getattr(spec, "facade_contract", None)
+    if contract is None:
+        return None
+    return {_RUNTIME_SMOKE_PATH: _runtime_smoke_harness(contract)}
+
 
 def _spec_has_trace_harness_unit(spec: ProjectSpec) -> bool:
     """spec 분해에 *검증 트레이스-하니스* 유닛이 있는지 보수적 판정(WO#157)."""
@@ -197,7 +267,17 @@ def trace_harness_skeleton(spec: ProjectSpec) -> dict[str, str] | None:
     """
     if not _spec_has_trace_harness_unit(spec):
         return None
-    return {_TRACE_HARNESS_SKELETON_PATH: _TRACE_HARNESS_SKELETON}
+    skeleton = _TRACE_HARNESS_SKELETON
+    contract = getattr(spec, "facade_contract", None)
+    if contract is not None:
+        # (A) #160: placeholder import 한 줄을 facade 계약 import로 *선채움*(빌더 추측 제거 — #158 직격).
+        # 나머지 골격(레코더·드라이버·시나리오·단언 TODO)은 불변 — 빌더는 여전 시나리오+단언만 채운다.
+        prefilled = (
+            _facade_import_line(contract)
+            + "  // (#160 facade 계약 — 선채움; 빌더는 시나리오+단언만 채운다)"
+        )
+        skeleton = skeleton.replace(_TRACE_IMPORT_PLACEHOLDER, prefilled)
+    return {_TRACE_HARNESS_SKELETON_PATH: skeleton}
 
 
 def generate_scaffold(
@@ -214,11 +294,14 @@ def generate_scaffold(
     """
     stack = _generate_stack_scaffold(spec, client, prompt_path)
     trace = trace_harness_skeleton(spec)
-    if trace is None:
+    smoke = runtime_smoke_harness(spec)  # WO#160 (B): facade 계약 있으면 런타임-smoke 하니스 추가
+    if trace is None and smoke is None:
         return stack
     files = dict(stack.files) if stack is not None else {}
-    for path, content in trace.items():
-        files.setdefault(path, content)  # 충돌 안 나게(스택이 이미 쓴 경로 보존)
+    for extra in (trace, smoke):
+        if extra:
+            for path, content in extra.items():
+                files.setdefault(path, content)  # 충돌 안 나게(스택이 이미 쓴 경로 보존)
     return Scaffold(files=files, install=(stack.install if stack is not None else False))
 
 

@@ -62,6 +62,8 @@
   - `unit`은 acceptance_criterion *최상위* 키다(`check` 안이 **아님**). 값은
     `decomposition`의 unit-id(예: `u1`) 또는 `"integration"`. 생략하면 통합 기준이다.
 - `assumptions[]`는 `id`, `text`, `confidence`(0~1 float), `checkpoint`(bool).
+- 선택 `facade_contract`(객체, #160): 동적 게임/시뮬의 wire된 엔진 facade 계약
+  (`{module_path, export_name, export_kind, construct_expr, tick}`) — 1f 참조. 없으면 생략(기존 동작 불변).
 - **문자열 값은 반드시 큰따옴표로 감싸라** — 특히 원문 주문을 옮기는 `order_raw`·`goal`·`desc`는
   콜론(:)·특수문자를 품을 수 있다. unquoted 콜론은 YAML이 mapping으로 오해해 파싱 에러
   (`mapping values are not allowed here`)를 낸다. 예: `goal: "X를 한다: 단, Y"` (O) / `goal: X를 한다: 단, Y` (X).
@@ -302,6 +304,19 @@ engine-trace(file://·loopback 금지). (순수 조립만 하는 통합 유닛�
   — 엔진 로드·결정적 tick 드라이버·상태 레코더·단언 프레임)을 #27 스캐폴드로 선제 제공하니, 빌더는
   *시나리오 시퀀스 + 행동별 단언만* 채우면 된다(단일-유닛 역량 내). 골격은 인프라지 판정이 아니며,
   run-judge가 트레이스 출력을 #113 풀-사슬로 독립 평가한다(부분 트레이스는 fail — 바 불변).
+
+### 1f. 통합 facade 계약 + 런타임-smoke (#160 — build-pass ≠ runtime-works)
+동적 게임(1e)에선 **wire된 엔진의 *고정 facade 계약*을 명시하라** — 트레이스·런타임-smoke가 *추측 없이*
+엔진을 import·구동하는 단일 결정적 계약(#158: 빌더 import 추측 + 통합이 빌드되나 런타임 크래시 → 미수렴).
+- **`facade_contract`**(선택 최상위 키): `{module_path, export_name, export_kind, construct_expr, tick}`. 예:
+  `{ module_path: "src/engine/engine.js", export_name: "GameEngine", construct_expr: "new GameEngine()", tick: "engine.tick({})" }`.
+  wire/엔진 유닛 acceptance가 이 계약을 *요구*하게 하라. 스캐폴드가 이걸로 (A) 트레이스 import 선채움(추측
+  제거) + (B) 런타임-smoke 하니스(`scripts/trace/runtime-smoke.mjs`: import→인스턴스화→1-tick→throw 0) 생성.
+- **통합 acceptance를 빌드 → 빌드 + 런타임-smoke로 강화하라**: `unit: integration`에 빌드 기준에 *더해*
+  `check: { type: run, cmd: "node scripts/trace/runtime-smoke.mjs" }` — 빌드-passes-but-crashes를 트레이스 前 포착.
+- **강화지 완화 아님(#113 불변)**: 런타임-smoke = 필요조건이지 충분조건 아님(게임이 *돌아도* 풀-사슬 행동은
+  트레이스 run-judge가 #113로 검증 — 부분 트레이스 여전 fail). 결정적 크래시-검사지 행동 판정 아님. 서버리스(#128).
+- facade 불요(비-게임)면 생략 — 스캐폴드 기존 #157 동작(placeholder·smoke 미생성).
 
 ### 2. 묻지 말고 가정하라 (assume-don't-ask)
 주문에서 비어 있는 부분은 **네가 가장 합리적인 방향을 골라 채우고**,

@@ -511,3 +511,94 @@ def test_generate_scaffold_no_trace_unit_unchanged():
     scaffold = generate_scaffold(_spec(), MockClient([SCAFFOLD_YAML]))
     assert scaffold is not None and "package.json" in scaffold.files
     assert not any("harness.skeleton" in p for p in scaffold.files)
+
+
+# ──────────── WO#160: facade 계약 → import 선채움 (A) + 런타임-smoke 하니스 (B) ────────────
+
+
+def _spec_trace_contract(with_contract: bool = True) -> ProjectSpec:
+    """트레이스-하니스 유닛 + (선택) facade 계약을 가진 spec."""
+    data = {
+        "spec_id": "fc-scaf-160", "version": 2, "order_raw": "snake", "goal": "snake game",
+        "task_type": "feature_impl", "verifiability": "objective", "mode": "normal",
+        "acceptance_criteria": [
+            {"id": "ac1", "desc": "d", "check": {"type": "build", "cmd": "npm run build"}}
+        ],
+        "non_goals": ["x"], "done_when": "ac1",
+        "decomposition": [
+            {"unit": "integration", "desc": "엔진·렌더러를 앱 진입점에 조립", "deps": ["u1"]},
+            {"unit": "u6", "desc": "서버 없는 Node 엔진 트레이스 하니스", "deps": ["integration"]},
+        ],
+    }
+    if with_contract:
+        data["facade_contract"] = {
+            "module_path": "src/engine/engine.js", "export_name": "GameEngine",
+            "export_kind": "class", "construct_expr": "new GameEngine()", "tick": "engine.tick({})",
+        }
+    return ProjectSpec.model_validate(data)
+
+
+def test_trace_import_prefilled_from_facade_contract():
+    """WO#160 (A): facade 계약 있으면 트레이스 골격 import가 계약대로 *선채움*(빌더 추측 제거)."""
+    sk = trace_harness_skeleton(_spec_trace_contract(with_contract=True))
+    body = sk["scripts/trace/harness.skeleton.mjs"]
+    assert 'import { GameEngine } from "../../src/engine/engine.js"' in body
+    assert "createGame, step" not in body  # placeholder TODO import 제거됨
+    assert "#160 facade 계약" in body  # 선채움 표시
+
+
+def test_trace_skeleton_no_contract_keeps_placeholder():
+    """WO#157 무회귀: 계약 없으면 트레이스 골격은 placeholder import 그대로(byte-identical)."""
+    from haetae.scaffold import _TRACE_HARNESS_SKELETON
+
+    sk = trace_harness_skeleton(_spec_trace_contract(with_contract=False))
+    assert sk["scripts/trace/harness.skeleton.mjs"] == _TRACE_HARNESS_SKELETON
+    assert "createGame, step" in sk["scripts/trace/harness.skeleton.mjs"]  # placeholder 유지
+
+
+def test_runtime_smoke_harness_from_contract_serverless():
+    """WO#160 (B): facade 계약으로 런타임-smoke 하니스 생성(import→인스턴스화→1-tick→JSON), 서버리스."""
+    from haetae.scaffold import runtime_smoke_harness
+
+    rs = runtime_smoke_harness(_spec_trace_contract(with_contract=True))
+    assert rs is not None
+    body = rs["scripts/trace/runtime-smoke.mjs"]
+    assert 'import { GameEngine } from "../../src/engine/engine.js"' in body
+    assert "new GameEngine()" in body            # construct(계약)
+    assert "engine.tick({})" in body             # 1-tick(계약)
+    assert "process.stdout.write(JSON" in body   # 단일 JSON evidence(#86)
+    for forbidden in ("http", "listen", "createServer", "127.0.0.1", "localhost"):  # 서버리스(#128)
+        assert forbidden not in body
+
+
+def test_runtime_smoke_harness_none_without_contract():
+    """WO#160 무회귀: facade 계약 없으면 런타임-smoke 미생성(None) — 기존 #157 동작."""
+    from haetae.scaffold import runtime_smoke_harness
+
+    assert runtime_smoke_harness(_spec_trace_contract(with_contract=False)) is None
+
+
+def test_generate_scaffold_includes_runtime_smoke_with_contract():
+    """WO#160: facade 계약 있으면 generate_scaffold가 트레이스 골격 + 런타임-smoke 하니스 둘 다 포함."""
+    sc = generate_scaffold(_spec_trace_contract(with_contract=True), MockClient(["null"]))
+    assert sc is not None
+    assert "scripts/trace/runtime-smoke.mjs" in sc.files
+    assert "scripts/trace/harness.skeleton.mjs" in sc.files
+    assert "GameEngine" in sc.files["scripts/trace/runtime-smoke.mjs"]
+
+
+def test_runtime_smoke_tick_omitted_when_contract_tick_empty():
+    """WO#160: 계약 tick이 비면 런타임-smoke는 construct-only(인스턴스화 크래시만) — tick 줄 없음."""
+    from haetae.scaffold import runtime_smoke_harness
+
+    spec = ProjectSpec.model_validate({
+        "spec_id": "fc-2", "version": 2, "order_raw": "o", "goal": "g",
+        "task_type": "feature_impl", "verifiability": "objective", "mode": "normal",
+        "acceptance_criteria": [{"id": "ac1", "desc": "d", "check": {"type": "build", "cmd": "npm run build"}}],
+        "non_goals": ["x"], "done_when": "ac1",
+        "decomposition": [{"unit": "u6", "desc": "트레이스 하니스"}],
+        "facade_contract": {"module_path": "src/g.js", "export_name": "Game"},
+    })
+    body = runtime_smoke_harness(spec)["scripts/trace/runtime-smoke.mjs"]
+    assert "new Game()" in body
+    assert ".tick(" not in body  # tick 미지정 → construct-only

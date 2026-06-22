@@ -1122,3 +1122,119 @@ def test_selftest_js_live_self_consistency(tmp_path):
     )
     ex.run(order)
     assert (tmp_path / "src" / "calc.ts").exists()
+
+
+# ──────────────────────────── WO#160: 통합 런타임-smoke (빌더 self-test) ────────────────────────────
+
+
+def _mk_runtime_smoke(workdir: Path) -> None:
+    """스캐폴드된 런타임-smoke 하니스 파일을 만든다(내용은 _smoke_run 모킹 시 무관)."""
+    d = workdir / "scripts" / "trace"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "runtime-smoke.mjs").write_text("// scaffolded runtime-smoke", encoding="utf-8")
+
+
+def test_integration_runtime_smoke_crash_returns_feedback(tmp_path, monkeypatch):
+    """WO#160 (B): 통합 유닛 + 하니스 존재 + 런타임 크래시(exit≠0) → 정확한 에러 피드백 반환."""
+    _mk_runtime_smoke(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run",
+                        lambda cmd, cwd, timeout: (1, "TypeError: Food.generate is not a function"))
+    err = la.integration_runtime_smoke(tmp_path, _order(unit="integration"), 20.0)
+    assert err is not None
+    assert "런타임-smoke 실패" in err and "Food.generate" in err
+
+
+def test_integration_runtime_smoke_pass_returns_none(tmp_path, monkeypatch):
+    """WO#160 (B): 통합 유닛 + 하니스 + 런타임 OK(exit 0) → None(통과)."""
+    _mk_runtime_smoke(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (0, '{"runtime_smoke":"ok"}'))
+    assert la.integration_runtime_smoke(tmp_path, _order(unit="integration"), 20.0) is None
+
+
+def test_integration_runtime_smoke_gated_to_integration_unit(tmp_path, monkeypatch):
+    """WO#160 무회귀: 통합 유닛이 아니면(예 u1) no-op(None) — _smoke_run 미호출(게이트)."""
+    _mk_runtime_smoke(tmp_path)
+    called = {"n": 0}
+
+    def rec(cmd, cwd, timeout):
+        called["n"] += 1
+        return (1, "should not run")
+
+    monkeypatch.setattr(la, "_smoke_run", rec)
+    assert la.integration_runtime_smoke(tmp_path, _order(unit="u1"), 20.0) is None
+    assert called["n"] == 0  # 비-통합 유닛엔 실행 안 함
+
+
+def test_integration_runtime_smoke_no_harness_noop(tmp_path, monkeypatch):
+    """WO#157 무회귀: 런타임-smoke 하니스 없으면(facade 계약 미선언) no-op(None) — _smoke_run 미호출."""
+    called = {"n": 0}
+
+    def rec(cmd, cwd, timeout):
+        called["n"] += 1
+        return (1, "x")
+
+    monkeypatch.setattr(la, "_smoke_run", rec)
+    assert la.integration_runtime_smoke(tmp_path, _order(unit="integration"), 20.0) is None
+    assert called["n"] == 0  # 하니스 없으면 실행 안 함(스캐폴드 미생성=계약 미선언)
+
+
+def test_integration_runtime_smoke_node_absent_or_timeout_skips(tmp_path, monkeypatch):
+    """WO#160: node 부재(rc 127)/타임아웃(rc 124)이면 skip(None) — 빌드 막지 않음."""
+    _mk_runtime_smoke(tmp_path)
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (127, ""))
+    assert la.integration_runtime_smoke(tmp_path, _order(unit="integration"), 20.0) is None
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (124, "smoke timeout"))
+    assert la.integration_runtime_smoke(tmp_path, _order(unit="integration"), 20.0) is None
+
+
+def test_run_integration_runtime_smoke_feedback_then_pass(tmp_path, monkeypatch):
+    """WO#160 (B): run 루프가 통합 유닛 빌드 시 런타임-smoke 실패→피드백 주입→다음 턴 통과(self-fix)."""
+    _mk_runtime_smoke(tmp_path)
+    calls = {"n": 0}
+
+    def fake_rs(workdir, order, timeout):
+        calls["n"] += 1
+        return "통합 런타임-smoke 실패 — 크래시 detail" if calls["n"] == 1 else None
+
+    monkeypatch.setattr(la, "integration_runtime_smoke", fake_rs)
+    monkeypatch.setattr(la, "post_chat", FakePost([
+        _block("src/main.js", "// wire v1") + f"\n{DONE_MARKER}",
+        _block("src/main.js", "// wire v2 fixed") + f"\n{DONE_MARKER}",
+    ]))
+    ex = LocalAgentExecutor(endpoint="http://x/v1", model="m", workdir=str(tmp_path),
+                            max_turns=3, verify=lambda wd: None)  # 스모크 즉시 통과(selftest 없음)
+    ex.run(_order(unit="integration", goal="wire"))
+    assert ex.runtime_smoke_feedback_count == 1
+    assert ex.last_runtime_smoke_passed is True
+
+
+def test_run_non_integration_no_runtime_smoke(tmp_path, monkeypatch):
+    """WO#160 무회귀: 비-통합 유닛 run은 런타임-smoke가 no-op(피드백 0·passed 미설정)."""
+    _mk_runtime_smoke(tmp_path)  # 하니스 있어도 비-통합 유닛엔 실행 안 함
+    monkeypatch.setattr(la, "_smoke_run", lambda cmd, cwd, timeout: (1, "should not crash build"))
+    monkeypatch.setattr(la, "post_chat", FakePost([_block("a.py", "x=1") + f"\n{DONE_MARKER}"]))
+    ex = LocalAgentExecutor(endpoint="http://x/v1", model="m", workdir=str(tmp_path),
+                            max_turns=2, verify=lambda wd: None)
+    ex.run(_order(unit="u1"))
+    assert ex.runtime_smoke_feedback_count == 0
+    assert ex.last_runtime_smoke_passed is False  # 비-통합 → 미실행(no-op)
+
+
+def test_integration_runtime_smoke_is_offline_builder_side(tmp_path, monkeypatch):
+    """WO#160 적대 분리: 런타임-smoke는 빌더-측·오프라인(_smoke_run 경유)지 gate/run-judge 무접촉.
+
+    런타임-smoke ≠ 트레이스 run-judge — 결정적 크래시-검사(필요조건이지 충분조건 아님)일 뿐, 행동
+    판정은 독립 적대 트레이스 run-judge가 #113 풀-사슬로 한다(이 헬퍼는 그 경로를 일절 안 부른다).
+    """
+    _mk_runtime_smoke(tmp_path)
+    seen = {"cmd": None}
+
+    def rec(cmd, cwd, timeout):
+        seen["cmd"] = cmd
+        return (0, "{}")
+
+    monkeypatch.setattr(la, "_smoke_run", rec)
+    assert la.integration_runtime_smoke(tmp_path, _order(unit="integration"), 20.0) is None
+    # _smoke_run(빌더 오프라인 seam)으로 node를 직접 실행 — gate/judge/run_judge 호출 아님.
+    assert seen["cmd"] is not None and seen["cmd"][0] == "node"
+    assert seen["cmd"][1].endswith("scripts/trace/runtime-smoke.mjs")

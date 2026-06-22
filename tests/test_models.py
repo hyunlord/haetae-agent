@@ -208,3 +208,53 @@ def test_decision_invalid_action_rejected():
         Decision.model_validate(
             {"verdict": "pass", "action": "warp", "rationale": "x"}
         )
+
+
+# ──────────────────────────── WO#160: facade 계약 ────────────────────────────
+
+
+def _facade_base_spec() -> dict:
+    return {
+        "spec_id": "fc-160", "version": 2, "order_raw": "snake", "goal": "g",
+        "task_type": "feature_impl", "verifiability": "objective", "mode": "normal",
+        "acceptance_criteria": [
+            {"id": "ac1", "desc": "d", "check": {"type": "build", "cmd": "npm run build"}}
+        ],
+        "non_goals": ["x"], "done_when": "ac1",
+        "decomposition": [{"unit": "u1", "desc": "a"}],
+    }
+
+
+def test_facade_contract_optional_default_none():
+    """WO#160: ProjectSpec.facade_contract는 선택 — 없으면 None(비파괴·기존 spec 무영향)."""
+    s0 = ProjectSpec.model_validate(_facade_base_spec())
+    assert s0.facade_contract is None
+
+
+def test_facade_contract_roundtrips_through_yaml(tmp_path):
+    """WO#160: facade_contract가 to_yaml→from_yaml 라운드트립(사이드카 영속화 안전)."""
+    spec = ProjectSpec.model_validate({
+        **_facade_base_spec(),
+        "facade_contract": {
+            "module_path": "src/engine/engine.js", "export_name": "GameEngine",
+            "export_kind": "class", "construct_expr": "new GameEngine()", "tick": "engine.tick({})",
+        },
+    })
+    assert spec.facade_contract.export_name == "GameEngine"
+    assert spec.facade_contract.module_path == "src/engine/engine.js"
+    p = tmp_path / "spec.yaml"
+    p.write_text(spec.to_yaml(), encoding="utf-8")
+    s2 = ProjectSpec.from_yaml(p)
+    assert s2.facade_contract is not None
+    assert s2.facade_contract.export_name == "GameEngine"
+    assert s2.facade_contract.tick == "engine.tick({})"
+
+
+def test_facade_contract_defaults():
+    """WO#160: construct_expr/tick는 생략 가능(기본 빈 문자열), export_kind 기본 class."""
+    from haetae.models import FacadeContract
+
+    fc = FacadeContract(module_path="src/g.js", export_name="Game")
+    assert fc.export_kind == "class"
+    assert fc.construct_expr == ""
+    assert fc.tick == ""
