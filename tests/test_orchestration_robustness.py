@@ -11,7 +11,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from haetae.gate import CompositeGate, aggregate_verdict
-from haetae.intake import _strip_pytest_k, align_check_findability, synthesize
+from haetae.intake import (
+    _strip_pytest_k,
+    _strip_pytest_nodeid,
+    align_check_findability,
+    synthesize,
+)
 from haetae.llm import MockClient
 from haetae.loop import (
     _fallback_order,
@@ -70,6 +75,27 @@ def test_strip_pytest_k_idempotent_and_unbalanced_safe():
     assert _strip_pytest_k(once) == once  # 멱등
     # 따옴표 불균형 → 보수적으로 원본 유지(크래시 없음)
     assert _strip_pytest_k("pytest -k 'unterminated") == "pytest -k 'unterminated"
+
+
+def test_strip_pytest_nodeid_variants():
+    """#172 라이브에서 드러난 `::nodeid` 형(약 brain이 -k 대신 `f.py::test_x`로 특정 노드 지목)."""
+    assert _strip_pytest_nodeid("pytest test_calculator.py::test_divide_zero") == "pytest test_calculator.py"
+    assert _strip_pytest_nodeid("python -m pytest tests/test_x.py::TestC::test_m") == "python -m pytest tests/test_x.py"
+    assert _strip_pytest_nodeid("pytest test_x.py") == "pytest test_x.py"  # :: 없음 = no-op
+    assert _strip_pytest_nodeid("npm run x::y") == "npm run x::y"  # 비-pytest 무관
+    once = _strip_pytest_nodeid("pytest a.py::t")
+    assert _strip_pytest_nodeid(once) == once  # 멱등
+
+
+def test_align_strips_nodeid_and_k_selectors():
+    """#172 라이브 gap: `pytest f.py::test_divide_zero`(빌더 미스매치 시 exit 4)도 -k와 함께 정렬."""
+    spec = _spec([
+        AcceptanceCriterion(id="a1", desc="d", check=Check(type=CheckType.test, cmd="pytest test_calculator.py::test_divide_zero")),
+        AcceptanceCriterion(id="a2", desc="d", check=Check(type=CheckType.test, cmd="pytest test_x.py -k 'foo'")),
+    ])
+    align_check_findability(spec)
+    assert spec.acceptance_criteria[0].check.cmd == "pytest test_calculator.py"  # ::nodeid stripped
+    assert spec.acceptance_criteria[1].check.cmd == "pytest test_x.py"  # -k stripped
 
 
 def test_align_strips_pytest_k_leaves_run_untouched():

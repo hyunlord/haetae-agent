@@ -103,7 +103,7 @@ def _yaml_repair_feedback(err: SynthesisError) -> str:
     )
 
 
-# ──────────────── WO#172: 합성 findability 정렬 (약-brain의 fragile pytest -k 흡수) ────────────────
+# ──────────────── WO#172: 합성 findability 정렬 (약-brain의 fragile pytest 셀렉터 -k·::nodeid 흡수) ────────────────
 #
 # #171 라이브(완전-로컬): 약 brain이 `pytest -k 'divide_zero_division'`처럼 *생성될 테스트 이름과
 # 어긋나는* freeform 키워드를 내 게이트가 0개 테스트 발견(exit 5)→green 완주 불가(#141 gate-discovery
@@ -141,19 +141,43 @@ def _strip_pytest_k(cmd: str) -> str:
     return " ".join(out)
 
 
-def align_check_findability(spec: ProjectSpec) -> ProjectSpec:
-    """합성된 acceptance_criteria의 pytest 체크에서 fragile `-k` 필터를 제거한다(findability 정렬, WO#172).
+def _strip_pytest_nodeid(cmd: str) -> str:
+    """pytest 명령의 `path::nodeid` 셀렉터를 파일 경로로 축약한다(WO#172 findability, `::`형). 멱등.
 
-    #171 라이브 실패(약 brain이 `-k 'divide_zero_division'` → 게이트 0개 발견 exit 5)를 차단: `-k`를
-    제거하면 *발견된 모든 테스트*가 실행돼 findable + **더 엄격**(가짜 pass 불가). per-unit 스코핑은
-    ac.unit(불변)·worktree로 하지 `-k`로 하지 않으므로 스코핑 영향 없다. **가드지 판정 아님** —
-    gate/run_judge 판정 로직·#113 바 불변(발견된 테스트 fail은 여전 fail). 멱등(이미 -k 없으면 no-op).
-    spec을 제자리 수정 후 그대로 반환한다.
+    #172 라이브: 약 brain이 `pytest test_calculator.py::test_divide_zero`처럼 *특정 테스트 노드*를 지목했는데
+    빌더가 그 이름으로 안 만들면 pytest가 'not found'(exit 4)로 막힌다(`-k`와 같은 findability 클래스, 다른
+    문법). `::nodeid`를 떼면 그 파일의 *모든* 테스트를 돌린다 — findable + **더 엄격**(테스트가 더 많이
+    실행됨, 가짜 pass 불가). pytest 명령에만 적용하고, 플래그(`-`로 시작) 토큰은 건드리지 않는다.
+    `path::Class::method` 같은 다중 `::`도 첫 `::` 앞(파일)까지로 축약한다.
+    """
+    if "pytest" not in cmd.lower() or "::" not in cmd:
+        return cmd
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return cmd  # 보수적으로 원본 유지
+    out = [t.split("::", 1)[0] if ("::" in t and not t.startswith("-")) else t for t in toks]
+    return " ".join(out)
+
+
+def align_check_findability(spec: ProjectSpec) -> ProjectSpec:
+    """합성된 acceptance_criteria의 pytest 체크에서 fragile *테스트 셀렉터*(`-k` 및 `::nodeid`)를 제거한다(WO#172).
+
+    #171/#172 라이브 실패를 차단한다 — 약 brain이 *생성될 테스트 이름과 어긋나는* 셀렉터를 내 게이트가
+    테스트를 못 찾던 두 형태: (a) `-k '<keyword>'`(0개 발견 exit 5, #171), (b) `path::<nodeid>`('not found'
+    exit 4, #172). 둘 다 제거하면 명령이 *그 파일/디렉토리의 모든 테스트*를 돌린다 — findable + **더 엄격**
+    (테스트가 더 많이 실행됨, 가짜 pass 불가). per-unit 스코핑은 ac.unit(불변)·worktree로 하지 셀렉터로
+    하지 않으므로 스코핑 영향 없다. **가드지 판정 아님** — gate/run_judge 판정 로직·#113 바 불변(발견된
+    테스트 fail은 여전 fail). 멱등(이미 셀렉터 없으면 no-op). spec을 제자리 수정 후 그대로 반환한다.
     """
     for ac in spec.acceptance_criteria:
         chk = ac.check
-        if chk.cmd and "pytest" in chk.cmd.lower() and "-k" in chk.cmd:
+        if not chk.cmd or "pytest" not in chk.cmd.lower():
+            continue
+        if "-k" in chk.cmd:
             chk.cmd = _strip_pytest_k(chk.cmd)
+        if "::" in chk.cmd:
+            chk.cmd = _strip_pytest_nodeid(chk.cmd)
     return spec
 
 
