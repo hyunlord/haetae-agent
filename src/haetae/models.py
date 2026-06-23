@@ -545,6 +545,56 @@ class DecompCritique(BaseModel):
     rejected: bool = False
 
 
+# ──────────────────── ResearchBrief (분해 전 research 단계, WO#166) ────────────────────
+#
+# 분해 *전* director-측 research 패스(오케스트레이션 LLM = critic-model, executor 아님)가 내는
+# brief — 합성기가 *입력*으로 소비해 더 정보-기반 분해(경계·계약·패턴)를 한다. **제안이지
+# mandate 아님**(합성기 override 가능·적대 spec/decomp critic 그대로 작동). 판정 아님(분해 입력)
+# — gate가 독립 판정. 오프라인(#32 스킬 레지스트리 + 의뢰 분석, 네트워크 0 — F.2 후속).
+
+
+class CandidateUnit(BaseModel):
+    """research가 제안하는 후보 disjoint-scope 유닛(#165 직접 공급 — 제안이지 강제 아님).
+
+    scope: 이 유닛이 *배타적으로 소유*할 후보 파일(형제 간 ∩=∅ 지향, #165). deps: 후보 의존.
+    합성기가 이걸 출발점으로 쓰되 override 가능(브리프는 mandate 아님).
+    """
+
+    unit: str
+    desc: str
+    scope: list[str] = Field(default_factory=list)
+    deps: list[str] = Field(default_factory=list)
+
+
+class CandidateContract(BaseModel):
+    """research가 제안하는 후보 facade 계약(#160 — 유닛 간 export/import 결합, *파일 공유 아님*)."""
+
+    producer: str                 # 이 export를 소유/생산하는 유닛
+    module_path: str              # 노출 모듈 경로(예: "src/engine/engine.js")
+    export_name: str              # import할 export 식별자(예: "GameEngine")
+    consumers: list[str] = Field(default_factory=list)  # 이걸 import하는 유닛들
+
+
+class ResearchBrief(BaseModel):
+    """분해 전 research 브리프(WO#166) — director-측 계획 *입력*(제안이지 mandate 아님).
+
+    합성기가 소비해 더 정보-기반 분해를 한다. **판정 아님** — 적대 gate/spec critic/decomp critic은
+    독립 작동(brief는 분해 입력일 뿐). 완전 best-effort: research 실패/파싱불가면 None(브리프 없이
+    직접 synthesize = 기존 동작). 전부 optional·기본값 → 부분 brief도 유효(graceful).
+
+    task_analysis: 필요 서브시스템/행동 분석. stack: 스택+규약(파일 레이아웃).
+    patterns: 관련 패턴(#32 레지스트리 오프라인 매칭 — 스킬명/요지). candidate_units: 후보
+    disjoint-scope 분해(#165). candidate_contracts: 후보 facade 계약(#160). note: 메타/감사.
+    """
+
+    task_analysis: str = ""
+    stack: str = ""
+    patterns: list[str] = Field(default_factory=list)
+    candidate_units: list[CandidateUnit] = Field(default_factory=list)
+    candidate_contracts: list[CandidateContract] = Field(default_factory=list)
+    note: str | None = None
+
+
 # ──────────────────── OR-node / approach 추적 (WO#41, Phase D) ────────────────────
 
 

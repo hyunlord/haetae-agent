@@ -873,6 +873,18 @@ def main(argv: list[str] | None = None) -> int:
         help="스킬 주입 on/off (기본 on). --no-skills로 끄면 주입 없음(기존 동작 불변).",
     )
     parser.add_argument(
+        "--research",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "분해 전 director-측 research 단계(WO#166, pipeline-strengthening B). 기본 off "
+            "(opt-in — 기존 동작 byte-identical). 켜면 *복잡* 의뢰에 한해(복잡도 게이트) 첫 "
+            "synthesize *전* 1회 오프라인 research(#32 레지스트리)로 ResearchBrief(후보 "
+            "disjoint-scope 경계·facade 계약·패턴)를 만들어 합성기에 *제안*으로 주입한다. "
+            "단순 의뢰는 skip(추가 콜 0). research=오케스트레이션 LLM이지 executor 아님."
+        ),
+    )
+    parser.add_argument(
         "--pricing",
         default=None,
         help=(
@@ -1138,6 +1150,23 @@ def main(argv: list[str] | None = None) -> int:
     # 진행 표시: 느린 codex 호출이 "행"으로 안 보이게 stderr로 한 줄씩.
     def progress(msg: str) -> None:
         print(f"… {msg}", file=sys.stderr, flush=True)
+
+    # WO#166: 분해 전 director-측 research 단계(pipeline-strengthening B) — replan 루프 *밖*·1회.
+    # opt-in(--research, 기본 off → 기존 동작 byte-identical). 켜져도 복잡도 게이트가 단순 의뢰는
+    # skip(추가 콜 0). 순수 재개(resume_spec≠None)면 합성 skip이라 research도 skip. brief는
+    # synth_context에 *제안*으로 얹혀 합성기가 소비(override 가능 — 적대 spec/decomp critic 그대로).
+    # research=오케스트레이션 LLM(critic-model 우선, 없으면 main client)이지 *executor 아님* →
+    # ALLOWED_SANDBOXES 무관. 소스=#32 레지스트리(오프라인) + 의뢰 분석(네트워크 0, F.2 후속).
+    if args.research and resume_spec is None:
+        from haetae.research import maybe_research
+
+        synth_context = maybe_research(
+            args.order,
+            critic_client or client,
+            synth_context,
+            skills_dir=args.skills_dir,
+            progress=progress,
+        )
 
     # graceful stop(WO#43): 웹 stop(#37)은 이 프로세스에 SIGINT를 보낸다. run_loop이
     # 이미 정리·저장·클린 마무리하지만(KeyboardInterrupt를 잡아 State 반환), 그 바깥

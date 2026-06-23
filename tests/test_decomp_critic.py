@@ -325,11 +325,13 @@ def test_decomposition_prompts_stay_concise():
     ceiling 소폭 상향(syn 383→388·dc 92→93) — *기준만*(서사 없이·콜 회귀 0 의도).
     WO#165: 기존 scope 정식화(배타 소유·∅ 불변식·facade 계약 결합 #160) + decomp-critic replan-time
     파일-소유권 겹침 축(#59 synthesis-time와 역할 분리)은 통합 머지-충돌→직렬화→escalate 직격이라
-    ceiling 소폭 상향(syn 388→392·dc 93→102) — *기준만*(새 필드 0·서사 없이·콜 회귀 0 의도)."""
+    ceiling 소폭 상향(syn 388→392·dc 93→102) — *기준만*(새 필드 0·서사 없이·콜 회귀 0 의도).
+    WO#166: 분해 전 research 단계(pipeline-strengthening B)가 synthesizer.md에 *리서치 브리프 소비*
+    지침(제안이지 mandate 아님·override 가능)을 더해 ceiling 소폭 상향(syn 392→397) — *기준만*."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
     # #152 직전: synthesizer 343, decomp_critic 73. #157: 검증-트레이스 end-to-end + 스캐폴드 지침.
-    assert syn_lines <= 392, f"synthesizer.md 길이 회귀({syn_lines}>392) — 간결 위반"
+    assert syn_lines <= 397, f"synthesizer.md 길이 회귀({syn_lines}>397) — 간결 위반"
     assert dc_lines <= 102, f"decomp_critic.md 길이 회귀({dc_lines}>102)"
 
 
