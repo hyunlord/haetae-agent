@@ -293,6 +293,14 @@ wire + **풀-행동 트레이스**(전체 행동 사슬을 *한 플레이스루*
 - **남은 옵션(서브프로젝트 재개 시)**: 포괄적 DOM-steering(app 진입점=실DOM·jsdom 금지 + 모든 헤드리스 하니스=installHeadlessDOM, synthesizer/scaffold 가이드). 단 *옮겨가는 floor* 특성상 강한 스캐폴드를 약빌더 특정 약점에 쌓는 것이라 thesis 깨끗함과 trade-off — 또는 강한 tier 빌더로 DOM-경계만 격상. 정직 baseline = ceiling 발견 자체가 완결된 결과.
 - **비용 메모**: 통합/트레이스 재시도가 비용 핫스팟(#161 3.13M·#163 1.76M, codex judge/critic 지배). 행동 로직은 cheap+안정.
 
+### 파이프라인 강화 arc (#165–#168) — A/B/C 라이브 검증 + 경계 정밀화
+- **A disjoint-scope (#165)** ✓ 라이브: 헤드리스 로그라이크 런서 합성이 11유닛에 배타 소유 파일(∩=∅) + 깨끗한 DAG + facade 계약(#160) 부여, 병렬 disjoint 디스패치, **전 런 머지충돌 1건**(snake 통합 벽 대비 현저히 청결). 단서: scope 배정하나 약빌더가 항상 준수는 안 함(OR-재빌드가 scope 벗어남 → #48이 처리).
+- **B research (#166)** ✓ 라이브: RESEARCH stage 발화(복잡도 게이트 통과) → ResearchBrief(후보 10유닛) → 합성기가 조사된 disjoint 경계+facade 계약 채택. --research opt-in 작동.
+- **C lineage (#167)**: 첫 런 parent null(정확) — 다-런 체인+대시보드 트리는 mechanism+test 검증, *라이브 다-런 미자극*(fix→continue 시 자극).
+- **🔑 경계 정밀화 (#163 → #168)**: ceiling은 *DOM-경계만이 아니다*. 약빌더는 단순 행동 유닛(types/rng/map/이동/아이템 = 클린 수렴)은 안정 수렴하나, **알고리즘적으로 어려운 유닛(BFS 추적 AI·death-sweep 전투)서 행동-로직-복잡도 floor**. 비-DOM은 더 멀리 가나(DOM 혼동 0) 복잡 알고리즘도 floor. → **역량 경계 = DOM-경계 ∪ 복잡-알고리즘**.
+- **thesis 결론 (양쪽 경계 매핑)**: *오케스트레이션 > 모델 강도* 는 경계지어 성립 — 파이프라인이 약빌더로 역량 내(단순 행동 로직, disjoint 다유닛 조립, runtime-smoke 통합 계약버그)에선 검증된-좋은 결과를 내게 하고, 역량 밖(DOM-경계 ∪ 복잡-알고리즘)은 정직하게 게이트. 전 arc 검증역전 0·#113 불완화·적대 분리·서버리스 유지. A/B/C가 통합 표면을 청결히 함(머지충돌 1건)을 라이브 입증.
+- **남은 옵션**: 복잡 유닛에 (a) 능력-인지 라우팅(어려운 유닛→강빌더 tier), (b) 패턴 주입(#32 레지스트리에 BFS/turn-combat 패턴), (c) C lineage 라이브 검증용 fix→continue. 정직 baseline = 경계 매핑 자체가 완결 결과.
+
 ### 비용 구조
 - 약한 빌더 **쌈**(~10K/유닛) · 강한 codex judge/critic **비쌈**(풀 런 ~1.4M; #138 실측 codex judge ~461K ≫ 로컬 빌더 ~10K).
 - codex replan **~5분/콜 = 벽시계 병목**(토큰 아닌 *시간*) → 효율 백로그(§3)와 연결.
