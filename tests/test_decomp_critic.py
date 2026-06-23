@@ -13,10 +13,12 @@ from haetae.decomp_critic import (
     critique_decomposition,
     granularity_signal,
     is_weak,
+    scope_overlap_signal,
 )
 from haetae.llm import MockClient
 from haetae.models import (
     DecompCritique,
+    DecompositionUnit,
     NextOrder,
     PlanItem,
     PlanState,
@@ -320,12 +322,15 @@ def test_decomposition_prompts_stay_concise():
     (build-pass≠runtime-works) 직격이라 ceiling 소폭 상향(syn 378→383) — *기준만*(서사 없이·콜 회귀 0 의도).
     WO#162: 트레이스-하니스 헤드리스 어댑터 재사용(synthesizer JSDOM→어댑터 redirect + 단일 트레이스
     consolidation; decomp_critic 1줄)은 #161 u7/u8 트레이스 floor(약빌더가 DOM 인프라를 못 짬) 직격이라
-    ceiling 소폭 상향(syn 383→388·dc 92→93) — *기준만*(서사 없이·콜 회귀 0 의도)."""
+    ceiling 소폭 상향(syn 383→388·dc 92→93) — *기준만*(서사 없이·콜 회귀 0 의도).
+    WO#165: 기존 scope 정식화(배타 소유·∅ 불변식·facade 계약 결합 #160) + decomp-critic replan-time
+    파일-소유권 겹침 축(#59 synthesis-time와 역할 분리)은 통합 머지-충돌→직렬화→escalate 직격이라
+    ceiling 소폭 상향(syn 388→392·dc 93→102) — *기준만*(새 필드 0·서사 없이·콜 회귀 0 의도)."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
     # #152 직전: synthesizer 343, decomp_critic 73. #157: 검증-트레이스 end-to-end + 스캐폴드 지침.
-    assert syn_lines <= 388, f"synthesizer.md 길이 회귀({syn_lines}>388) — 간결 위반"
-    assert dc_lines <= 93, f"decomp_critic.md 길이 회귀({dc_lines}>93)"
+    assert syn_lines <= 392, f"synthesizer.md 길이 회귀({syn_lines}>392) — 간결 위반"
+    assert dc_lines <= 102, f"decomp_critic.md 길이 회귀({dc_lines}>102)"
 
 
 # ──────────────── 통합-급 구조적 재분해 (WO#155) ────────────────
@@ -462,3 +467,137 @@ def test_decomp_critic_module_is_director_side_no_judgment():
     src = (REPO_ROOT / "src" / "haetae" / "decomp_critic.py").read_text(encoding="utf-8")
     for forbidden in ("ALLOWED_SANDBOXES", "run_judge", "CompositeGate", "import gate"):
         assert forbidden not in src, forbidden
+
+
+# ──────────────── 파일-소유권 disjoint 축 (WO#165, replan-time) ────────────────
+#
+# #165: 분해된 병렬 형제 유닛이 같은 파일을 소유(scope 겹침)하면 머지 충돌→직렬화(#21)→통합 escalate.
+# intake(#59)는 synthesis-time 겹침을 1회 재합성으로 잡고, 이 축은 *replan-time* 갭을 메운다 —
+# scope_overlap_signal = director-side 결정적 탐지(신호; codex가 판정·#148/#152 동형). 새 필드 0
+# (기존 scope 정식화). intake/scheduler 함수 미import(둘 다 무변경·디커플) — 보수 기준 로컬 재구현.
+
+
+def _spec_with_scopes(decomp: list[tuple[str, list[str], list[str]]]) -> ProjectSpec:
+    """(unit, deps, scope) 튜플로 _SPEC_DICT 위에 decomposition만 갈아끼운 spec(테스트 헬퍼)."""
+    d = dict(_SPEC_DICT)
+    d["decomposition"] = [
+        {"unit": u, "desc": f"{u} 모듈", "deps": list(dp), "scope": list(sc)}
+        for u, dp, sc in decomp
+    ]
+    return ProjectSpec.model_validate(d)
+
+
+def test_scope_overlap_signal_flags_parallel_sibling_file_overlap():
+    """병렬 형제 + 양쪽 scope 선언 + 같은 파일 → 소유권 겹침 신호(disjoint 위반)."""
+    spec = _spec_with_scopes([
+        ("u1", [], ["src/player.js"]),
+        ("u2", [], ["src/player.js"]),  # u1과 병렬(dep 없음) + 같은 파일
+    ])
+    sig = scope_overlap_signal(NextOrder(unit="u1", goal="플레이어"), spec)
+    assert sig is not None
+    assert "src/player.js" in sig and "u2" in sig
+    assert "∅" in sig or "disjoint" in sig.lower()
+    assert "facade" in sig.lower() and "#160" in sig  # 파일 공유 아닌 계약 결합 권고
+
+
+def test_scope_overlap_signal_none_when_disjoint():
+    """서로 다른 파일을 소유 → 신호 없음(과개입 0)."""
+    spec = _spec_with_scopes([
+        ("u1", [], ["src/player.js"]),
+        ("u2", [], ["src/collision.js"]),
+    ])
+    assert scope_overlap_signal(NextOrder(unit="u1", goal="x"), spec) is None
+
+
+def test_scope_overlap_signal_none_when_dep_linked():
+    """직렬(dep) 유닛은 같은 파일 겹쳐도 신호 없음(순차 머지 — #59 _scope_overlaps와 동형 보수성)."""
+    spec = _spec_with_scopes([
+        ("u1", [], ["src/shared.js"]),
+        ("u2", ["u1"], ["src/shared.js"]),  # u2가 u1에 의존 → 직렬
+    ])
+    assert scope_overlap_signal(NextOrder(unit="u2", goal="x"), spec) is None
+
+
+def test_scope_overlap_signal_transitive_dep_not_flagged():
+    """전이 의존(u3←u2←u1)도 직렬 → 겹쳐도 신호 없음."""
+    spec = _spec_with_scopes([
+        ("u1", [], ["src/x.js"]),
+        ("u2", ["u1"], ["src/y.js"]),
+        ("u3", ["u2"], ["src/x.js"]),  # u3는 u1에 전이 의존
+    ])
+    assert scope_overlap_signal(NextOrder(unit="u3", goal="x"), spec) is None
+
+
+def test_scope_overlap_signal_none_when_undeclared_or_unknown_unit():
+    """한쪽이라도 scope 미선언 → no-op. order 유닛이 decomposition에 없어도 None(보수적)."""
+    spec = _spec_with_scopes([("u1", [], ["src/a.js"]), ("u2", [], [])])
+    assert scope_overlap_signal(NextOrder(unit="u1", goal="x"), spec) is None  # u2 미선언
+    assert scope_overlap_signal(NextOrder(unit="uX", goal="x"), spec) is None  # order 유닛 미상
+
+
+def test_scope_overlap_signal_wired_into_critic_prompt():
+    """겹침이면 소유권 신호가 critic(codex) user 프롬프트에 *참고*로 주입된다(codex가 판정)."""
+    spec = _spec_with_scopes([
+        ("u1", [], ["src/player.js"]),
+        ("u2", [], ["src/player.js"]),
+    ])
+    client = MockClient([_WEAK_YAML])
+    critique_decomposition(
+        NextOrder(unit="u1", goal="플레이어"), spec, _state(), client, prompt_path=DECOMP_PROMPT
+    )
+    user = client.calls[0]["user"]
+    assert "소유권 신호" in user and ("∅" in user or "disjoint" in user.lower())
+
+
+def test_scope_overlap_signal_absent_for_disjoint_prompt():
+    """disjoint 분해엔 소유권 신호 섹션 없음(과개입 0 — 기존 동작)."""
+    spec = _spec_with_scopes([("u1", [], ["src/a.js"]), ("u2", [], ["src/b.js"])])
+    client = MockClient([_PROGRESS_YAML])
+    critique_decomposition(
+        NextOrder(unit="u1", goal="x"), spec, _state(), client, prompt_path=DECOMP_PROMPT
+    )
+    assert "소유권 신호" not in client.calls[0]["user"]
+
+
+def test_build_decomp_feedback_guides_disjoint_ownership():
+    """weak 피드백이 형제 파일-소유권 겹침 → 공유 파일 추출/경계 재조정 + facade 계약 결합을 유도(#165)."""
+    fb = build_decomp_feedback(DecompCritique(verdict="weak", reason="형제 scope 겹침", unit="u1"))
+    assert "facade" in fb.lower() or "계약" in fb
+    assert "∅" in fb or "한 유닛만" in fb
+
+
+def test_no_owned_paths_field_scope_is_canonical():
+    """WO#165-v2: 새 owned_paths 필드 없음 — 기존 scope를 정식화(소유 매니페스트)한다."""
+    assert "owned_paths" not in DecompositionUnit.model_fields
+    assert "scope" in DecompositionUnit.model_fields
+
+
+def test_scope_docstring_formalized_strict_ownership():
+    """models.py scope 필드가 엄격 소유 매니페스트로 정식화(배타 소유·∅·facade 계약 #160)."""
+    src = (REPO_ROOT / "src" / "haetae" / "models.py").read_text(encoding="utf-8")
+    assert "배타" in src and "∅" in src
+    assert "#160" in src  # 닿는 유닛은 facade 계약으로 결합(파일 공유 아님)
+
+
+def test_decomp_critic_prompt_has_ownership_overlap_axis():
+    """decomp-critic 프롬프트가 replan-time 파일-소유권 겹침 축(#165)을 담는다."""
+    dc = DECOMP_PROMPT.read_text(encoding="utf-8")
+    assert "#165" in dc
+    assert "소유권" in dc and "∅" in dc
+    assert "facade" in dc.lower() and "replan-time" in dc.lower()
+
+
+def test_synthesizer_prompt_formalizes_exclusive_ownership():
+    """합성기가 scope를 배타 소유 + ∅ 불변식 + facade 계약 결합으로 정식화(#165)."""
+    syn = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8")
+    assert "배타" in syn and "∅" in syn
+    assert "facade" in syn.lower() and "#160" in syn
+
+
+def test_scope_overlap_axis_decoupled_from_intake_and_scheduler():
+    """적대 분리/디커플: decomp_critic이 intake·scheduler의 scope 함수를 import·참조하지 않는다
+    (둘 다 무변경 — 보수 기준 로컬 재구현). intake #59 메커니즘 미재사용."""
+    src = (REPO_ROOT / "src" / "haetae" / "decomp_critic.py").read_text(encoding="utf-8")
+    assert "haetae.intake" not in src and "haetae.scheduler" not in src
+    assert "disjoint_scope_feedback" not in src  # intake 메커니즘 미재사용(로컬)
+    assert "is_disjoint_from" not in src  # scheduler 술어 미참조

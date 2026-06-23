@@ -148,9 +148,15 @@ class DecompositionUnit(BaseModel):
     unit: str
     desc: str
     deps: list[str] = Field(default_factory=list)
-    # WO#59: 이 유닛이 *소유*하는 파일/모듈 영역(경로·glob 힌트). 병렬 형제 유닛이 서로
-    # disjoint한 scope를 가지면 worktree 머지가 깨끗(통합 벽 예방, #51의 형제 버전).
-    # optional·비파괴: 없으면 빈 리스트(기존 spec 무영향, deps/capability_requests 패턴).
+    # WO#59 + WO#165(정식화): 이 유닛이 *배타적으로 소유*하는 파일/모듈 경로(소유 매니페스트).
+    # **disjoint 불변식**: 형제(병렬) 유닛 간 scope 교집합 = ∅ — 각 파일은 *한 유닛만* 소유한다.
+    # 그래야 동시 빌드 worktree 머지가 자명히 충돌-free(서로 다른 파일)고 직렬화 폴백(#21)이 거의
+    # 안 걸린다(통합 벽 예방, #51의 형제 버전). 유닛이 서로 닿아야 하면 *파일 공유 금지* →
+    # facade 계약(#160 — 한 유닛 export·다른 유닛 import)으로 결합해 소유권을 단일하게 유지하라.
+    # 이 필드가 disjoint 보장이 떨어지는 지점이다 — scheduler.is_disjoint_from(#110)·intake scope-겹침
+    # 재합성(#59)이 그대로 읽어 혜택받는다(새 필드 불요). 합성기가 명시하고, decomp-critic은
+    # replan-time 형제 겹침을 잡아 재분해를 권고한다(#165). optional·비파괴: 없으면 빈 리스트
+    # (기존 spec 무영향, deps/capability_requests 패턴).
     scope: list[str] = Field(default_factory=list)
     # WO#64: 반응형 tier 사다리의 *시작* 칸 힌트(예: "gpt-5.5:high"). 합성기가 "명백히
     # 어려운" 유닛(복잡 알고리즘 등)을 싼 tier 대신 더 센 tier에서 *probe*하게 한다.

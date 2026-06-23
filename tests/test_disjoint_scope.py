@@ -286,23 +286,29 @@ def test_adopt_scope_only_structural_change_returns_original():
 # ──────────────────────────── decomp critic 불변(적대 분리) ────────────────────────────
 
 
-def test_decomp_critic_unchanged_scope_overlap_not_weak_trigger():
-    """머지-충돌 scope-overlap 메커니즘(#59/#123)은 decomp critic에 *없다* — 합성/루프 경로 전용.
+def test_decomp_critic_replan_overlap_axis_decoupled_and_signal_only():
+    """WO#165-v2(역할 분리): decomp critic은 *replan-time* 파일-소유권 겹침 축을 가지되 —
+    (a) intake의 #59 메커니즘(`_scope_overlaps`/`disjoint_scope_feedback`)을 import·재사용하지 않고
+    (intake 무변경·디커플, 보수 기준 로컬 재구현), (b) scope-overlap은 프롬프트 *신호*지 하드코딩
+    verdict가 아니다(codex가 판정 — progress-only 정규화 유지). #59는 synthesis-time, 이 축은
+    replan-time(같은 입력 scope·다른 시점 — 중복 아님).
 
-    (WO#148이 입도 축으로 *분할 권고* disjoint-scope 텍스트를 critic에 추가했으나, 그건 과대-유닛
-    을 단일-책임 유닛들로 쪼개라는 권고지 머지-충돌 scope-overlap *verdict 트리거*가 아니다 —
-    아래 머지 메커니즘 부재 + progress-only 정규화는 유지된다.)
+    (#59 시절엔 critic에 scope-overlap *부재*가 불변식이었으나, #165-v2가 replan-time 갭을 메우며
+    *신호*를 추가했다. 단 intake 메커니즘 미재사용 + verdict-비트리거는 유지된다.)
     """
     import inspect
 
     import haetae.decomp_critic as dc
 
     src = inspect.getsource(dc)
-    # 머지-충돌 scope-overlap 메커니즘(#59/#123)은 critic에 없다(합성/루프 경로 전용).
+    # intake #59 메커니즘 미재사용(디커플 — intake 무변경). scheduler 술어도 미참조.
     assert "_scope_overlaps" not in src and "disjoint_scope_feedback" not in src
-    # weak 정규화는 'weak' 별칭만 — scope-overlap 같은 새 *verdict* 트리거 없음(progress-only 유지).
+    assert "haetae.intake" not in src and "is_disjoint_from" not in src
+    # 하지만 replan-time 소유권 *신호*는 존재한다(역할 분리 — 이름·시점이 다름).
+    assert hasattr(dc, "scope_overlap_signal")
+    # scope-overlap은 신호지 verdict 아님 — 미지 verdict는 progress(codex가 판정·안 막음, 유지).
     assert dc._norm_verdict("weak") == "weak"
-    assert dc._norm_verdict("scope-overlap") == "progress"  # 미지값 → progress(안 막음)
+    assert dc._norm_verdict("scope-overlap") == "progress"
 
 
 def test_synthesizer_prompt_has_disjoint_scope_guidance():

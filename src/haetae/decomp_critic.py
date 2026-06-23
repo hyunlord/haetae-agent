@@ -157,6 +157,75 @@ def granularity_signal(order: NextOrder) -> str | None:
     )
 
 
+# ──────────────────── 파일-소유권 disjoint 축 (WO#165, replan-time) ────────────────────
+#
+# 분해된 *병렬 형제* 유닛이 *같은 파일을 소유*(scope 겹침)하면 동시 빌드 worktree 머지 충돌 →
+# 직렬화(#21) → 통합 escalate. intake(#59)는 *synthesis-time* 겹침을 1회 bounded 재합성으로 잡지만
+# decomp-critic엔 의도적으로 안 넣었다(progress-only). 이 축은 그 *replan-time* 갭을 메운다 —
+# replan이 유닛을 정련/도입하며 만든 형제 scope 겹침을 결정적으로 탐지해 critic 프롬프트에 *신호*로
+# 주입한다(codex가 최종 판정 — #148/#152 입도/KIND 축과 동형, 오버블록 회피). **판정 아님·gate 무관**
+# (director-side 분해 입력). intake/scheduler를 import하지 않는다(둘 다 무변경·디커플) — 같은 보수
+# 기준(병렬 형제·양쪽 scope 선언·정확-문자열 겹침; intake #59 scope-겹침 탐지와 동형)을 로컬 재구현한다.
+
+
+def _scope_transitive_deps(units: list) -> dict[str, set[str]]:
+    """유닛별 *전이적* 의존 집합(사이클 visited 가드). intake._transitive_deps와 동형(로컬 재구현)."""
+    direct = {u.unit: set(u.deps or []) for u in units}
+    out: dict[str, set[str]] = {}
+    for unit in direct:
+        seen: set[str] = set()
+        stack = list(direct.get(unit, ()))
+        while stack:
+            d = stack.pop()
+            if d in seen:
+                continue
+            seen.add(d)
+            stack.extend(direct.get(d, ()))
+        out[unit] = seen
+    return out
+
+
+def scope_overlap_signal(order: NextOrder, spec: ProjectSpec) -> str | None:
+    """order 유닛의 소유 scope가 *병렬 형제* 유닛과 겹치면 disjoint-위반 신호(한 줄), 아니면 None.
+
+    WO#165 replan-time 파일-소유권 축. 보수적(intake #59 scope-겹침 탐지와 동형):
+      - order 유닛이 spec.decomposition에 있고 scope 선언 + 상대도 선언 + *정확-문자열 겹침*일 때만.
+      - 직렬(전이 dep로 엮임)·미선언·order 유닛 미상·겹침 없음 → None(no-op — 과개입 0·기존 동작).
+    **판정 아님** — critic(codex)에 주입되는 *참고 신호*다(최종 판정은 codex). gate/run-judge 무관·
+    director-side. 같은 입력(scope) 다른 시점: synthesis-time 겹침은 intake #59가 담당, 여긴 replan-time만.
+    """
+    units = spec.decomposition
+    own = next((list(u.scope or []) for u in units if u.unit == order.unit), [])
+    if not own:
+        return None  # order 유닛 미상 / scope 미선언 → 보수적 no-op
+    tdeps = _scope_transitive_deps(units)
+    own_set = set(own)
+    collisions: list[tuple[str, list[str]]] = []
+    for u in units:
+        if u.unit == order.unit:
+            continue
+        other = set(u.scope or [])
+        if not other:
+            continue  # 상대 미선언 → 스킵(보수적)
+        # 병렬 형제만(직렬 dep로 엮이면 순차 머지 → 충돌 위험 작음, #59와 동형)
+        if order.unit in tdeps.get(u.unit, set()) or u.unit in tdeps.get(order.unit, set()):
+            continue
+        shared = own_set & other
+        if shared:
+            collisions.append((u.unit, sorted(shared)))
+    if not collisions:
+        return None
+    collisions.sort(key=lambda x: x[0])
+    pairs = "; ".join(f"[{order.unit}]↔[{u}] 공유: {', '.join(s)}" for u, s in collisions)
+    return (
+        f"이 유닛이 병렬 형제와 *같은 파일을 소유*(scope 겹침)한다 — {pairs}. 형제 간 owned-scope "
+        "교집합은 ∅이어야 한다(disjoint 불변식) — 동시 빌드 시 같은 파일을 건드려 worktree 머지 "
+        "충돌→직렬화(#21)→통합 벽. 공유 파일을 *별도 유닛으로 추출*(한 유닛이 소유·나머지는 deps)하거나 "
+        "경계를 재조정해 각 파일을 *한 유닛만* 소유하게 하고, 닿아야 하면 *파일 공유가 아니라* facade "
+        "계약(#160 export/import)으로 결합하도록 재분해를 권고하라."
+    )
+
+
 class DecompCriticError(ParseError):
     """분해 critic 응답 파싱/검증 실패. raw 응답은 .raw_response에 보존된다."""
 
@@ -247,6 +316,16 @@ def _build_user(
             "(이 신호는 *판정이 아니라 참고*다. 행동들이 실제로 독립이고 한 유닛이 과대하면 "
             "weak로 단일-책임 disjoint-scope 분할을 권고하고, 한 책임의 하위측면일 뿐이면 무시하라.)"
         )
+    # WO#165: replan-time 파일-소유권 겹침 신호(형제 owned-scope 교집합 ≠ ∅) — *참고*(판정은 codex).
+    osig = scope_overlap_signal(order, spec)
+    if osig:
+        base += (
+            "\n\n# 소유권 신호 (파일-소유권 겹침 — replan-time 자동 탐지, WO#165)\n"
+            f"{osig}\n"
+            "(이 신호는 *판정이 아니라 참고*다. 형제 유닛이 실제로 같은 파일을 소유해 머지 충돌 "
+            "리스크가 있으면 weak로 disjoint 재분해(공유 파일 추출/경계 재조정·facade 계약 결합)를 "
+            "권고하고, 실은 disjoint거나 직렬(dep)로 엮였으면 무시하라.)"
+        )
     return base
 
 
@@ -308,6 +387,9 @@ def build_decomp_feedback(crit: DecompCritique) -> str:
         "유닛에 독립 행동이 여럿이면(이동/충돌/먹이/game-over 등) 각각을 *distinct 모듈 파일을 "
         "소유하는 단일-책임 disjoint-scope 유닛*으로 쪼개고(파일 겹침 0 → 통합 벽 악화 방지), "
         "별도 통합/조립 유닛이 그 모듈들을 wire하게 하라. "
+        "형제 유닛이 *같은 파일을 소유*(scope 겹침)하면(#165) 그 공유 파일을 *별도 유닛으로 추출*하거나 "
+        "경계를 재조정해 각 파일을 *한 유닛만* 소유하게 하고(owned-scope 교집합 = ∅), 닿아야 하면 "
+        "*파일 공유가 아니라* facade 계약(#160 export/import)으로 결합하라. "
         "통합 유닛이 조립에 *더해* 트레이스-하니스(전체 행동 사슬 구동 + evidence emit)까지 겸하면, "
         "in-place로 줄이지 말고 wire/파사드 유닛과 *전용 트레이스-하니스 유닛*(wire에 deps)으로 "
         "*유닛을 추가*해 구조적으로 분리하라(#155)."
