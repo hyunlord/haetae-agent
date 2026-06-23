@@ -703,6 +703,45 @@ def state_to_view(
         critique=critique,
     )
 
+    # WO#171: 약-judge 정직 표기 + shadow 검증역전 요약(read-only — verdict 불변·엔진 무접촉). #28/#35 패턴.
+    #   부재(강-judge·구버전 state)면 judge_profile=None·shadow.enabled=False(빈). state만 읽는다.
+    jp = getattr(state, "judge_profile", None)
+    judge_profile_view = (
+        {
+            "brain_executor": jp.brain_executor,
+            "builder_executor": jp.builder_executor,
+            "judge_executor": jp.judge_executor,
+            "critic_executor": jp.critic_executor,
+            "judge_model": jp.judge_model,
+            "weak_judge": jp.weak_judge,
+            "shadow_judge": jp.shadow_judge,
+            "note": jp.note,
+        }
+        if jp is not None
+        else None
+    )
+    shadow_cmps = getattr(state, "shadow_comparisons", None) or []
+    inversions = [c for c in shadow_cmps if getattr(c, "inverted", False)]
+    shadow_view = {
+        "enabled": bool(jp and jp.shadow_judge) or bool(shadow_cmps),
+        "comparisons": len(shadow_cmps),
+        "inversions": len(inversions),
+        "inversion_rate": (
+            round(len(inversions) / len(shadow_cmps), 3) if shadow_cmps else None
+        ),
+        "items": [
+            {
+                "unit": c.unit,
+                "primary_verdict": c.primary_verdict,
+                "shadow_verdict": c.shadow_verdict,
+                "inverted": c.inverted,
+                "locus": c.locus,
+                "detail": c.detail,
+            }
+            for c in shadow_cmps
+        ],
+    }
+
     return {
         "status": state.status.value,
         "summary": summary,
@@ -728,6 +767,9 @@ def state_to_view(
         "decomp_critiques": decomp_critiques_view,
         # WO#46 A: 생애주기 단계 섹션(빈/구버전 state → [] 무크래시).
         "phases": phases,
+        # WO#171: 약-judge 정직 표기 + shadow 검증역전 요약(read-only — 보장 차이 *표면화*, 은폐 아님).
+        "judge_profile": judge_profile_view,
+        "shadow": shadow_view,
     }
 
 

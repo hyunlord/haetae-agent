@@ -582,6 +582,8 @@ def run_loop(
     seeded: bool = False,
     reuse_manifest: dict | None = None,
     reuse: bool = True,
+    judge_profile=None,
+    shadow_sink=None,
     skills_dir: str | Path | None = None,
     pricing: dict | None = None,
     clock: Callable[[], str] | None = None,
@@ -660,6 +662,13 @@ def run_loop(
         이벤트 append/spec 변경/종료마다 호출 → Ctrl-C나 후반 실패에도 그때까지의
         감사 로그가 파일에 남는다. state_path가 없으면 no-op.
         """
+        # WO#171-shadow: 검증역전 누적분을 state로 동기화(state_path 유무 무관 — 반환 State에도 반영,
+        #   순차/병렬 양쪽이 같은 try_save 클로저를 공유하므로 한 곳에서 처리). best-effort.
+        if shadow_sink is not None:
+            try:
+                state.shadow_comparisons = shadow_sink.snapshot()
+            except Exception:  # noqa: BLE001 — 관측 동기화 실패가 run/save를 죽이지 않는다
+                pass
         if state_path is None:
             return
         try:
@@ -984,6 +993,10 @@ def run_loop(
             if resume_spec is not None
             else _init_state(spec)
         )
+        # WO#171-C: 약-judge 정직 표기를 state에 박는다(read-only 메타 — verdict 불변). 병렬 경로도
+        #   같은 state 객체를 받으므로 한 번만 설정하면 양쪽에 반영된다. 없으면 None(강-judge·구버전).
+        if judge_profile is not None:
+            state.judge_profile = judge_profile
         save_spec(spec)  # WO#58: 검증된 spec을 spec.yaml 사이드카로(이어가기·대시보드 보강 원천)
         # WO#65: auto 해석 config를 진짜 state에 transition으로 기록(투명성 — 대시보드/감사).
         if auto_config_note:

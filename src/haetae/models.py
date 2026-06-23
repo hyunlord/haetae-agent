@@ -642,6 +642,63 @@ class Lineage(BaseModel):
     fix_ref: str | None = None
 
 
+# ──────────────── 완전-로컬 자급 모드 — 약-judge 플래그 + shadow 관측 (WO#171) ────────────────
+#
+# 새 thesis: 강 모델 0, 약 로컬 모델 하나(빌더·judge·critic 전부 로컬). judge≠builder *독립 모델*
+# 분리가 단일 로컬 모델에선 불가하므로 적대성 무게가 (A)인스턴스 분리 +(B)기계적 게이트로 이전한다.
+# 아래는 그 *정직 표면화*용 read-only 메타 — gate/run_judge 판정 로직·#113 바·hollow #98 불변.
+
+
+class JudgeProfile(BaseModel):
+    """이 run의 judge/critic/빌더/brain *실행자 정체성* + 약-judge 정직 표기(WO#171-C, read-only).
+
+    "약-judge 런(judge_executor=local)은 강 독립 judge와 무결성 보장이 *다르다*"를 state/대시보드에
+    *은폐 아니라 표면화*한다. **판정이 아니라 표기** — verdict를 절대 바꾸지 않는다(기존 gate/run_judge
+    로직 불변). weak_judge=True면 적대성이 (A)빌더≠judge 인스턴스 분리 +(B)기계적 게이트로 이전됐다는
+    뜻(shadow로 그 약함을 *측정* 가능). 전부 optional·기본값 → 구버전 state read 무영향(추가형·비파괴).
+
+    brain/builder/judge/critic_executor: 각 역할의 실행자("codex"|"local"|"human").
+    judge_model:  judge가 쓴 모델명(local이면 로컬 서빙 모델, codex면 --judge-model/codex 기본).
+    weak_judge:   judge_executor=="local" (강 독립 judge가 아님 — 무결성 보장 다름).
+    shadow_judge: shadow 비교 judge 실행자("codex"|None). None=shadow OFF(100% 로컬·codex 흔적 0).
+    note:         사람용 정직 한 줄(예: "약-judge 런: 적대성=기계적 게이트+인스턴스 분리").
+    """
+
+    brain_executor: str = "codex"
+    builder_executor: str = "human"
+    judge_executor: str = "codex"
+    critic_executor: str = "codex"
+    judge_model: str | None = None
+    weak_judge: bool = False
+    shadow_judge: str | None = None
+    note: str | None = None
+
+
+class ShadowComparison(BaseModel):
+    """약 judge(적용 verdict 권위) vs 강 shadow judge(기록만)의 한 게이트 비교(WO#171-shadow, 적용 0).
+
+    `--shadow-judge codex`(opt-in)일 때만 누적된다. 약 judge가 *같은 산출물*을 판정해 verdict를
+    적용하고, codex가 *같은 workdir*를 shadow 판정해 **나란히 기록만** 된다(적용 0 — verdict 권위는
+    언제나 약 judge). 검증역전(inverted: 약=pass인데 강=fail)이 *약 self-judge가 어디서 봐주는지*
+    데이터다. locus는 그 역전이 LLM 판정 갭(흥미로운 신호)인지 기계 체크 차이(드문 비결정/flaky)인지
+    구분한다(#113 기계 신호는 결정적이라 보통 일치 — 역전은 LLM 쪽). shadow OFF면 빈 리스트(codex 0).
+
+    unit:            어느 게이트인지(유닛-id, None=통합/순차).
+    primary_verdict: 적용된 약(로컬) judge verdict.
+    shadow_verdict:  codex shadow judge verdict(기록만 — 적용 0).
+    inverted:        약=pass & 강=fail (검증역전 — 약 judge 관대 지점).
+    locus:           역전/차이 위치 "llm"|"mechanical"|"mixed"|None(차이 없음).
+    detail:          차이 난 check ac_id/요지(감사용 한 줄).
+    """
+
+    unit: str | None = None
+    primary_verdict: str
+    shadow_verdict: str
+    inverted: bool = False
+    locus: str | None = None
+    detail: str | None = None
+
+
 # ──────────────────────────── State ────────────────────────────
 
 
@@ -678,6 +735,12 @@ class State(BaseModel):
     #   대시보드가 이걸 source×tier×kind로 집계해 "토큰이 어디로 갔나"를 드릴다운한다.
     #   추가형·append-only — 기존 read 무영향, 부재(구버전 state)면 빈 리스트(graceful).
     cost_parts: list[Cost] = Field(default_factory=list)
+    # WO#171-C: 약-judge 정직 표기(judge/critic/빌더/brain 실행자 정체성 + weak_judge·shadow). read-only
+    #   메타 — verdict를 절대 바꾸지 않는다(기존 gate/run_judge 로직 불변). 부재(구버전/강-judge 런)면 None.
+    judge_profile: JudgeProfile | None = None
+    # WO#171-shadow: 약=적용·강=기록만(적용 0) 검증역전 누적. `--shadow-judge` opt-in일 때만 채워진다.
+    #   shadow OFF(기본)면 빈 리스트(100% 로컬·codex 흔적 0). 추가형·비파괴(구버전 state read 무영향).
+    shadow_comparisons: list[ShadowComparison] = Field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "State":

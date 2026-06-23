@@ -26,11 +26,11 @@ from haetae.providers.launch_options import read_codex_config
 from haetae.gate import CompositeGate
 from haetae.heartbeat import HeartbeatWriter
 from haetae.transcript import TranscriptWriter
-from haetae.llm import CodexClient
+from haetae.llm import CodexClient, LocalJudgeClient
 from haetae.loop import Executor, Gate, run_loop
 from haetae.llm import LLMClient
 from haetae.metering import MeteredClient
-from haetae.models import PlanState, ProjectSpec, State
+from haetae.models import JudgeProfile, PlanState, ProjectSpec, State
 
 # 기본 스킬 디렉토리 = 이 repo의 skills/ (src/haetae/run.py → parents[2] = repo 루트).
 _DEFAULT_SKILLS_DIR = str(Path(__file__).resolve().parents[2] / "skills")
@@ -78,6 +78,8 @@ def run(
     seeded: bool = False,
     reuse_manifest: dict | None = None,
     reuse: bool = True,
+    judge_profile=None,
+    shadow_sink=None,
 ) -> State:
     """주입된 brain/executor/gate로 루프를 한 번 완주하고 최종 State를 반환한다."""
     return run_loop(
@@ -93,6 +95,8 @@ def run(
         seeded=seeded,
         reuse_manifest=reuse_manifest,
         reuse=reuse,
+        judge_profile=judge_profile,   # WO#171-C: 약-judge 정직 표기(read-only 메타)
+        shadow_sink=shadow_sink,       # WO#171-shadow: 검증역전 누적기(opt-in, 적용 0)
         capabilities_on=capabilities_on,
         capability_registry_path=capability_registry_path,
         capability_allowlist=capability_allowlist,
@@ -244,6 +248,116 @@ def resolve_auto_config(args, config_path: str | Path | None = None) -> AutoConf
         warnings=warnings,
         summary=summary,
     )
+
+
+# ──────────────── WO#171: 완전-로컬 자급 모드 라우팅 (codex 경로 보존·fully-local 프리셋) ────────────────
+#
+# 새 thesis(강 모델 0): brain·builder·judge·critic을 전부 약 로컬 모델로 굴릴 수 있게 *역할별 실행자*를
+# 라우팅한다. **기본값은 전부 codex/human = 기존 동작 보존(1246 무회귀)** — codex 경로(CodexExecutor·
+# ALLOWED_SANDBOXES)는 *코드로 보존*되고 opt-out다. `--fully-local`은 새 thesis의 한-플래그 진입점
+# (네 역할 전부 local). shadow는 opt-in(기본 None). 순수 함수라 테스트가 배선을 *값으로* 단언한다.
+
+
+@dataclass
+class ExecutorWiring:
+    """역할별 실행자 + shadow 해석(--fully-local 프리셋 반영, WO#171). 명시 플래그가 프리셋을 이긴다.
+
+    brain:        합성/replan/scaffold LLM 실행자("codex"|"local").
+    builder:      유닛 빌더 executor("human"|"codex"|"local").
+    judge:        gate judge/run-judge 실행자("codex"|"local").
+    critic:       spec/decomp critic 실행자("codex"|"local").
+    shadow_judge: shadow 비교 judge("codex"|None — None=shadow OFF=100% 로컬·codex 흔적 0).
+    """
+
+    brain: str
+    builder: str
+    judge: str
+    critic: str
+    shadow_judge: str | None
+
+    @property
+    def fully_local(self) -> bool:
+        return (
+            self.brain == "local" and self.builder == "local"
+            and self.judge == "local" and self.critic == "local"
+        )
+
+    @property
+    def uses_codex(self) -> bool:
+        """이 배선이 codex를 *하나라도* 쓰나(shadow 포함). shadow OFF·완전-로컬이면 False(흔적 0)."""
+        return (
+            "codex" in (self.brain, self.builder, self.judge, self.critic)
+            or self.shadow_judge == "codex"
+        )
+
+
+def resolve_executor_wiring(args) -> ExecutorWiring:
+    """역할별 실행자를 해석한다(WO#171). **명시 플래그 > --fully-local(local) > 기본(codex/human)**.
+
+    --fully-local은 brain/judge/critic을 local로, builder(--executor)도 (명시 안 했으면) local로 민다.
+    기본값(미지정·fully-local OFF)은 전부 codex/human = 기존 동작 그대로(1246 무회귀·codex 경로 보존).
+    `--executor codex`처럼 명시한 builder는 fully-local에서도 존중(human은 fully-local서 local로 승격 —
+    완전-로컬은 사람 릴레이를 원치 않으므로). 순수 함수(테스트가 값으로 단언).
+    """
+    fl = bool(getattr(args, "fully_local", False))
+    brain = args.brain_executor or ("local" if fl else "codex")
+    judge = args.judge_executor or ("local" if fl else "codex")
+    critic = args.critic_executor or ("local" if fl else "codex")
+    builder = args.executor
+    if fl and builder == "human":
+        builder = "local"  # 완전-로컬: 미지정(기본 human) → local(사람 릴레이 비활성)
+    return ExecutorWiring(
+        brain=brain, builder=builder, judge=judge, critic=critic,
+        shadow_judge=args.shadow_judge,
+    )
+
+
+def _make_role_client(
+    kind: str,
+    *,
+    role: str,
+    model: str | None,
+    local_endpoint: str,
+    local_model: str,
+    idle_timeout: float | None,
+    max_duration: float | None,
+    stall_retries: int,
+    local_timeout: float,
+    heartbeat=None,
+    transcript=None,
+    default_call_kind: str | None = None,
+) -> LLMClient:
+    """역할(brain/judge/critic)의 LLMClient를 실행자 종류로 만든다(WO#171): codex→CodexClient, local→LocalJudgeClient.
+
+    **codex 경로 보존**: kind=="codex"면 기존 CodexClient 그대로(불변). kind=="local"이면 약-judge
+    클라이언트(LocalJudgeClient) — *같은 LLMClient judge 슬롯*에 꽂힌다(판정 로직 불변, CodexClient 동격).
+    빌더(executor)는 이 함수가 아니라 LocalAgentExecutor/CodexExecutor 경로로 만들어진다(빌더≠judge 분리).
+    """
+    if kind == "local":
+        return LocalJudgeClient(
+            endpoint=local_endpoint, model=local_model, role=role,
+            timeout=local_timeout, heartbeat=heartbeat, transcript=transcript,
+            default_call_kind=default_call_kind or role,
+        )
+    return CodexClient(
+        model=model, idle_timeout=idle_timeout, max_duration=max_duration,
+        stall_retries=stall_retries, heartbeat=heartbeat, transcript=transcript,
+        default_call_kind=default_call_kind,
+    )
+
+
+def _judge_profile_note(wiring: ExecutorWiring) -> str:
+    """약-judge 런 정직 한 줄(WO#171-C). weak_judge면 적대성 이전(인스턴스 분리+기계 게이트)을 명시."""
+    if wiring.judge == "local":
+        base = (
+            "약-judge 런(judge=local): 강 독립 judge와 무결성 보장 다름 — 적대성=빌더≠judge "
+            "인스턴스 분리 + 기계적 게이트(결정적 사실 주력). 바 불완화·gate 판정 로직 불변."
+        )
+    else:
+        base = "강-judge 런(judge=codex): 독립 모델 적대 판정."
+    if wiring.shadow_judge:
+        base += f" shadow={wiring.shadow_judge}(약=적용·강=기록만, 검증역전 측정·적용 0)."
+    return base
 
 
 # ──────────────────── WO#58: 이어가기(②a) — 부모 해석·시딩·계보 ────────────────────
@@ -644,6 +758,43 @@ def main(argv: list[str] | None = None) -> int:
             "없으면 critic OFF(추가 비용 0, 기존 동작 불변)"
         ),
     )
+    # ── WO#171: 완전-로컬 자급 모드(새 thesis: 강 모델 0) — 역할별 실행자 라우팅 + shadow 관측 ──
+    parser.add_argument(
+        "--fully-local",
+        action="store_true",
+        default=False,
+        help=(
+            "완전-로컬 자급 모드(새 thesis: 강 모델 0). brain·builder·judge·critic을 *전부* 약 로컬 "
+            "모델로 라우팅하는 한-플래그 프리셋(brain/judge/critic-executor=local + executor=local). "
+            "**기본 OFF = 기존 codex 경로 보존(불변·opt-out)**. 명시 역할 플래그가 프리셋을 오버라이드. "
+            "shadow OFF(기본)면 codex 흔적 0(thesis 순수). 적대성=빌더≠judge 인스턴스 분리 + 기계적 "
+            "게이트(바 불완화 아님 — 같은 gate에 약 모델만 꽂음)."
+        ),
+    )
+    parser.add_argument(
+        "--brain-executor", choices=["codex", "local"], default=None,
+        help="합성/replan/scaffold LLM 실행자(기본: codex; --fully-local이면 local). codex 경로 보존.",
+    )
+    parser.add_argument(
+        "--judge-executor", choices=["codex", "local"], default=None,
+        help=(
+            "gate judge/run-judge 실행자(기본: codex; --fully-local이면 local). local=약-judge"
+            "(LocalJudgeClient — 빌더와 다른 인스턴스/역할/시드, 적대 프롬프트 유지). **gate 판정 로직·"
+            "바 불변** — 약 모델을 *같은 judge 슬롯*에 꽂을 뿐. 약함은 --shadow-judge로 측정."
+        ),
+    )
+    parser.add_argument(
+        "--critic-executor", choices=["codex", "local"], default=None,
+        help="spec/decomp critic 실행자(기본: codex; --fully-local이면 local). local이면 critic ON.",
+    )
+    parser.add_argument(
+        "--shadow-judge", choices=["codex"], default=None,
+        help=(
+            "shadow 비교 관측(opt-in·기본 OFF·적용 0). 약 judge가 verdict 권위로 *적용*되고 codex가 "
+            "*같은 산출물*을 shadow 판정해 **나란히 기록만**(검증역전=약pass·강fail 누적) → 약 self-judge가 "
+            "어디서 봐주는지 *측정*. OFF면 codex 흔적 0. shadow=관측이지 적용 아님(verdict 권위는 약 judge)."
+        ),
+    )
     parser.add_argument(
         "--decomp-critic",
         action=argparse.BooleanOptionalAction,
@@ -971,6 +1122,9 @@ def main(argv: list[str] | None = None) -> int:
 
     pricing = _load_pricing(args.pricing)
 
+    # WO#171: 역할별 실행자 배선 해석(--fully-local 프리셋 + 명시 플래그). 기본 전부 codex/human(무회귀).
+    wiring = resolve_executor_wiring(args)
+
     # WO#65: --auto → 미설정 운영 knob 자동 해석(거버넌스 게이트는 비-자동). 명시 플래그는 그대로.
     #   auto_cfg가 tier 사다리/critic-model을 결정하고, summary/warnings를 투명하게 노출한다.
     auto_cfg = resolve_auto_config(args) if args.auto else None
@@ -981,7 +1135,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"… ⚠ {w}", file=sys.stderr, flush=True)
     # critic 배선: auto면 강제 ON(critic 절대 OFF 아님), 아니면 --critic-model 게이트(기존 동작).
     effective_critic_model = auto_cfg.critic_model if auto_cfg is not None else args.critic_model
-    critic_on = bool(auto_cfg is not None) or bool(args.critic_model)
+    # WO#171: critic-executor=local(완전-로컬)이면 critic ON(약 critic으로 적대 비평 유지).
+    critic_on = bool(auto_cfg is not None) or bool(args.critic_model) or (wiring.critic == "local")
 
     # WO#54: idle(무진행) timeout을 모든 codex 클라이언트에 건다. brain(합성/replan/scaffold)과
     #   executor(빌드)는 *필수* → stall_retries=1(bounded 재시도 후 escalate). judge/critic은
@@ -1004,21 +1159,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.state_path else None
     )
 
-    client = CodexClient(
-        model=args.model, idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
-        heartbeat=heartbeat, transcript=transcript,
+    # WO#171: brain(합성/replan/scaffold)도 역할별 라우팅 — codex(기본·보존) 또는 local(완전-로컬).
+    #   stall_retries는 codex에서만 의미(필수 호출). local이면 LocalJudgeClient(오류 시 빈 출력 degrade).
+    client = _make_role_client(
+        wiring.brain, role="synth", model=args.model,
+        local_endpoint=args.local_endpoint, local_model=args.local_model,
+        idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
+        local_timeout=args.local_timeout, heartbeat=heartbeat, transcript=transcript,
     )
 
     # judge LLM 비용 계측(WO#34): judge client를 passthrough MeteredClient로 감싼다.
     # complete 결과를 그대로 통과시키므로 gate 검증 *행동*은 불변 — 비용만 기록된다.
     # gate가 호출마다 이 client를 드레인해 GateResult.judge_cost로 노출하고, 루프가
     # event.cost/budget에 합산한다. judge_model이 없으면 codex 기본(모델 미상→usd=null).
+    # WO#171: judge도 역할별 라우팅 — codex(기본·보존) 또는 local(약-judge LocalJudgeClient). 어느
+    #   쪽이든 *같은 judge 슬롯*(MeteredClient→CompositeGate.judge_client)에 꽂힌다(gate 판정 로직 불변).
     def make_judge_client() -> LLMClient:
         return MeteredClient(
-            CodexClient(
-                model=args.judge_model, idle_timeout=idle_to, max_duration=max_dur,
+            _make_role_client(
+                wiring.judge, role="judge", model=args.judge_model,
+                local_endpoint=args.local_endpoint, local_model=args.local_model,
+                idle_timeout=idle_to, max_duration=max_dur,
                 stall_retries=0,  # best-effort: 멈추면 degrade(skipped→ambiguous, 가짜 pass 금지)
-                heartbeat=heartbeat, transcript=transcript,
+                local_timeout=args.local_timeout, heartbeat=heartbeat, transcript=transcript,
             ),
             source="judge", pricing=pricing,
         )
@@ -1032,7 +1195,8 @@ def main(argv: list[str] | None = None) -> int:
         install_deps=args.install_deps,
         install_timeout=args.install_timeout,
     )
-    if args.executor == "codex":
+    # WO#171: 빌더 실행자는 wiring.builder(--fully-local 프리셋 반영). 기본 human(무회귀).
+    if wiring.builder == "codex":
         # 자율 쓰기 실행 — gate와 같은 --workdir로 범위 한정.
         # reasoning_effort: 미설정(None)이면 codex 기본(medium) 그대로(후방호환).
         executor: Executor = CodexExecutor(
@@ -1041,10 +1205,11 @@ def main(argv: list[str] | None = None) -> int:
             idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
             heartbeat=heartbeat, transcript=transcript,
         )
-    elif args.executor == "local":
+    elif wiring.builder == "local":
         # WO#137: 약한 로컬 모델 빌더(OpenAI 호환 엔드포인트, #136 GB10 llama.cpp).
-        # **빌더 전용** — judge는 위 make_judge_client()(강한 codex), critic은 critic_client
-        # (강한 codex) 경로 그대로다(적대 분리 불변). 로컬 모델은 *판정*에 절대 안 닿는다.
+        # **빌더 ≠ judge 인스턴스 분리(WO#171-A)**: LocalAgentExecutor는 run()만(complete 無)이라
+        # judge 슬롯에 못 끼운다. judge가 local이어도(완전-로컬) judge는 *다른 인스턴스*
+        # (LocalJudgeClient — 다른 역할/시드/적대 프롬프트)다. 빌더 출력은 judge에 재사용되지 않는다.
         executor = LocalAgentExecutor(
             endpoint=args.local_endpoint, model=args.local_model,
             workdir=args.workdir, max_turns=args.local_max_turns,
@@ -1069,14 +1234,14 @@ def main(argv: list[str] | None = None) -> int:
     executor_factory = None
     gate_factory = None
     if args.max_parallel > 1:
-        if args.executor == "codex":
+        if wiring.builder == "codex":
             # tier-aware(2-arg): 루프가 그 시도의 Tier를 넘긴다(단일 tier면 사다리 0번 = 기존값).
             executor_factory = lambda wt, tier: CodexExecutor(
                 model=tier.model, workdir=wt, reasoning_effort=tier.reasoning_effort,
                 idle_timeout=idle_to, max_duration=max_dur, stall_retries=1,
                 heartbeat=heartbeat, transcript=transcript,
             )
-        elif args.executor == "local":
+        elif wiring.builder == "local":
             # WO#137 빌더 전용(1-arg=후방호환). 로컬 엔드포인트는 단일 모델을 서빙하므로
             # tier model override는 적용 안 한다(설정된 endpoint/model 재사용). 판정 무접촉.
             executor_factory = lambda wt: LocalAgentExecutor(
@@ -1099,14 +1264,64 @@ def main(argv: list[str] | None = None) -> int:
     # 없으면 None → critic OFF(추가 비용 0, 기존 동작 불변).
     # WO#65: --auto면 critic 강제 ON(절대 OFF 아님 — decomp critic/OR 살림). effective_critic_model이
     #   None이면 codex 기본(최신)으로 돈다. 빌더 model과 분리 못 하면 위에서 독립성 경고를 냈다.
+    # WO#171: critic도 역할별 라우팅 — codex(기본·보존) 또는 local(약 critic, critic-executor=local이면 ON).
     critic_client = (
-        CodexClient(
-            model=effective_critic_model, idle_timeout=idle_to, max_duration=max_dur,
+        _make_role_client(
+            wiring.critic, role="critic", model=effective_critic_model,
+            local_endpoint=args.local_endpoint, local_model=args.local_model,
+            idle_timeout=idle_to, max_duration=max_dur,
             stall_retries=0,  # best-effort: 멈추면 진행(critic은 advisory)
-            heartbeat=heartbeat, transcript=transcript, default_call_kind="critic",
+            local_timeout=args.local_timeout, heartbeat=heartbeat, transcript=transcript,
+            default_call_kind="critic",
         )
         if critic_on else None
     )
+
+    # WO#171: shadow 비교 관측(opt-in·적용 0). 약 judge(적용) 옆에 codex shadow judge(기록만)를 단다.
+    #   gate + gate_factory를 ShadowComparingGate로 감싸 검증역전(약pass·강fail)을 sink에 누적한다
+    #   (verdict 권위 불변 — primary 약 judge만 적용). shadow OFF(기본)면 이 블록 skip = codex 흔적 0
+    #   (완전-로컬이면 thesis 순수). shadow gate는 같은 workdir를 codex로 *재판정*만 한다(판정 로직 불변).
+    shadow_sink = None
+    if wiring.shadow_judge:
+        from haetae.shadow import ShadowComparingGate, ShadowSink
+
+        shadow_sink = ShadowSink()
+
+        def _make_shadow_gate(wd) -> Gate:
+            return CompositeGate(
+                workdir=wd,
+                judge_client=MeteredClient(
+                    _make_role_client(
+                        wiring.shadow_judge, role="judge", model=args.judge_model,
+                        local_endpoint=args.local_endpoint, local_model=args.local_model,
+                        idle_timeout=idle_to, max_duration=max_dur, stall_retries=0,
+                        local_timeout=args.local_timeout, heartbeat=heartbeat, transcript=transcript,
+                    ),
+                    source="shadow", pricing=pricing,
+                ),
+                run_timeout=args.run_timeout,
+                install_deps=args.install_deps, install_timeout=args.install_timeout,
+            )
+
+        gate = ShadowComparingGate(gate, _make_shadow_gate(args.workdir), shadow_sink)
+        if gate_factory is not None:
+            _primary_gf = gate_factory
+            gate_factory = lambda wt: ShadowComparingGate(
+                _primary_gf(wt), _make_shadow_gate(wt), shadow_sink
+            )
+
+    # WO#171-C: 약-judge 정직 표기(judge/critic/빌더/brain 실행자 정체성 + weak·shadow). read-only 메타 —
+    #   verdict를 절대 바꾸지 않는다(gate/run_judge 로직 불변). 약-judge면 stderr로도 한 줄 정직 경고.
+    judge_profile = JudgeProfile(
+        brain_executor=wiring.brain, builder_executor=wiring.builder,
+        judge_executor=wiring.judge, critic_executor=wiring.critic,
+        judge_model=(args.local_model if wiring.judge == "local" else args.judge_model),
+        weak_judge=(wiring.judge == "local"),
+        shadow_judge=wiring.shadow_judge,
+        note=_judge_profile_note(wiring),
+    )
+    if wiring.judge == "local":
+        print(f"… ⚠ {judge_profile.note}", file=sys.stderr, flush=True)
 
     # 선제 스캐폴드(WO#27): --scaffold(기본 on)면 brain client를 scaffold 생성에 재사용.
     # --no-scaffold면 None → 스캐폴드 OFF(기존 동작 그대로). 생성기는 dep 스택 필요할 때만
@@ -1256,6 +1471,8 @@ def main(argv: list[str] | None = None) -> int:
                 if args.capabilities else None
             ),
             capability_searcher=capability_searcher,  # F.2: opt-in 원격 발견(off면 None)
+            judge_profile=judge_profile,               # WO#171-C: 약-judge 정직 표기(read-only 메타)
+            shadow_sink=shadow_sink,                   # WO#171-shadow: 검증역전 누적기(opt-in, 적용 0)
         )
     except KeyboardInterrupt:
         print("중단됨 (사용자 stop/SIGINT)", file=sys.stderr, flush=True)

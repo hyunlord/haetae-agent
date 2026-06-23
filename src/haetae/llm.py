@@ -72,7 +72,12 @@ from haetae.providers.codex import (  # noqa: E402
     CodexUsageLimitError,
 )
 
+# WO#171: 로컬 judge/critic 클라이언트 재노출(local_agent도 llm을 import하지 않아 순환 없음).
+# LLMClient(complete) 프로토콜을 충족하는 약-judge 클라이언트 — CodexClient와 같은 judge 슬롯에
+# 꽂힌다(빌더 LocalAgentExecutor와 다른 클래스 = 인스턴스 분리). 빌더는 여전히 complete()가 없다.
+from haetae.providers.local_agent import LocalJudgeClient  # noqa: E402
+
 __all__ = [
     "LLMClient", "MockClient", "CodexClient", "CodexError", "CodexStalled",
-    "CodexUsageLimitError",
+    "CodexUsageLimitError", "LocalJudgeClient",
 ]

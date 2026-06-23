@@ -1273,3 +1273,134 @@ def _accumulate_tokens(
     if usage.output_tokens is not None:
         agg_out = (agg_out or 0) + usage.output_tokens
     return agg_in, agg_out
+
+
+# ──────────────── WO#171: 로컬 judge/critic 클라이언트 (빌더 ≠ judge 인스턴스 분리, point A) ────────────────
+#
+# 완전-로컬 자급 모드(WO#171): 빌더뿐 아니라 judge·critic도 약한 로컬 모델로 굴린다. judge≠builder
+# *독립 모델* 분리가 단일 로컬 모델에선 불가하므로 적대성 무게가 (A)빌더≠judge *인스턴스* 분리로
+# 이전한다. LocalJudgeClient는 LocalAgentExecutor(빌더)와 **다른 클래스**이고: complete()를 갖고
+# (LLMClient 프로토콜 — 빌더는 run()만, complete 無), *적대적 judge/run-judge 프롬프트*(caller가 읽어
+# 넘김 — 이 클라이언트는 판정 엔진을 import하지 않는다)를 system으로 받으며(빌더의 _BUILDER_SYSTEM
+# 아님 — #15 적대 보존), caller(LLMJudge)가 주는 *산출 파일 +
+# run 증거*를 user로 받아 빌더 chat 이력을 *재사용하지 않는다*. 빌더와 *다른 생성 시드/temperature*로
+# 샘플링을 decorrelate한다. **판정 로직 불변** — 약 모델을 *같은 judge 슬롯*(CodexClient 동격)에 꽂을
+# 뿐 바를 낮추지 않는다. 약 judge의 무결성 약함은 shadow 비교로 *측정*(은폐 아니라 표면화).
+
+# 역할별 고정 생성 seed(빌더와·서로 decorrelate). 빌더(_chat)는 seed 미전송(서버 기본)이고, judge/critic은
+# 명시 seed로 *다른* 샘플링 스트림을 탄다. 값 자체는 임의(안정성만 필요·WO#171 유래) — 분리 단언용.
+_ROLE_SEEDS = {"judge": 11171, "critic": 21171}
+
+
+class LocalJudgeClient:
+    """약한 로컬 모델(OpenAI 호환 엔드포인트)을 *judge/critic*로 쓰는 LLMClient(WO#171, 빌더≠judge 분리).
+
+    LocalAgentExecutor(빌더)와 **다른 클래스·다른 인스턴스**다(point A 인스턴스 분리):
+      - complete(system, user)를 구현(LLMClient) — 빌더는 run()만(complete 無 → judge 슬롯에 못 끼움).
+      - system = caller가 주는 *적대적 judge/run-judge 프롬프트*(LLMJudge가 읽어 넘김 — 이 클라이언트는
+        판정 엔진 코드를 import하지 않는다) — _BUILDER_SYSTEM 아님(#15 적대 보존).
+      - user = caller(LLMJudge)가 주는 *산출 파일 + run 증거* — 빌더의 chat 이력을 *재사용하지 않는다*.
+      - 빌더와 다른 seed(역할별 고정)·temperature(greedy 기본) — 샘플링 decorrelate("자기 통과" 최소 차단).
+    **판정 로직 불변**: judge_client 슬롯에 꽂히는 LLMClient일 뿐(CodexClient와 동격) — gate/run-judge가
+    이걸 부르는 *방식*·바는 codex와 동일. 약 judge의 약함은 shadow 비교로 측정한다.
+
+    degrade(가짜 pass 금지): 엔드포인트 오류/stall이면 complete가 *빈 문자열*을 반환 → judge.py가 파싱
+    실패로 보고 그 기준들을 skipped→ambiguous→escalate시킨다(#54 degrade 동형). judge.py를 *건드리지
+    않고* 빈 출력만으로 같은 degrade를 얻는다(판정 로직 불변·가짜 pass 절대 아님).
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        *,
+        role: str = "judge",
+        seed: int | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+        timeout: float = 300.0,
+        heartbeat=None,
+        transcript=None,
+        default_call_kind: str | None = None,
+    ):
+        self.endpoint = endpoint
+        self.model = model
+        self.role = role
+        # 빌더와·서로 decorrelate되는 역할별 생성 seed(명시 우선, 없으면 역할 기본).
+        self.seed = seed if seed is not None else _ROLE_SEEDS.get(role, 11171)
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.heartbeat = heartbeat
+        self.transcript = transcript
+        self.default_call_kind = default_call_kind or role
+        # 직전 호출 token usage(WO#33 동형 — 미노출/오류면 None, 날조 금지). MeteredClient가 읽는다.
+        self.last_usage: Usage | None = None
+        self.last_error: str | None = None
+
+    # ── LLMClient 인터페이스 ──────────────────────────────────────────
+    def complete(self, system: str, user: str, **opts) -> str:
+        """적대적 judge 프롬프트(system) + 산출 증거(user)로 로컬 모델을 1회 호출해 raw 텍스트 반환.
+
+        인스턴스 분리: system은 빌더의 _BUILDER_SYSTEM이 아니라 caller가 주는 *적대 프롬프트*이고,
+        seed/temperature가 빌더와 다르다(빌더 chat 출력 재사용 안 함). 엔드포인트 오류/stall이면 빈
+        문자열 → judge.py가 파싱 실패→skipped→ambiguous로 degrade(가짜 pass 금지·판정 로직 불변).
+        """
+        self.last_usage = None
+        self.last_error = None
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system or ""},
+                {"role": "user", "content": user or ""},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            # 빌더(seed 미전송)와 *다른* 명시 시드 — 같은 모델이라도 샘플링 스트림 분리(인스턴스 분리 단언).
+            "seed": self.seed,
+        }
+        hb_handle = self._hb_start()
+        try:
+            resp = post_chat(self.endpoint, payload, self.timeout)
+        except LocalAgentError as e:
+            # degrade(#54 동형): 빈 출력 → judge.py 파싱 실패 → skipped → ambiguous → escalate.
+            # **가짜 pass 절대 아님** — judge.py를 건드리지 않고 같은 degrade를 얻는다(판정 로직 불변).
+            self.last_error = str(e)
+            return ""
+        finally:
+            self._hb_finish(hb_handle)
+        text = _message_text(resp)
+        self.last_usage = _usage_from_resp(resp, self.model)
+        self._tr_output(text)
+        return text
+
+    # 텔레메트리(duck-typed, best-effort — 절대 호출을 죽이지 않는다; #55/#67 패턴).
+    def _hb_start(self):
+        if self.heartbeat is None:
+            return None
+        try:
+            kind, unit = self.heartbeat.get_context()
+        except Exception:  # noqa: BLE001
+            kind, unit = None, None
+        try:
+            return self.heartbeat.start(kind or self.default_call_kind, unit, idle_timeout=None)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _hb_finish(self, handle) -> None:
+        if self.heartbeat is None or handle is None:
+            return
+        try:
+            self.heartbeat.finish(handle)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _tr_output(self, text: str) -> None:
+        if self.transcript is None or not text:
+            return
+        try:
+            tr_id = self.transcript.start(kind=self.default_call_kind, unit=None, input_text="")
+            self.transcript.output(tr_id, text)
+            self.transcript.finish(tr_id, "done")
+        except Exception:  # noqa: BLE001
+            pass
