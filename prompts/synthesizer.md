@@ -89,11 +89,11 @@ acceptance_criteria:
   - id: ac1
     desc: "저장 모델이 할 일을 JSON으로 영속화한다(라운드트립)"
     unit: u1
-    check: { type: test, cmd: "python -m pytest -k storage" }
+    check: { type: test, cmd: "python -m pytest tests/test_store.py" }
   - id: ac2
     desc: "add/complete/list가 end-to-end로 동작한다"
     unit: integration
-    check: { type: test, cmd: "python -m pytest -k cli_e2e" }
+    check: { type: test, cmd: "python -m pytest tests/test_cli.py" }
 assumptions:
   - { id: as1, text: "데이터는 로컬 JSON 파일에 저장", confidence: 0.7, checkpoint: false }
 non_goals:
@@ -116,6 +116,9 @@ check 없는 기준은 기준이 아니다. `check.type`은
 check를 *기계로* 만들 수 없으면, 그 항목의 type을 `human`으로 두고
 spec 최상위 `verifiability`를 그에 맞게 낮춰라(`objective` → `judge` 또는 `human_checkpoint`).
 = "이건 자동 종료가 불가능하다"는 신호다.
+
+**테스트 cmd는 발견 가능해야 한다(findability)**: `pytest` cmd는 **테스트 파일/디렉토리** 대상으로 하라
+(예: `pytest tests/test_store.py`) — 안 쓴 테스트명을 추측한 `-k <키워드>`는 0개 발견(exit 5)으로 완주를 막는다.
 
 **동적/런타임 행동에 정확성이 달린 요구는 반드시 `run` 기준을 포함하라.**
 요구가 *움직임·실시간 갱신·에이전트 행동·인터랙션·애니메이션·"자연스럽게 동작"* 같은

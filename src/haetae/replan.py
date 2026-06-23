@@ -11,12 +11,40 @@ from pathlib import Path
 import yaml
 
 from haetae.llm import LLMClient
-from haetae.models import CheckType, Decision, ProjectSpec, State
+from haetae.models import Action, CheckType, Decision, ProjectSpec, State
 from haetae.parsing import ParseError, parse_yaml_model
 
 DEFAULT_PROMPT_PATH = "prompts/replan.md"
 
 _CHECK_TYPES = {t.value for t in CheckType}
+
+
+def degenerate_next_order(decision: Decision | None) -> str | None:
+    """action이 next_order/retry인데 next_order 본문이 *비었으면* 재프롬프트용 피드백을 반환한다(WO#172).
+
+    #171 라이브: 약 brain replan이 action은 next_order/retry로 내고 *next_order 본문(unit·goal)을 비워*
+    루프가 즉시 escalate("next_order 본문 없음")하던 실패. 이건 **빈 산출**(파싱은 됨, 본문 부실)이지
+    #54 idle(침묵)이 *아니다* — 그래서 파싱 실패(ReplanError)와 *동형*으로 에러-피드백 재프롬프트(#31)로
+    흡수한다. 빈 = next_order None / unit blank / goal blank. 정상이면 None.
+
+    **판정 아님** — brain 산출 *품질* 가드(director-side). gate/run_judge 무접촉. 반환 피드백은 다음
+    replan 시도의 user 메시지에 얹혀 약 brain이 *완전한* next_order를 내도록 유도한다.
+    """
+    if decision is None or decision.action not in (Action.next_order, Action.retry):
+        return None
+    no = decision.next_order
+    if no is None:
+        return (
+            "action을 next_order/retry로 냈는데 next_order 본문이 비었다(null). "
+            "완전한 next_order(unit·goal 필수, 가능하면 local_checks·deliverable 포함)를 담아 "
+            "Decision YAML을 다시(그리고 그것만) 출력하라."
+        )
+    if not (no.unit or "").strip() or not (no.goal or "").strip():
+        return (
+            "next_order의 unit 또는 goal이 비었다. 둘 다 채운 *완전한* next_order를 담아 "
+            "Decision YAML을 다시(그리고 그것만) 출력하라."
+        )
+    return None
 
 
 class ReplanError(ParseError):

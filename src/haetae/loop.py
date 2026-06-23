@@ -100,7 +100,7 @@ from haetae.or_node import (
     is_fixated,
     summarize_gate_evidence,
 )
-from haetae.replan import ReplanError, replan
+from haetae.replan import ReplanError, degenerate_next_order, replan
 from haetae.scheduler import all_done, is_disjoint_from, ready_units
 from haetae.skills import Skill, inject_skills, load_skills, match_skills
 from haetae.spec_change import apply_spec_change
@@ -354,6 +354,58 @@ def _escalated_no_spec(reason: str, raw_response: str | None) -> State:
         status=Status.escalated,
         pending_escalations=[note],
     )
+
+
+# ──────────────── WO#172: replan 빈-산출 결정적 fallback (약 brain 받치기) ────────────────
+#
+# #171 라이브: 약 brain replan이 *빈 next_order*를 내 즉시 escalate("next_order 본문 없음")로 막힘.
+# fix: 빈 산출은 먼저 에러-피드백 재프롬프트(#31, replan_retries 내)로 흡수하고, 그래도 비면 escalate로
+# *조용히 막히는 대신* pinned spec에서 work order를 결정적으로 합성해 진행한다. **봐주기 아님** — fallback은
+# 빌더 가이드(work order)일 뿐, 독립 게이트가 결과를 판정한다(done 기준·#113 바·gate 판정 로직 불변).
+
+
+def _is_degenerate_order(no) -> bool:
+    """NextOrder가 비었나(None / unit blank / goal blank) — WO#172 fallback 판정용(순수)."""
+    if no is None:
+        return True
+    return not (getattr(no, "unit", "") or "").strip() or not (getattr(no, "goal", "") or "").strip()
+
+
+def _fallback_order(spec: ProjectSpec, unit: str | None) -> NextOrder | None:
+    """약 brain이 빈 next_order만 낼 때 *고정 spec*에서 결정적으로 work order를 합성한다(WO#172 fallback).
+
+    pinned spec의 그 유닛 데이터(desc·scope·acceptance_criteria의 체크)로 work order를 구성한다.
+    **봐주기 아님**: 빌더 가이드일 뿐 — 독립 게이트가 결과를 판정한다(바·done 기준 불변). 유닛이 spec에
+    없으면 None(호출부가 기존 escalate). NextOrder.unit은 호출부가 권위적으로 다시 고정한다.
+    """
+    if not unit:
+        return None
+    du = next((u for u in spec.decomposition if u.unit == unit), None)
+    if du is None:
+        return None
+    # 이 유닛 태그된 acceptance_criteria의 체크를 local_checks로(빌더 자기검사가 미러 — #144).
+    checks = [ac.check for ac in spec.acceptance_criteria if ac.unit == unit and ac.check.cmd]
+    scope = "; ".join(du.scope) if du.scope else None
+    return NextOrder(
+        unit=unit,
+        goal=(du.desc or f"{unit} 구현").strip(),
+        scope=scope,
+        local_checks=checks,
+        deliverable="변경/생성한 파일",
+    )
+
+
+def _fallback_target_unit(
+    state: State, worked_unit: str | None, in_flight: set[str] | None = None
+) -> str | None:
+    """순차 경로 fallback 대상 유닛(WO#172): 직전 작업 유닛이 미완이면 그걸(재시도), 아니면 첫 ready."""
+    if worked_unit and any(
+        p.unit == worked_unit and p.state in (PlanState.pending, PlanState.in_progress)
+        for p in state.plan
+    ):
+        return worked_unit
+    r = ready_units(state.plan, in_flight or set())
+    return r[0] if r else None
 
 
 def _advance_done(state: State, unit: str) -> None:
@@ -1208,16 +1260,23 @@ def run_loop(
                             spec, state, last_result, m_client,
                             prompt_path=rep_prompt, feedback=feedback,
                         )
-                        break
                     except ReplanError as e:
                         last_err = e
                         feedback = e.message  # raw는 빼고 검증 메시지만 다시 태운다
+                        continue
+                    # WO#172: 파싱은 됐는데 next_order 본문이 비면(약 brain 슬립) 파싱 실패와 *동형*으로
+                    #   에러-피드백 재프롬프트(#31). 재시도 소진 후에도 비면 아래서 결정적 fallback.
+                    deg = degenerate_next_order(decision)
+                    if deg is not None and _attempt < replan_retries:
+                        feedback = deg
+                        continue
+                    break
                 # 파싱 소진 / 분해 critic 비대상 action(next_order/retry 아님) → 그대로 채택.
                 if decision is None or decision.action not in (Action.next_order, Action.retry):
                     break
                 no_candidate = decision.next_order
-                if no_candidate is None:
-                    break  # 본문 없음 → 아래 action 처리에서 방어 escalate
+                if _is_degenerate_order(no_candidate):
+                    break  # WO#172: 본문 빈 → critic 건너뛰고 아래 action 처리서 fallback-or-escalate
                 crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입 원본
                 if crit is None or not is_weak(crit):
                     break  # progress(또는 OFF/평가불가) → 이 분해 채택
@@ -1259,13 +1318,20 @@ def run_loop(
 
             if action in (Action.next_order, Action.retry):
                 no = decision.next_order
-                if no is None:
-                    # 방어: next_order/retry인데 본문이 없음 → 사람 tier로 올림
-                    state.status = Status.escalated
-                    state.pending_escalations.append(
-                        {"reason": "next_order 본문 없음", "action": action.value}
-                    )
-                    break
+                if _is_degenerate_order(no):
+                    # WO#172: 재프롬프트(#31) 후에도 빈 next_order → escalate로 *조용히 막히는 대신*
+                    #   pinned spec서 결정적 fallback work order 합성해 진행(봐주기 아님 — 게이트가 판정).
+                    fb = _fallback_order(spec, _fallback_target_unit(state, worked_unit))
+                    if fb is not None:
+                        emit(f"replan 빈 산출 → 결정적 fallback work order 합성: {fb.unit}")
+                        no = fb
+                    else:
+                        # 빌드할 pending 유닛 없음 → 기존 방어 escalate(조용한 정체 아님 — 명시 escalate).
+                        state.status = Status.escalated
+                        state.pending_escalations.append(
+                            {"reason": "next_order 본문 없음", "action": action.value}
+                        )
+                        break
                 # WO#25 Part A: brain이 다른 유닛으로 넘어가면 직전 작업 유닛을 수용(done).
                 # dispatch하는 유닛은 in_progress. (gate/replan/종료 로직은 불변 — plan state만.)
                 if worked_unit is not None and worked_unit != no.unit:
@@ -1708,15 +1774,21 @@ def _parallel_loop(
                 try:
                     decision = replan(spec, state, ctx, client,
                                       prompt_path=rep_prompt, feedback=feedback)
-                    break
                 except ReplanError as e:
                     last_err = e
                     feedback = e.message
+                    continue
+                # WO#172: 빈 next_order도 파싱 실패와 동형으로 에러-피드백 재프롬프트(#31). 소진 후엔 fallback.
+                deg = degenerate_next_order(decision)
+                if deg is not None and attempt < replan_retries:
+                    feedback = deg
+                    continue
+                break
             if decision is None or decision.action not in (Action.next_order, Action.retry):
                 break
             no_candidate = decision.next_order
-            if no_candidate is None:
-                break
+            if _is_degenerate_order(no_candidate):
+                break  # WO#172: 본문 빈 → critic 건너뛰고 아래서 fallback-or-escalate
             no_candidate.unit = unit  # 스케줄러 권위 — critic도 올바른 unit으로 본다
             crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입
             if crit is None or not is_weak(crit):
@@ -1746,12 +1818,18 @@ def _parallel_loop(
         action = decision.action
         if action in (Action.next_order, Action.retry):
             no = decision.next_order
-            if no is None:
-                account(orch_cost_of.pop(unit, None))
-                terminal = "escalated"
-                state.pending_escalations.append(
-                    {"reason": "next_order 본문 없음", "unit": unit})
-                return None
+            if _is_degenerate_order(no):
+                # WO#172: 재프롬프트(#31) 후에도 빈 → pinned spec서 결정적 fallback(유닛은 스케줄러가 정함).
+                fb = _fallback_order(spec, unit)
+                if fb is not None:
+                    emit(f"replan 빈 산출 → 결정적 fallback work order 합성: {unit}")
+                    no = fb
+                else:
+                    account(orch_cost_of.pop(unit, None))
+                    terminal = "escalated"
+                    state.pending_escalations.append(
+                        {"reason": "next_order 본문 없음", "unit": unit})
+                    return None
             no.unit = unit  # 스케줄러 권위 — 어떤 unit인지는 스케줄러가 정한다
             last_approach[unit] = no.goal  # OR 접근 추적(다음 실패 시 폐기/대안 피드백에 사용)
             emit(f"작업 실행 중: {unit} — {_truncate(no.goal)}")

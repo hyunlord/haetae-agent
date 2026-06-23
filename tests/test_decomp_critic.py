@@ -327,11 +327,14 @@ def test_decomposition_prompts_stay_concise():
     파일-소유권 겹침 축(#59 synthesis-time와 역할 분리)은 통합 머지-충돌→직렬화→escalate 직격이라
     ceiling 소폭 상향(syn 388→392·dc 93→102) — *기준만*(새 필드 0·서사 없이·콜 회귀 0 의도).
     WO#166: 분해 전 research 단계(pipeline-strengthening B)가 synthesizer.md에 *리서치 브리프 소비*
-    지침(제안이지 mandate 아님·override 가능)을 더해 ceiling 소폭 상향(syn 392→397) — *기준만*."""
+    지침(제안이지 mandate 아님·override 가능)을 더해 ceiling 소폭 상향(syn 392→397) — *기준만*.
+    WO#172: 합성 findability 정렬(테스트 cmd는 파일/디렉토리 대상 — 약 brain의 fragile `-k` 추측이
+    0개 발견 exit 5로 완주를 막던 #171 직격)이 §1에 *기준 2줄*을 더해 ceiling 소폭 상향(syn 397→400) —
+    *기준만*(서사 없이·합성 콜 회귀 0 의도; 코드 align_check_findability가 하드 가드, 프롬프트는 소프트)."""
     syn_lines = (PROMPT_DIR / "synthesizer.md").read_text(encoding="utf-8").count("\n")
     dc_lines = DECOMP_PROMPT.read_text(encoding="utf-8").count("\n")
     # #152 직전: synthesizer 343, decomp_critic 73. #157: 검증-트레이스 end-to-end + 스캐폴드 지침.
-    assert syn_lines <= 397, f"synthesizer.md 길이 회귀({syn_lines}>397) — 간결 위반"
+    assert syn_lines <= 400, f"synthesizer.md 길이 회귀({syn_lines}>400) — 간결 위반"
     assert dc_lines <= 102, f"decomp_critic.md 길이 회귀({dc_lines}>102)"
 
 

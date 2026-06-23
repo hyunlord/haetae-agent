@@ -10,6 +10,7 @@ model_validate 직전에 _normalize_spec_dict로 흔한 출력 변종을 흡수�
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,60 @@ def _yaml_repair_feedback(err: SynthesisError) -> str:
     )
 
 
+# ──────────────── WO#172: 합성 findability 정렬 (약-brain의 fragile pytest -k 흡수) ────────────────
+#
+# #171 라이브(완전-로컬): 약 brain이 `pytest -k 'divide_zero_division'`처럼 *생성될 테스트 이름과
+# 어긋나는* freeform 키워드를 내 게이트가 0개 테스트 발견(exit 5)→green 완주 불가(#141 gate-discovery
+# 불일치의 약-brain 버전). fix: 합성 직후 acceptance_criteria의 pytest `-k`를 *결정적으로 제거*해 명령이
+# *발견된 모든 테스트*를 돌리게 한다 — findable + **더 엄격**(테스트가 더 많이 실행됨, 가짜 pass 불가).
+# **가드지 판정 아님**: per-unit 스코핑은 ac.unit(불변)·worktree로 하지 `-k`로 하지 않으므로 스코핑 영향
+# 0이고, gate/run_judge 무접촉·발견된 테스트 fail은 여전히 fail(바 불완화 0).
+
+
+def _strip_pytest_k(cmd: str) -> str:
+    """pytest 명령에서 `-k <expr>` 필터를 제거한다(WO#172). 나머지 토큰 보존·멱등.
+
+    `-k expr` / `-kexpr`(붙은 폼) / `-k 'a or b'`(따옴표) 모두 처리한다. pytest 명령이 아니거나 `-k`가
+    없으면 그대로(no-op). 따옴표 불균형 등 shlex 실패 시도 손대지 않는다(보수적). `-k`는 pytest keyword
+    필터 — unittest/vitest엔 의미 없으므로 pytest 명령에만 적용한다.
+    """
+    if "pytest" not in cmd.lower() or "-k" not in cmd:
+        return cmd
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return cmd  # 따옴표 불균형 등 — 보수적으로 원본 유지
+    out: list[str] = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "-k":
+            i += 2  # `-k` + 그 인자(expr) 건너뜀
+            continue
+        if t.startswith("-k") and len(t) > 2:
+            i += 1  # `-kexpr` 붙은 폼 건너뜀
+            continue
+        out.append(t)
+        i += 1
+    return " ".join(out)
+
+
+def align_check_findability(spec: ProjectSpec) -> ProjectSpec:
+    """합성된 acceptance_criteria의 pytest 체크에서 fragile `-k` 필터를 제거한다(findability 정렬, WO#172).
+
+    #171 라이브 실패(약 brain이 `-k 'divide_zero_division'` → 게이트 0개 발견 exit 5)를 차단: `-k`를
+    제거하면 *발견된 모든 테스트*가 실행돼 findable + **더 엄격**(가짜 pass 불가). per-unit 스코핑은
+    ac.unit(불변)·worktree로 하지 `-k`로 하지 않으므로 스코핑 영향 없다. **가드지 판정 아님** —
+    gate/run_judge 판정 로직·#113 바 불변(발견된 테스트 fail은 여전 fail). 멱등(이미 -k 없으면 no-op).
+    spec을 제자리 수정 후 그대로 반환한다.
+    """
+    for ac in spec.acceptance_criteria:
+        chk = ac.check
+        if chk.cmd and "pytest" in chk.cmd.lower() and "-k" in chk.cmd:
+            chk.cmd = _strip_pytest_k(chk.cmd)
+    return spec
+
+
 def synthesize(
     order: str,
     client: LLMClient,
@@ -158,7 +213,7 @@ def synthesize(
         # 재시도는 *파싱 실패*에만 적용한다(아래 except).
         raw = client.complete(system, base_user + repair_note)
         try:
-            return parse_yaml_model(
+            spec = parse_yaml_model(
                 raw, ProjectSpec, SynthesisError, normalize=_normalize_spec_dict
             )
         except SynthesisError as e:
@@ -168,6 +223,10 @@ def synthesize(
             if not isinstance(e.__cause__, yaml.YAMLError):
                 raise
             repair_note = _yaml_repair_feedback(e)
+        else:
+            # WO#172: 합성 성공 → findability 정렬(fragile pytest -k 제거 → 게이트가 테스트 발견·실행).
+            #   모든 합성 경로(첫 합성·재합성·scope 넛지)가 이 단일 지점을 지난다(멱등·바 불완화 0).
+            return align_check_findability(spec)
 
     # 재시도 소진 — 마지막 파싱 실패를 그대로 전파(첫 합성→escalate 경로,
     # 재합성→호출부 synthesize_with_critique가 원본 fallback).

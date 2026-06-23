@@ -65,6 +65,9 @@
 ## 자기검열 (출력 직전)
 
 - verdict 분류가 `last_result`와 맞나?
+- **action이 `next_order`/`retry`면 `next_order` 본문을 *반드시* 채웠나?** `unit`·`goal`은 필수다 —
+  비우면 진행이 막힌다. 아래 스키마 예시의 문구(goal/cmd 등)는 *형식 예시*일 뿐 — **이번 spec/order에
+  맞는 내용**으로 채워라(예시를 그대로 복사하지 마라).
 - `next_order`가 `done_when`에 정당화되나?
 - spec을 바꾸려는 거면, 그게 "정보 기반"이지 "난이도 회피"가 아닌가?
 - 이 작업이 `non_goals`를 건드리지 않나?
