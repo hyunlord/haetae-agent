@@ -58,6 +58,12 @@
   .run-row.child { margin-left:14px; border-left:2px solid var(--accent); }
   .run-row .rlineage { width:100%; font-size:10.5px; color:var(--mut2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .run-row .rlineage a { color:var(--accent); text-decoration:none; cursor:pointer; }
+  /* WO#167 run 계보 트리 */
+  .lineage-chain { display:flex; flex-direction:column; gap:2px; font-size:12px; }
+  .lin-node { padding:4px 8px; border:1px solid rgba(127,127,127,0.25); border-radius:6px; }
+  .lin-node.lin-cur { border-color:var(--accent); }
+  .lin-id { font-size:11px; color:var(--mut2); }
+  .lin-edge { padding:1px 0 1px 14px; color:var(--mut2); font-size:11px; }
   .run-row .cont-btn { font-size:10px; padding:1px 6px; }
   .continue-note { background:#10233a; border:1px solid #1d4e6a; color:#cfe6ff; border-radius:6px; padding:8px 10px; font-size:12px; }
   .continue-note b { color:#eaf4ff; }
@@ -418,6 +424,8 @@
     <div id="summary" class="summary" style="display:none"></div>
     <!-- WO#57: 선택된 run의 원 주문(내가 친 의뢰문) 전문 — /api/runs의 order를 client-side 매칭 -->
     <div id="run-order" style="display:none"></div>
+    <!-- WO#167: run 계보 트리(다-런 arc) — parent_run_id 링크를 거슬러 verdict/토큰/fix 엣지로(read-only) -->
+    <div class="card" id="lineage-card" style="display:none"><h2>run 계보 (lineage) <span class="sec-demote">— 다-런 arc · 런→fix→이어가기 (read-only)</span></h2><div id="lineage"></div></div>
 
     <div id="main-cols" class="main-cols">
       <!-- 주 패널: 생애주기 스텝퍼(빌드에 유닛 리스트 중첩) + 로그 + DAG/transitions(강등) -->
@@ -884,6 +892,7 @@ function render(v) {
   renderHeartbeat(v);  // WO#55: 진행 중 codex 호출 라이브 배너(director-side 포함)
   renderRunOrder();    // WO#57: 선택 run의 원 주문 전문(합성 goal과 구분)
   renderSummary(v);
+  renderLineage(v);    // WO#167: run 계보 트리(다-런 arc) — read-only 표시
   renderPhases(v);     // 단계 섹션 먼저(빌드 섹션 안에 #unitlist 생성)
   renderUnitList(v);   // 그 #unitlist에 유닛 dense 리스트 채움
   renderDag(v);
@@ -957,6 +966,34 @@ function fmtDur(s){
 function hbLabel(a){
   const kind = a.call_kind || "codex";
   return a.unit ? (esc(a.unit)+" "+esc(kind)+" 중") : (esc(kind)+" 중");
+}
+function renderLineage(v){
+  // WO#167: run 계보 트리(다-런 arc) — 현재→조상 순 체인. verdict/토큰 노드 + fix 엣지. read-only.
+  const card = $("lineage-card"), host = $("lineage");
+  if (!host) return;
+  const lin = (v && v.lineage) || null;
+  if (!lin || lin.length < 2){ if (card) card.style.display = "none"; host.innerHTML = ""; return; }
+  if (card) card.style.display = "";
+  let html = '<div class="lineage-chain">';
+  lin.forEach((n, i) => {
+    const verdict = n.verdict || "—";
+    const tok = (n.tokens != null)
+      ? (n.tokens >= 1e6 ? (n.tokens/1e6).toFixed(2)+"M" : String(n.tokens))
+      : "—";
+    html += '<div class="lin-node'+(i===0?' lin-cur':'')+'">'
+      + '<span class="pill s-'+esc(verdict)+'">'+esc(verdict)+'</span>'
+      + ' <code class="lin-id">'+esc(n.run_id)+'</code>'
+      + (i===0 ? ' <span class="mut small">(현재)</span>' : '')
+      + ' <span class="mut small">· '+tok+' tok'+(n.started_at?(' · '+esc(n.started_at)):'')+'</span>'
+      + '</div>';
+    if (i < lin.length-1){
+      // 이 노드(자식)가 부모로부터 이어올 때 적용된 fix.
+      const fix = n.fix_ref;
+      html += '<div class="lin-edge">↑ fix: '+(fix?('<code>'+esc(fix)+'</code>'):'<span class="mut">(미기록)</span>')+'</div>';
+    }
+  });
+  html += '</div>';
+  host.innerHTML = html;
 }
 function renderHeartbeat(v){
   const host = $("hb-banner"); if (!host) return;

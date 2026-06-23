@@ -826,6 +826,84 @@ def load_meta(state_path: str | Path | None) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+# ──────────────────── run 계보 트리 (lineage, WO#167 — read-only) ────────────────────
+#
+# 비싼 런(수 M 토큰)을 fix 후 이어가는 다-런 arc(런→fix→이어가기→fix…)를 한눈에 보이게 한다.
+# 주어진 run서 parent_run_id 링크를 거슬러 체인을 구성(현재→조상 순). **read-only**: 각 조상
+# run dir의 state.yaml(verdict=status·tokens=budget)·lineage.json/meta.json(parent·fix_ref)을
+# *읽기만* — 엔진/state 쓰기 0(#28/#35 동일 위험 0). lineage는 기록 메타+표시지 *판정 아님*
+# (verdict를 절대 바꾸지 않는다 — state.status가 단일 출처).
+
+
+def load_lineage(state_path: str | Path | None) -> dict[str, Any] | None:
+    """state.yaml 옆 lineage.json을 best-effort로 읽는다(WO#167, read-only). 없으면 None."""
+    if state_path is None:
+        return None
+    lp = Path(state_path).parent / "lineage.json"
+    try:
+        data = json.loads(lp.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _lineage_node(run_dir: Path) -> dict[str, Any]:
+    """한 run dir → lineage 노드(run_id·verdict·started_at·tokens·parent_run_id·fix_ref). read-only.
+
+    verdict/tokens는 그 run의 state.yaml에서(단일 출처 — 중복 저장 안 함). parent/fix_ref는
+    lineage.json(CLI #167) 우선, 없으면 meta.json(런처)서 폴백. 모두 best-effort(부재→None).
+    """
+    sp = run_dir / "state.yaml"
+    node: dict[str, Any] = {
+        "run_id": run_dir.name, "verdict": None, "started_at": None,
+        "tokens": None, "parent_run_id": None, "fix_ref": None,
+    }
+    try:
+        st = State.from_yaml(sp)
+        node["verdict"] = st.status.value if hasattr(st.status, "value") else st.status
+        if st.budget and st.budget.spent:
+            node["tokens"] = st.budget.spent.tokens
+    except Exception:  # noqa: BLE001 — state 부재/깨짐 → verdict None(노드는 살림)
+        pass
+    lin = load_lineage(sp) or {}
+    meta = load_meta(sp) or {}
+    node["parent_run_id"] = lin.get("parent_run_id") or meta.get("parent_run_id")
+    node["fix_ref"] = lin.get("fix_ref") or meta.get("fix_ref")
+    node["started_at"] = meta.get("started_at")
+    return node
+
+
+def build_lineage(state_path: str | Path | None, *, max_depth: int = 50) -> list[dict[str, Any]]:
+    """현재 run서 parent_run_id를 거슬러 lineage 체인을 만든다(현재→조상 순). read-only·best-effort.
+
+    runs_dir = state_path 디렉토리의 부모(= runs/<id>/state.yaml → runs/). 각 조상 run dir의
+    state/lineage/meta를 *읽어* 노드 구성. 사이클(visited)·max_depth 가드(무한루프 금지). 부모
+    없으면 단일 노드(첫 런). 조상 dir 부재(삭제 등)면 거기서 중단. 절대 raise 안 함(서버 안전).
+    """
+    if state_path is None:
+        return []
+    try:
+        cur = Path(state_path).parent
+        runs_dir = cur.parent
+    except Exception:  # noqa: BLE001
+        return []
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    depth = 0
+    while cur is not None and cur.name not in seen and depth < max_depth:
+        seen.add(cur.name)
+        if not (cur / "state.yaml").exists() and not (cur / "meta.json").exists():
+            break  # 조상 run dir 부재 → 체인 중단(삭제/접근불가)
+        node = _lineage_node(cur)
+        chain.append(node)
+        parent = node.get("parent_run_id")
+        if not parent or not isinstance(parent, str):
+            break  # 첫 런(부모 없음) 또는 잘못된 parent → 중단
+        cur = runs_dir / parent
+        depth += 1
+    return chain
+
+
 def detect_stale_run(
     status_value: str | None, heartbeat: dict[str, Any] | None, now_dt: datetime | None
 ) -> dict[str, Any] | None:
@@ -944,6 +1022,14 @@ def load_view(state_path: str | Path, spec_path: str | Path | None = None) -> di
         view["transcripts"] = transcripts  # WO#67: 유닛/단계 드릴다운용 라이브 트랜스크립트
     if meta is not None:
         view["meta"] = meta  # WO#75: 원 주문 사이드카(#57 CLI 커버)
+    # WO#167: run 계보 트리(다-런 arc) — parent_run_id 링크를 거슬러 체인 구성(read-only). 부모가
+    # 있는(체인 길이>1) run만 동봉 → 첫 런엔 lineage 패널 안 뜸(노이즈 0). lineage≠판정(표시뿐).
+    try:
+        lineage = build_lineage(state_path)
+        if len(lineage) > 1:
+            view["lineage"] = lineage
+    except Exception:  # noqa: BLE001 — 계보 구성 실패가 뷰를 죽이지 않는다(read-only best-effort)
+        pass
     # WO#75: stale 감지(running인데 heartbeat 응답 없음 → 죽었을 수 있음). best-effort·표시뿐.
     try:
         stale = detect_stale_run(view.get("status"), heartbeat, datetime.now(timezone.utc))

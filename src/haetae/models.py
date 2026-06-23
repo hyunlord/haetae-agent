@@ -621,6 +621,27 @@ class ApproachAttempt(BaseModel):
     index: int = 0
 
 
+# ──────────────────── run 계보 (lineage, WO#167) ────────────────────
+
+
+class Lineage(BaseModel):
+    """run 계보 링크(WO#167) — state.yaml 옆 lineage.json 사이드카로 영속하는 *read-only 메타*.
+
+    비싼 런(수 M 토큰)을 fix 후 이어가는 다-런 arc(런→fix→이어가기→fix…)를 추적 가능하게 한다.
+    #91 resume(--continue-from)을 leverage — C는 *링크 기록*만 추가(resume 메커니즘 자체 무변경).
+
+    parent_run_id: --continue-from 한 부모 run id(첫 런이면 None).
+    fix_ref:       부모→자식 사이 적용된 commit/WO 참조(인자 또는 현재 HEAD commit; 없으면 None).
+    **verdict는 여기 중복 저장하지 않는다** — 각 run의 state.status가 단일 출처(드리프트 방지).
+    대시보드 lineage 트리가 노드별로 state.status에서 verdict를, budget에서 토큰을 읽어 표시한다
+    (lineage = 기록 메타+표시지 *판정 아님* — verdict를 절대 바꾸지 않는다). 추가형·비파괴:
+    기존 `{parent_run_id}` 사이드카에 fix_ref만 더한 것(parent_run_id 키 보존 — 구 read 무영향).
+    """
+
+    parent_run_id: str | None = None
+    fix_ref: str | None = None
+
+
 # ──────────────────────────── State ────────────────────────────
 
 

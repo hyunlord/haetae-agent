@@ -335,12 +335,41 @@ def seed_workdir_from_parent(parent_work: Path, new_work: Path) -> int:
     return copied
 
 
-def _write_lineage(state_path: str | Path, parent_run_id: str) -> None:
-    """계보(parent_run_id)를 state.yaml 옆 lineage.json 사이드카에 best-effort 기록(append-only 감사)."""
+def _resolve_fix_ref(fix_ref_arg: str | None) -> str | None:
+    """부모→자식 사이 적용된 fix 참조 해소(WO#167): 인자 우선, 없으면 현재 HEAD commit(짧은 해시).
+
+    best-effort — git 없음/repo 아님/실패 시 None(계보 기록은 run을 막지 않는다). director-side 메타.
+    """
+    # blank 인자(None/""/공백)는 '미지정'으로 보고 HEAD로 폴백 — 일관(arg OR HEAD).
+    arg = (fix_ref_arg or "").strip()
+    if arg:
+        return arg
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ref = (out.stdout or "").strip()
+        return ref or None
+    except Exception:  # noqa: BLE001 — git 부재/실패는 무시(fix_ref 미기록)
+        return None
+
+
+def _write_lineage(
+    state_path: str | Path, parent_run_id: str, fix_ref: str | None = None
+) -> None:
+    """계보(parent_run_id + fix_ref)를 state.yaml 옆 lineage.json 사이드카에 best-effort 기록(WO#167).
+
+    WO#167: 기존 `{parent_run_id}`에 fix_ref(부모→자식 사이 적용된 commit/WO)를 더한다 — 다-런 arc
+    (런→fix→이어가기) 추적용 *read-only 메타*. parent_run_id 키 보존(구 read·기존 테스트 무영향).
+    verdict는 안 적는다(각 run의 state.status가 단일 출처 — 대시보드 트리가 거기서 읽음). 판정 아님.
+    """
     try:
         import json
+        from haetae.models import Lineage
         p = Path(state_path).parent / "lineage.json"
-        p.write_text(json.dumps({"parent_run_id": parent_run_id}, ensure_ascii=False), encoding="utf-8")
+        rec = Lineage(parent_run_id=parent_run_id, fix_ref=fix_ref).model_dump(mode="json")
+        p.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
     except Exception:  # noqa: BLE001 — 계보 기록 실패가 run을 죽이지 않는다(best-effort 영속화)
         pass
 
@@ -885,6 +914,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--fix-ref",
+        default=None,
+        help=(
+            "run 계보(WO#167)에 기록할 *fix 참조* — --continue-from 시 부모→이번 런 사이 적용된 "
+            "commit/WO. 미지정이면 현재 HEAD commit(짧은 해시)을 자동 사용. lineage.json에 기록돼 "
+            "대시보드 lineage 트리의 엣지로 표시된다(read-only 메타 — 판정 아님)."
+        ),
+    )
+    parser.add_argument(
         "--pricing",
         default=None,
         help=(
@@ -1097,7 +1135,10 @@ def main(argv: list[str] | None = None) -> int:
         seeded = True
         scaffold_client = None  # 이어가기 = scaffold 스킵(스택 이미 시딩됨)
         if args.state_path:
-            _write_lineage(args.state_path, rp.parent_dir.name)  # 계보 사이드카(best-effort)
+            # WO#167: 계보 사이드카(parent_run_id + fix_ref) — 다-런 arc 추적(read-only 메타·best-effort).
+            _write_lineage(
+                args.state_path, rp.parent_dir.name, fix_ref=_resolve_fix_ref(args.fix_ref)
+            )
         if rp.mode == "pure_resume":
             resume_spec = rp.resume_spec
             resume_state = rp.resume_state
