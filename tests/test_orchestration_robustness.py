@@ -22,6 +22,7 @@ from haetae.loop import (
     _fallback_order,
     _fallback_target_unit,
     _is_degenerate_order,
+    _is_unit_done,
     MockGate,
 )
 from haetae.providers.codex import ALLOWED_SANDBOXES
@@ -267,3 +268,127 @@ def test_fallback_order_is_builder_guidance_not_verdict():
     fb = _fallback_order(spec, "u1")
     assert isinstance(fb, NextOrder)  # work order(빌더 입력)지 Verdict/GateResult 아님
     assert not hasattr(fb, "verdict")
+
+
+# ════════════════════ WO#173: 완료-인식 결정적 가드 + 파싱-레벨 빈-replan 흡수 ════════════════════
+#
+# #172 라이브: 완전-로컬이 검증-정확 산출물 + gate 5/5에 도달했으나 green 완주 막은 약-brain 슬립 2개:
+# (#3) u1 pass 후 brain이 done 선언 대신 재dispatch, (#4) 14b가 빈 replan 텍스트 3× → ReplanError(파싱
+# 레벨). 둘을 결정적 완료-인식 + 파싱-레벨 빈-replan 흡수로 받친다(gate 판정/바 불변·완료=gate-pass 사실).
+
+PROMPT_DIR_173 = PROMPT_DIR  # alias for clarity
+
+_SPEC_1UNIT = _SPEC_YAML  # 1-unit(u1) spec, ac1 check `true`
+
+_SPEC_2UNIT = """\
+spec_id: orch2-001
+version: 1
+order_raw: "2유닛"
+goal: "2유닛 구현"
+task_type: feature_impl
+verifiability: objective
+mode: normal
+constraints: []
+acceptance_criteria:
+  - { id: ac1, desc: "u1", unit: u1, check: { type: test, cmd: "true" } }
+  - { id: ac2, desc: "u2", unit: u2, check: { type: test, cmd: "true" } }
+assumptions: []
+non_goals: ["x"]
+done_when: "전 기준 통과"
+decomposition:
+  - { unit: u1, desc: "u1 모듈", deps: [] }
+  - { unit: u2, desc: "u2 모듈", deps: [u1] }
+open_questions: []
+"""
+
+
+def _human_exec():
+    return HumanRelayExecutor(present=lambda t: None, collect=lambda: "결과")
+
+
+# ── #3 완료-인식: 전 유닛 gate-pass → 결정적 done(brain stop 선언 불요) ──
+
+
+def test_completion_recognized_on_pass_without_brain_stop():
+    """1유닛 spec, gate가 pass_만 반복(brain은 stop/done 안 냄) → 결정적 done(#3 완료-인식)."""
+    # MockClient: synth + 유효 next_order(u1) 반복(brain은 done 절대 안 선언). gate=pass_.
+    client = MockClient([_SPEC_1UNIT, _valid_order("u1"), _valid_order("u1"), _valid_order("u1")])
+    state = run("유틸 추가", client=client, executor=_human_exec(),
+                gate=MockGate([Verdict.pass_]), prompt_dir=PROMPT_DIR_173)
+    assert state.status is Status.done  # gate-pass 사실로 결정적 done(brain 의견 무관)
+    assert not any("검증 실패" in str(e) or "본문 없음" in str(e) for e in state.pending_escalations)
+
+
+def test_completion_not_premature_when_a_unit_still_pending():
+    """2유닛 spec: u1 gate-pass가 done을 *조기 트리거하지 않음*(u2 미통과) — 정직(all_done 가드)."""
+    client = MockClient([_SPEC_2UNIT, _valid_order("u1"), _valid_order("u2"), _valid_order("u2")])
+    state = run("2유닛", client=client, executor=_human_exec(),
+                gate=MockGate([Verdict.pass_, Verdict.pass_]), prompt_dir=PROMPT_DIR_173)
+    assert state.status is Status.done
+    # u1 pass_에 조기 완료했으면 events 1개 — 정직하면 u2까지 가서 2개.
+    assert len(state.events) == 2, f"u1 pass_에 조기 완료(부정직): events={len(state.events)}"
+
+
+def test_completion_does_not_fire_on_non_pass_verdict():
+    """gate가 pass_ 아니면(ambiguous) 완료-인식 안 함 — 미통과면 done 아님(정직)."""
+    # synth + next_order(u1) ×N, gate=ambiguous → done 아님(escalate/stuck로 끝나야).
+    client = MockClient([_SPEC_1UNIT] + [_valid_order("u1")] * 10)
+    state = run("유틸 추가", client=client, executor=_human_exec(),
+                gate=MockGate([Verdict.ambiguous]), prompt_dir=PROMPT_DIR_173, max_iters=3)
+    assert state.status is not Status.done  # ambiguous는 완료-인식 트리거 X(정직)
+
+
+def test_is_unit_done_helper():
+    s = State(spec_ref="s", spec_version=1, status=Status.running, plan=[
+        PlanItem(unit="u1", state=PlanState.done),
+        PlanItem(unit="u2", state=PlanState.pending),
+        PlanItem(unit="u3", state=PlanState.failed),
+    ])
+    assert _is_unit_done(s, "u1")
+    assert not _is_unit_done(s, "u2") and not _is_unit_done(s, "u3")
+    assert not _is_unit_done(s, None) and not _is_unit_done(s, "nope")
+
+
+# ── #4 파싱-레벨 빈-replan 흡수: raw-빈/파싱불가 → 재프롬프트 → fallback(escalate-empty 0) ──
+
+
+def test_raw_empty_replan_absorbed_via_fallback():
+    """raw-빈 replan 응답(파싱 레벨, #172 parsed-empty보다 앞) → 재프롬프트 → fallback → done(escalate 0)."""
+    # synth + replan 3시도(replan_retries=2) 전부 raw-빈("") → decision None → _fallback_order(u1) → gate pass_.
+    client = MockClient([_SPEC_1UNIT, "", "", ""])
+    state = run("유틸 추가", client=client, executor=_human_exec(),
+                gate=MockGate([Verdict.pass_]), prompt_dir=PROMPT_DIR_173)
+    assert state.status is Status.done
+    assert not any("검증 실패" in str(e) for e in state.pending_escalations)  # raw-빈에 조용히 안 죽음
+
+
+def test_replan_raises_clear_error_on_raw_empty():
+    """replan()이 raw-빈 응답에 *또렷한* ReplanError(재프롬프트 피드백용) — 'NoneType'보다 actionable."""
+    from haetae.replan import replan, ReplanError
+    spec = _spec([], decomposition=[DecompositionUnit(unit="u1", desc="d", deps=[])])
+    st = State(spec_ref="s", spec_version=1, status=Status.running)
+    for raw in ("", "   ", "\n\n"):
+        try:
+            replan(spec, st, "lr", MockClient([raw]))
+            assert False, "raw-빈은 ReplanError여야"
+        except ReplanError as e:
+            assert "비었다" in e.message or "raw empty" in e.message
+
+
+def test_valid_replan_still_works_no_regression():
+    """유효 replan 무회귀: 정상 next_order는 그대로 dispatch(빈-replan 가드가 정상 경로 안 가림)."""
+    client = MockClient([_SPEC_2UNIT, _valid_order("u1"), _valid_order("u2"), _valid_order("u2")])
+    state = run("2유닛", client=client, executor=_human_exec(),
+                gate=MockGate([Verdict.pass_, Verdict.pass_]), prompt_dir=PROMPT_DIR_173)
+    assert state.status is Status.done and len(state.events) == 2
+
+
+def test_completion_rests_on_gate_fact_not_relaxation():
+    """무결성: 완료-인식은 gate-pass *사실*에 근거 — 미통과 유닛 있으면 done 아님(바 불완화 아님)."""
+    from haetae.scheduler import all_done
+    # all_done은 전 유닛 done일 때만 True(미통과 1개면 False) — 완료-인식의 결정 근거.
+    s = State(spec_ref="s", spec_version=1, status=Status.running, plan=[
+        PlanItem(unit="u1", state=PlanState.done), PlanItem(unit="u2", state=PlanState.pending)])
+    assert not all_done(s.plan)  # u2 pending → 완료 아님
+    s.plan[1].state = PlanState.done
+    assert all_done(s.plan)  # 전 유닛 done → 완료

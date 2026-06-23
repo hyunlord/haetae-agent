@@ -50,6 +50,7 @@ from haetae.models import (
     ApproachAttempt,
     CheckReport,
     Cost,
+    Decision,
     DecompCritique,
     Event,
     GateResult,
@@ -406,6 +407,13 @@ def _fallback_target_unit(
         return worked_unit
     r = ready_units(state.plan, in_flight or set())
     return r[0] if r else None
+
+
+def _is_unit_done(state: State, unit: str | None) -> bool:
+    """unit이 plan에서 이미 done(통과·불변)인가 — WO#173 재dispatch 가드용(순수)."""
+    if not unit:
+        return False
+    return any(p.unit == unit and p.state == PlanState.done for p in state.plan)
 
 
 def _advance_done(state: State, unit: str) -> None:
@@ -1305,14 +1313,27 @@ def run_loop(
                 account(tag_cost(combine_costs(m_critic.drain()), kind="critic"))
             if decision is None:
                 account(replan_cost)  # 실패한 replan도 비용은 정직하게 누적
-                state.status = Status.escalated
-                state.pending_escalations.append(
-                    {
-                        "reason": f"replan 출력 {replan_retries + 1}회 검증 실패",
-                        "raw_response": last_err.raw_response if last_err else None,
-                    }
-                )
-                break
+                # WO#173 #4: raw-빈/파싱불가 replan(파싱 레벨)이 재프롬프트(#31) 후에도 실패 → escalate로
+                #   *조용히 막히는 대신* #172 _fallback_order 경로로 합류(결정적 fallback). 트리거만 파싱
+                #   레벨로 앞당김(같은 fallback) — 빌드할 pending 유닛 있으면 진행, 없으면 기존 escalate.
+                fb = _fallback_order(spec, _fallback_target_unit(state, worked_unit))
+                if fb is not None:
+                    emit(f"replan raw-빈/파싱불가 → 결정적 fallback work order 합성: {fb.unit}")
+                    decision = Decision(
+                        verdict=Verdict.fail_recoverable, action=Action.next_order,
+                        rationale="replan 파싱 실패 — pinned spec서 결정적 fallback(WO#173)",
+                        next_order=fb,
+                    )
+                    # decision을 fallback으로 채웠으니 escalate 대신 아래 action 처리로 흘려보낸다.
+                else:
+                    state.status = Status.escalated
+                    state.pending_escalations.append(
+                        {
+                            "reason": f"replan 출력 {replan_retries + 1}회 검증 실패",
+                            "raw_response": last_err.raw_response if last_err else None,
+                        }
+                    )
+                    break
 
             action = decision.action
 
@@ -1332,6 +1353,19 @@ def run_loop(
                             {"reason": "next_order 본문 없음", "action": action.value}
                         )
                         break
+                # WO#173 #3: brain이 *이미 done(통과·불변)인 유닛*을 재dispatch → 진전 0 재작업 차단.
+                #   전 유닛 done이면 결정적 완료 인식(gate-pass 사실이지 brain 의견 아님), 아니면 pending으로
+                #   redirect. 완료=기계적 사실이라 더 엄격·정직(미통과 유닛 있으면 done 아님·바 불완화 아님).
+                if _is_unit_done(state, no.unit):
+                    if all_done(state.plan):
+                        record_transition(STAGE_DONE)
+                        state.status = Status.done
+                        emit(f"이미 통과한 {no.unit} 재dispatch — 전 유닛 done, 결정적 완료 인식")
+                        break
+                    redirect = _fallback_order(spec, _fallback_target_unit(state, None))
+                    if redirect is not None and redirect.unit != no.unit:
+                        emit(f"이미 통과한 {no.unit} 재dispatch 차단 → pending 유닛 {redirect.unit}로 redirect")
+                        no = redirect
                 # WO#25 Part A: brain이 다른 유닛으로 넘어가면 직전 작업 유닛을 수용(done).
                 # dispatch하는 유닛은 in_progress. (gate/replan/종료 로직은 불변 — plan state만.)
                 if worked_unit is not None and worked_unit != no.unit:
@@ -1384,6 +1418,17 @@ def run_loop(
                 last_result = f"unit={no.unit} verdict={verdict.value} :: {result}"
                 if verdict == Verdict.done:
                     state.status = Status.done
+                elif verdict == Verdict.pass_:
+                    # WO#173 #3: 순차 경로의 gate는 *전체-spec*(unit=None)이라 pass_ = 전 acceptance_criteria
+                    #   통과 = done_when("전 기준 통과")이 *기계적으로* 충족됨. worked 유닛을 done 수용 후 전
+                    #   유닛 done이면 *결정적 완료 인식* — 약 brain의 "next/stop" 선언에 의존하지 않는다(#172 #3:
+                    #   14b가 pass 후 done 대신 재dispatch하던 슬립 차단). **미통과 유닛 1개라도 있으면 done 아님**
+                    #   (all_done 가드 — 정직·바 불완화 아님; 완료=gate-pass 사실이지 brain 의견 아님 — 더 엄격).
+                    _advance_done(state, no.unit)
+                    if all_done(state.plan):
+                        record_transition(STAGE_DONE)
+                        state.status = Status.done
+                        emit("전 유닛 gate-pass — 결정적 완료 인식(done)")
 
             elif action == Action.stop:
                 account(replan_cost)  # event 없는 종료 — replan 비용은 budget에만
@@ -1807,13 +1852,25 @@ def _parallel_loop(
         orch_cost_of[unit] = tag_cost(combine_costs(client.drain()), kind="replan", unit=unit)
         account_decomp_cost()  # 분해 critic(verifier-side) 비용 누적(코스트 패널에 보임)
         if decision is None:
-            account(orch_cost_of.pop(unit, None))  # event 없음 → budget에만
-            terminal = "escalated"
-            state.pending_escalations.append({
-                "reason": f"unit {unit} replan {replan_retries + 1}회 검증 실패",
-                "raw_response": last_err.raw_response if last_err else None,
-            })
-            return None
+            # WO#173 #4: raw-빈/파싱불가 replan(파싱 레벨)이 재프롬프트(#31) 후에도 실패 → escalate 대신
+            #   #172 _fallback_order 경로로 합류(결정적 fallback·유닛은 스케줄러가 권위적으로 정함). 같은
+            #   fallback, 트리거만 파싱 레벨 추가. spec에 유닛 없으면(이론상) 기존 escalate.
+            fb = _fallback_order(spec, unit)
+            if fb is not None:
+                emit(f"replan raw-빈/파싱불가 → 결정적 fallback work order 합성: {unit}")
+                decision = Decision(
+                    verdict=Verdict.fail_recoverable, action=Action.next_order,
+                    rationale="replan 파싱 실패 — pinned spec서 결정적 fallback(WO#173)",
+                    next_order=fb,
+                )
+            else:
+                account(orch_cost_of.pop(unit, None))  # event 없음 → budget에만
+                terminal = "escalated"
+                state.pending_escalations.append({
+                    "reason": f"unit {unit} replan {replan_retries + 1}회 검증 실패",
+                    "raw_response": last_err.raw_response if last_err else None,
+                })
+                return None
 
         action = decision.action
         if action in (Action.next_order, Action.retry):

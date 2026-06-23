@@ -110,10 +110,12 @@ def test_run_loop_escalate():
 
 
 def test_run_loop_max_iters_caps():
-    # 끝나지 않는 스크립트(매번 next_order, gate는 pass만) → max_iters에서 종료
+    # 끝나지 않는 스크립트: 매번 next_order, gate는 *fail만* → 완료 안 됨 → max_iters에서 종료.
+    # (WO#173: gate pass_는 이제 전 유닛 통과 시 *결정적 done*이라 더는 무한루프가 아님 — max_iters
+    #  cap 안전성은 *진짜로* 안 끝나는 시나리오(항상 fail)로 검증한다.)
     client = MockClient([SPEC_YAML] + [_next_order("u1")] * 3)
     state = run_loop(order="x", client=client,
-                     executor=MockExecutor("again"), gate=MockGate(Verdict.pass_),
+                     executor=MockExecutor("again"), gate=MockGate(Verdict.fail_recoverable),
                      max_iters=3, prompt_dir=PROMPT_DIR)
     assert state.status is Status.stopped_stuck
     assert len(state.events) == 3
@@ -312,10 +314,11 @@ def test_save_failure_non_fatal_without_progress(tmp_path):
 def test_incremental_save_persists_events_during_run(tmp_path):
     """이벤트마다 증분 저장 → max_iters로 중단돼도 그때까지의 이벤트가 파일에 남는다."""
     out = tmp_path / "state.yaml"
-    # 끝나지 않는 스크립트: 매번 next_order, gate는 pass만 → max_iters에서 stopped_stuck
+    # 끝나지 않는 스크립트: 매번 next_order, gate는 *fail만* → max_iters에서 stopped_stuck.
+    # (WO#173: 항상-pass는 이제 결정적 done이라 무한루프 아님 — 증분 저장은 항상-fail로 검증.)
     client = MockClient([SPEC_YAML] + [_next_order("u1")] * 3)
     run_loop(order="x", client=client, executor=MockExecutor("again"),
-             gate=MockGate(Verdict.pass_), max_iters=3, prompt_dir=PROMPT_DIR,
+             gate=MockGate(Verdict.fail_recoverable), max_iters=3, prompt_dir=PROMPT_DIR,
              state_path=out)
     assert out.exists()
     reloaded = State.from_yaml(out)
@@ -681,9 +684,20 @@ def test_run_loop_replan_retries_then_succeeds():
 
 
 def test_run_loop_escalates_when_replan_retries_exhausted():
-    """replan이 계속 검증 실패하면 crash 대신 escalated로 종료하고 raw를 보존한다."""
-    # replan_retries=2 → iter1에서 3회 시도 모두 실패 → escalate
-    client = MockClient([SPEC_YAML, DEC_INVALID, DEC_INVALID, DEC_INVALID])
+    """replan이 계속 검증 실패 + *빌드할 pending 유닛 없음*(no-decomp)이면 crash 대신 escalated로 종료·raw 보존.
+
+    WO#173 #4: replan 파싱 소진은 이제 빌드 가능한 pending 유닛이 있으면 결정적 fallback으로 *진행*한다
+    (그 경로는 test_orchestration_robustness). 여기선 *fallback 불가*(decomposition 비어 plan 없음 →
+    ready 유닛 0) 시 graceful escalate가 그대로 살아있음을 검증한다(no-crash 안전성 보존)."""
+    # decomposition 없는 spec → plan 비어 ready 유닛 0 → fallback 불가 → escalate(파싱 소진 graceful).
+    spec_no_decomp = SPEC_YAML.replace(
+        'decomposition:\n  - { unit: u1, desc: "스켈레톤", deps: [] }\n'
+        '  - { unit: u2, desc: "데미지 로직", deps: [u1] }',
+        "decomposition: []",
+    )
+    assert "decomposition: []" in spec_no_decomp  # replace가 실제로 먹었는지 가드
+    # replan_retries=2 → iter1에서 3회 시도 모두 실패 → fallback 불가 → escalate
+    client = MockClient([spec_no_decomp, DEC_INVALID, DEC_INVALID, DEC_INVALID])
     state = run_loop(order="x", client=client,
                      executor=MockExecutor("noop"), gate=MockGate(Verdict.pass_),
                      replan_retries=2, prompt_dir=PROMPT_DIR)

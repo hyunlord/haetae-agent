@@ -137,4 +137,13 @@ def replan(
     system = Path(prompt_path).read_text(encoding="utf-8")
     user = _build_user(spec, state, last_result, feedback)
     raw = client.complete(system, user)
+    # WO#173 #4: raw-빈 응답(파싱 *전* — #172 라이브서 14b가 빈 replan 텍스트 3× 반환)을 *명시 감지*해
+    #   재프롬프트(#31)에 또렷한 피드백을 준다(parse_yaml_model의 'NoneType' 메시지보다 actionable).
+    #   파싱불가는 parse_yaml_model이 ReplanError로 잡는다 — 둘 다 루프의 재시도→소진 시 결정적 fallback에 합류.
+    if not (raw or "").strip():
+        raise ReplanError(
+            "replan 응답이 비었다(raw empty). verdict·action·rationale·(action이 next_order/retry면) "
+            "next_order(unit·goal 필수)를 담은 완전한 Decision YAML을 다시(그리고 그것만) 출력하라.",
+            raw or "",
+        )
     return parse_yaml_model(raw, Decision, ReplanError, normalize=_normalize_decision_dict)
