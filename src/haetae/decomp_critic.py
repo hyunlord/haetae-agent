@@ -18,6 +18,7 @@ LEAP 교훈: 이 리뷰어 ablation → 형식상 멀쩡한데 무진전인 분�
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -262,6 +263,24 @@ def _normalize_critique_dict(data: dict) -> dict:
 def is_weak(crit: DecompCritique) -> bool:
     """이 분해가 무진전(weak)으로 판정됐는지 — 호출부의 reject/재replan 트리거."""
     return _norm_verdict(crit.verdict) == "weak"
+
+
+def decomp_signature(order: NextOrder) -> str:
+    """work order의 *내용* 시그니처(unit id 제외) — rename-evasion 추적 키 (WO#175).
+
+    #174 라이브: 약 brain이 decomp-critic이 거부한 작업을 *id만 바꿔*(u2→u2a→…) 재제출해
+    critic verdict를 우회했다. 내용(goal·scope·deliverable)을 정규화(소문자·공백 축약)해 짧은
+    해시로 만들어 "같은 작업인가"를 id와 무관하게 식별한다. unit id는 *일부러 제외* — 그게
+    rename되는 축이기 때문. 순수 함수(LLM/IO 없음)·결정적·저비용. **판정 아님** — 호출부가
+    이 키로 거부된 작업의 id-스왑 재제출을 차단(critic verdict를 불변 권위로 강화)할 뿐이다.
+    """
+    parts = [
+        (order.goal or "").strip().lower(),
+        (order.scope or "").strip().lower(),
+        (order.deliverable or "").strip().lower(),
+    ]
+    norm = "\x1f".join(" ".join(p.split()) for p in parts)  # \x1f=field sep (collision-free)
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
 
 
 def _plan_progress(state: State) -> str:

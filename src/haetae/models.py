@@ -741,6 +741,11 @@ class State(BaseModel):
     # WO#171-shadow: 약=적용·강=기록만(적용 0) 검증역전 누적. `--shadow-judge` opt-in일 때만 채워진다.
     #   shadow OFF(기본)면 빈 리스트(100% 로컬·codex 흔적 0). 추가형·비파괴(구버전 state read 무영향).
     shadow_comparisons: list[ShadowComparison] = Field(default_factory=list)
+    # WO#175: decomp-critic이 *거부한* work order의 내용 시그니처(unit id 제외) → 원 거부 유닛 id 매핑.
+    #   약 brain이 거부된 작업을 *id만 바꿔* 재제출(rename-evasion)하는지 추적하는 append-only 감사 키.
+    #   순차 경로 전용(병렬은 스케줄러가 unit id 권위라 rename 불가). critic verdict *강화*지 판정 아님 —
+    #   gate/run_judge 로직 불변. 부재(구버전 state read)면 빈 dict(graceful).
+    rejected_decomp_signatures: dict[str, str] = Field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "State":

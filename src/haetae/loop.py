@@ -89,6 +89,7 @@ from haetae.decomp_critic import (
     DEFAULT_DECOMP_CRITIC_PROMPT_PATH,
     build_decomp_feedback,
     critique_decomposition,
+    decomp_signature,
     is_weak,
 )
 from haetae.or_node import (
@@ -658,6 +659,8 @@ def run_loop(
     unit_attempt_budget: int | None = None,
     unit_token_budget: int | None = None,
     fixation_threshold: int = 2,
+    rename_block_bound: int = 2,
+    fixation_escalate: int = 4,
 ) -> State:
     """주문 한 줄에서 종료 상태까지 루프를 돈다. 최종 State를 반환(필요시 저장).
 
@@ -1224,6 +1227,12 @@ def run_loop(
         # 이 유닛을 done으로 수용하고, escalate면 이 유닛을 failed로 표시한다.
         worked_unit: str | None = None
 
+        # WO#175: 순차 거버넌스 가드 상태(loop-local). 둘 다 *brain 거버넌스*지 gate 판정 아님.
+        #   rename_block_count: decomp-critic이 거부한 작업을 id만 바꿔 재제출(rename-evasion)한 횟수.
+        #   serial_fail_digests: 유닛별 gate fail 지문 시간순 — 같은 지문 반복=무진전(fixation) 감지.
+        rename_block_count = 0
+        serial_fail_digests: dict[str, list] = {}
+
         iters = 0
         while iters < max_iters and state.status == Status.running:
             iters += 1
@@ -1288,6 +1297,13 @@ def run_loop(
                 crit = run_decomp_critic(no_candidate, last_result)  # 독립 critic, 스킬 미주입 원본
                 if crit is None or not is_weak(crit):
                     break  # progress(또는 OFF/평가불가) → 이 분해 채택
+                # WO#175: weak(거부) 판정 → 이 작업의 *내용 시그니처*(id 제외)를 등록한다(setdefault=
+                #   첫 거부 유닛 id 보존). 이후 *다른 id*로 같은 내용이 재제출되면(rename-evasion) dispatch
+                #   직전 가드가 차단한다 — critic verdict를 id 변경으로 무력화 못 하게(강화). 같은 id 재제출은
+                #   정상(여기 기록만, 차단 안 함). 순차 전용·append-only 감사.
+                state.rejected_decomp_signatures.setdefault(
+                    decomp_signature(no_candidate), no_candidate.unit
+                )
                 # weak: 재시도 남았으면 reject→재replan, 소진이면 진행(데드락 금지).
                 if _decomp_attempt < decomp_retries:
                     crit.rejected = True
@@ -1366,6 +1382,42 @@ def run_loop(
                     if redirect is not None and redirect.unit != no.unit:
                         emit(f"이미 통과한 {no.unit} 재dispatch 차단 → pending 유닛 {redirect.unit}로 redirect")
                         no = redirect
+                # WO#175: rename-evasion 차단 — dispatch 직전. decomp-critic이 *거부한* 작업을 id만
+                #   바꿔 재제출(내용 시그니처 동일·unit id 상이)했으면 dispatch 금지 — critic verdict는
+                #   *불변 권위*(id 변경으로 무력화 못 함, 강화지 약화 아님). bound 내면 피드백 얹어 재계획
+                #   (조용한 adopt 대신 표면화), 초과면 governed escalate(자동 완화 없음). 같은 id 재제출·
+                #   다른 작업(시그니처 상이)엔 무영향(과차단 0). **gate/run_judge 판정 로직 불변**.
+                _ev_prior = state.rejected_decomp_signatures.get(decomp_signature(no))
+                if _ev_prior is not None and _ev_prior != no.unit:
+                    account(replan_cost)  # dispatch 안 해도 replan 비용은 정직하게 누적
+                    rename_block_count += 1
+                    record_transition(STAGE_DECOMP_REJECT, no.unit)
+                    emit(
+                        f"rename-evasion 차단: 거부된 작업(원 {_ev_prior})을 {no.unit}(으)로 "
+                        f"재제출 #{rename_block_count} — decomp-critic verdict 불변(WO#175)"
+                    )
+                    if rename_block_count > rename_block_bound:
+                        if worked_unit is not None:
+                            _set_plan_state(state, worked_unit, PlanState.failed)
+                        state.status = Status.escalated
+                        state.pending_escalations.append(
+                            {
+                                "reason": (
+                                    f"거부된 작업을 id만 바꿔 재제출 {rename_block_count}회(rename-evasion) — "
+                                    f"governed escalate(decomp-critic verdict 불변·자동 완화 없음, WO#175)"
+                                ),
+                                "unit": no.unit,
+                            }
+                        )
+                        record_transition(STAGE_ESCALATE, no.unit)
+                        try_save()
+                        break
+                    last_result = (
+                        "(rename-evasion 차단: decomp-critic이 거부한 작업을 id만 바꿔 재제출했다. "
+                        "critic verdict는 불변 권위 — id 변경으로 무력화 못 한다. *진짜 다른* 유닛/접근으로 재계획하라.)"
+                    )
+                    try_save()
+                    continue
                 # WO#25 Part A: brain이 다른 유닛으로 넘어가면 직전 작업 유닛을 수용(done).
                 # dispatch하는 유닛은 in_progress. (gate/replan/종료 로직은 불변 — plan state만.)
                 if worked_unit is not None and worked_unit != no.unit:
@@ -1429,6 +1481,29 @@ def run_loop(
                         record_transition(STAGE_DONE)
                         state.status = Status.done
                         emit("전 유닛 gate-pass — 결정적 완료 인식(done)")
+                # WO#175: 순차 fixation 가드 — 같은 유닛이 *같은 gate fail 지문*으로 무진전 반복하면
+                #   (#174 라이브 u1×7) governed escalate(정직 정지, 조용한 churn 금지·자동 완화 없음).
+                #   지문은 #79와 동일(독립 gate 산출 (ac_id,check_type), 빌더 자기보고 아님). 진전이면
+                #   (다른 fail 지문·pass=None) 히스토리가 바뀌어 fixation 깨짐 → 느리지만 나아가는 건 안 죽인다.
+                #   **brain 거버넌스지 gate 판정 아님** — 완료/pass 권위는 그대로 gate(불변).
+                if state.status == Status.running and fixation_escalate >= 2:
+                    _fhist = serial_fail_digests.setdefault(no.unit, [])
+                    _fhist.append(fixation_fail_digest(gr))
+                    if is_fixated(_fhist, fixation_escalate):
+                        _set_plan_state(state, no.unit, PlanState.failed)
+                        state.status = Status.escalated
+                        state.pending_escalations.append(
+                            {
+                                "reason": (
+                                    f"unit {no.unit} — 같은 gate 신호로 {fixation_escalate}회 무진전"
+                                    f"(fixation) — governed escalate(정직 정지·진전 시 리셋·자동 완화 없음, WO#175)"
+                                ),
+                                "unit": no.unit,
+                                "fail_digest": str(fixation_fail_digest(gr)),
+                            }
+                        )
+                        record_transition(STAGE_ESCALATE, no.unit)
+                        break
 
             elif action == Action.stop:
                 account(replan_cost)  # event 없는 종료 — replan 비용은 budget에만

@@ -61,6 +61,8 @@ def run(
     executor_factory: Callable | None = None,
     gate_factory: Callable | None = None,
     unit_retries: int = 3,  # WO#108-C: 2→3 상향 — 어려운 유닛에 escalate 전 한 번 더 여유.
+    rename_block_bound: int = 2,  # WO#175: rename-evasion 차단 bound(순차)
+    fixation_escalate: int = 4,   # WO#175: 무진전 fixation escalate bound(순차)
     tier_ladder: list[Tier] | None = None,
     auto_config_note: str | None = None,
     scaffold_client: LLMClient | None = None,
@@ -117,6 +119,8 @@ def run(
         executor_factory=executor_factory,
         gate_factory=gate_factory,
         unit_retries=unit_retries,
+        rename_block_bound=rename_block_bound,  # WO#175: rename-evasion 차단 bound(순차)
+        fixation_escalate=fixation_escalate,    # WO#175: 무진전 fixation escalate bound(순차)
         tier_ladder=tier_ladder,
         auto_config_note=auto_config_note,
         scaffold_client=scaffold_client,
@@ -954,6 +958,27 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--rename-block-bound",
+        type=int,
+        default=2,
+        help=(
+            "순차 거버넌스(WO#175): decomp-critic이 *거부한* work order를 약 brain이 id만 바꿔 재제출"
+            "(rename-evasion)한 횟수가 N 초과면 governed escalate(자동 완화 없음). 내용 시그니처(id 제외) "
+            "동일·unit id 상이면 dispatch 차단(critic verdict 불변 권위·강화). 같은 id 재제출·다른 작업엔 "
+            "무영향(과차단 0). 병렬은 스케줄러가 unit id 권위라 미해당. 기본 2."
+        ),
+    )
+    parser.add_argument(
+        "--fixation-escalate",
+        type=int,
+        default=4,
+        help=(
+            "순차 거버넌스(WO#175): 한 유닛이 *같은 gate fail 지문*으로 N회 연속 무진전이면 governed "
+            "escalate(정직 정지·조용한 churn 금지·자동 완화 없음). 진전(다른 지문/pass)이면 카운트 리셋. "
+            "<2면 비활성. #79 nudge와 동형 신호·다른 행동(hard escalate). gate 판정 로직 불변. 기본 4."
+        ),
+    )
+    parser.add_argument(
         "--tier-ladder",
         default=None,
         metavar="TIERS",
@@ -1450,6 +1475,8 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory=executor_factory,
             gate_factory=gate_factory,
             unit_retries=args.unit_retries,
+            rename_block_bound=args.rename_block_bound,  # WO#175: rename-evasion 차단 bound(순차)
+            fixation_escalate=args.fixation_escalate,    # WO#175: 무진전 fixation escalate bound(순차)
             tier_ladder=tier_ladder,
             auto_config_note=auto_config_note,
             scaffold_client=scaffold_client,
